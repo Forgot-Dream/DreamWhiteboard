@@ -1,0 +1,12 @@
+node_modules/
+dist/
+build/
+.vite/
+.env
+.env.local
+coverage/
+tmp/
+*.log
+deploy/uploads/*
+!deploy/uploads/.gitkeep
+
