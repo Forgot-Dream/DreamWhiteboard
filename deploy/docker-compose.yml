@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: dreamwhiteboard
+      POSTGRES_USER: dreamwhiteboard
+      POSTGRES_PASSWORD: dreamwhiteboard
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../backend/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dreamwhiteboard -d dreamwhiteboard"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: ../backend
+    environment:
+      HTTP_ADDR: :8080
+      DATABASE_URL: postgres://dreamwhiteboard:dreamwhiteboard@postgres:5432/dreamwhiteboard?sslmode=disable
+      UPLOAD_DIR: /app/uploads
+      FIRST_ADMIN_EMAIL: admin@example.com
+      FIRST_ADMIN_PASSWORD: admin123
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ../frontend
+      args:
+        VITE_API_BASE: http://localhost:8080
+    ports:
+      - "5173:80"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+
