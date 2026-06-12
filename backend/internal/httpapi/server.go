@@ -19,14 +19,14 @@ import (
 )
 
 type Server struct {
-	repo      *store.MemoryStore
+	repo      store.Repository
 	uploadDir string
 	hub       *realtime.Hub
 	sessions  map[string]string
 	mu        sync.RWMutex
 }
 
-func NewServer(repo *store.MemoryStore, uploadDir string) http.Handler {
+func NewServer(repo store.Repository, uploadDir string) http.Handler {
 	s := &Server{
 		repo:      repo,
 		uploadDir: uploadDir,
