@@ -133,11 +133,36 @@ textarea {
 
 .app-header nav {
   display: flex;
+  align-items: center;
   gap: 8px;
 }
 
 .app-header nav button {
   padding: 0 12px;
+}
+
+.locale-select {
+  min-height: 38px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #40514d;
+}
+
+.locale-select span {
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.locale-select select {
+  width: auto;
+  min-width: 120px;
+  height: 38px;
+  padding: 0 28px 0 10px;
+}
+
+.login-panel .locale-select {
+  justify-self: end;
 }
 
 .app-header nav .active, .nav-list .active, .icon-btn.selected {

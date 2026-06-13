@@ -1,8 +1,10 @@
 import { FormEvent, useEffect, useState } from 'react';
 import { Plus, Shield } from 'lucide-react';
 import { api, type User } from '../lib/api';
+import { useI18n } from '../lib/i18n';
 
 export function Admin() {
+  const { t } = useI18n();
   const [users, setUsers] = useState<User[]>([]);
   const [email, setEmail] = useState('');
   const [name, setName] = useState('');
@@ -29,7 +31,7 @@ export function Admin() {
       setName('');
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Create user failed');
+      setError(err instanceof Error ? err.message : t('admin.createFailed'));
     }
   }
 
@@ -37,20 +39,20 @@ export function Admin() {
     <section className="panel">
       <div className="section-head">
         <div>
-          <h2>System Users</h2>
-          <p>Created users receive the temporary password <code>changeme123</code>.</p>
+          <h2>{t('admin.title')}</h2>
+          <p>{t('admin.tempPassword', { password: 'changeme123' })}</p>
         </div>
         <Shield size={22} />
       </div>
       <form className="inline-form" onSubmit={createUser}>
-        <input placeholder="email" value={email} onChange={(event) => setEmail(event.target.value)} />
-        <input placeholder="name" value={name} onChange={(event) => setName(event.target.value)} />
+        <input placeholder={t('admin.emailPlaceholder')} value={email} onChange={(event) => setEmail(event.target.value)} />
+        <input placeholder={t('admin.namePlaceholder')} value={name} onChange={(event) => setName(event.target.value)} />
         <select value={systemRole} onChange={(event) => setSystemRole(event.target.value as 'user' | 'system_admin')}>
-          <option value="user">user</option>
-          <option value="system_admin">system_admin</option>
+          <option value="user">{t('admin.role.user')}</option>
+          <option value="system_admin">{t('admin.role.system_admin')}</option>
         </select>
         <button className="primary" type="submit">
-          <Plus size={16} /> Add
+          <Plus size={16} /> {t('admin.add')}
         </button>
       </form>
       {error && <p className="error">{error}</p>}
@@ -59,11 +61,10 @@ export function Admin() {
           <div className="table-row" key={user.id}>
             <span>{user.email}</span>
             <span>{user.name}</span>
-            <span className="badge">{user.system_role}</span>
+            <span className="badge">{t(`admin.role.${user.system_role}`)}</span>
           </div>
         ))}
       </div>
     </section>
   );
 }
-

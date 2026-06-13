@@ -2,6 +2,7 @@ import { PointerEvent, WheelEvent, useEffect, useMemo, useRef, useState } from '
 import { ArrowLeft, FileImage, GripHorizontal, MousePointer2, Trash2, Type, ZoomIn, ZoomOut } from 'lucide-react';
 import { api, assetURL, canEdit as canUserEdit, wsURL, type Board, type BoardSnapshot, type Project, type ProjectRole, type User, type WhiteboardBlock } from '../lib/api';
 import { createBlock } from '../lib/blockRegistry';
+import { useI18n } from '../lib/i18n';
 
 interface BoardEditorProps {
   user: User;
@@ -21,6 +22,7 @@ interface SocketMessage {
 type Tool = 'select' | 'text';
 
 export function BoardEditor({ user, board, project, role, onBack }: BoardEditorProps) {
+  const { t, formatTime } = useI18n();
   const [blocks, setBlocks] = useState<WhiteboardBlock[]>([]);
   const [version, setVersion] = useState(0);
   const [savedAt, setSavedAt] = useState(board.updated_at);
@@ -111,6 +113,7 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
 
   function addTextBlock(x = (120 - offset.x) / scale, y = (120 - offset.y) / scale) {
     const block = createBlock('note', x, y, blocks.length + 1);
+    block.data = { ...block.data, text: t('editor.defaultText') };
     setBlocks((current) => [...current, block]);
     setSelected(block.id);
     setTool('select');
@@ -206,25 +209,25 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
   return (
     <div className="editor-shell">
       <header className="topbar">
-        <button className="icon-btn" onClick={onBack} title="Back"><ArrowLeft size={19} /></button>
+        <button className="icon-btn" onClick={onBack} title={t('editor.back')}><ArrowLeft size={19} /></button>
         <div className="title-block">
           <strong>{board.name}</strong>
-          <span>{project.name} · {saving ? 'Saving...' : `Saved ${formatSavedAt(savedAt)}`} · {connection === 'live' ? 'live' : connection}</span>
+          <span>{project.name} · {saving ? t('editor.saving') : t('editor.saved', { time: formatSavedAt(savedAt, formatTime) })} · {t(`editor.connection.${connection}`)}</span>
         </div>
         <div className="toolbar">
-          <button className={`icon-btn ${tool === 'select' ? 'selected' : ''}`} onClick={() => setTool('select')} title="Select"><MousePointer2 size={18} /></button>
-          <button className={`icon-btn ${tool === 'text' ? 'selected' : ''}`} disabled={!canEdit} onClick={() => setTool('text')} title="Text box"><Type size={18} /></button>
-          <label className={`icon-btn ${!canEdit ? 'disabled' : ''}`} title="Upload image">
+          <button className={`icon-btn ${tool === 'select' ? 'selected' : ''}`} onClick={() => setTool('select')} title={t('editor.select')}><MousePointer2 size={18} /></button>
+          <button className={`icon-btn ${tool === 'text' ? 'selected' : ''}`} disabled={!canEdit} onClick={() => setTool('text')} title={t('editor.textBox')}><Type size={18} /></button>
+          <label className={`icon-btn ${!canEdit ? 'disabled' : ''}`} title={t('editor.uploadImage')}>
             <FileImage size={18} />
             <input type="file" accept="image/*" disabled={!canEdit} onChange={(event) => event.target.files?.[0] && uploadImage(event.target.files[0])} />
           </label>
           {selectedBlock && selectedBlock.type !== 'image' && (
             <BlockStyleControls block={selectedBlock} disabled={!canEdit} onChange={updateBlock} />
           )}
-          <button className="icon-btn" onClick={() => setScale((value) => Math.max(0.25, value - 0.1))} title="Zoom out"><ZoomOut size={18} /></button>
+          <button className="icon-btn" onClick={() => setScale((value) => Math.max(0.25, value - 0.1))} title={t('editor.zoomOut')}><ZoomOut size={18} /></button>
           <span className="zoom-readout">{Math.round(scale * 100)}%</span>
-          <button className="icon-btn" onClick={() => setScale((value) => Math.min(2.5, value + 0.1))} title="Zoom in"><ZoomIn size={18} /></button>
-          <button className="icon-btn danger" disabled={!selected || !canEdit} onClick={deleteSelected} title="Delete"><Trash2 size={18} /></button>
+          <button className="icon-btn" onClick={() => setScale((value) => Math.min(2.5, value + 0.1))} title={t('editor.zoomIn')}><ZoomIn size={18} /></button>
+          <button className="icon-btn danger" disabled={!selected || !canEdit} onClick={deleteSelected} title={t('editor.delete')}><Trash2 size={18} /></button>
         </div>
       </header>
       {error && <div className="toast">{error}</div>}
@@ -239,6 +242,7 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
               onDragStart={(event) => pointerDownBlock(event, block)}
               onCommit={updateBlock}
               onDraft={updateBlockDraft}
+              dragTitle={t('editor.dragBlock')}
             />
           ))}
         </div>
@@ -247,13 +251,14 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
   );
 }
 
-function WhiteboardBlockView({ block, selected, readOnly, onDragStart, onCommit, onDraft }: {
+function WhiteboardBlockView({ block, selected, readOnly, onDragStart, onCommit, onDraft, dragTitle }: {
   block: WhiteboardBlock;
   selected: boolean;
   readOnly: boolean;
   onDragStart: (event: PointerEvent<HTMLElement>) => void;
   onCommit: (block: WhiteboardBlock) => void;
   onDraft: (block: WhiteboardBlock) => void;
+  dragTitle: string;
 }) {
   const style = {
     left: block.x,
@@ -268,7 +273,7 @@ function WhiteboardBlockView({ block, selected, readOnly, onDragStart, onCommit,
   const textStyle = { color: blockTextColor(block) };
   return (
     <div className={`block block-${block.type} ${selected ? 'selected' : ''}`} style={style}>
-      <button className="block-handle" type="button" onPointerDown={onDragStart} title="Drag block">
+      <button className="block-handle" type="button" onPointerDown={onDragStart} title={dragTitle}>
         <GripHorizontal size={16} />
       </button>
       {block.type !== 'image' && (
@@ -291,25 +296,26 @@ function BlockStyleControls({ block, disabled, onChange }: {
   disabled: boolean;
   onChange: (block: WhiteboardBlock) => void;
 }) {
+  const { t } = useI18n();
   function update(data: Record<string, unknown>) {
     onChange({ ...block, data: { ...block.data, ...data } });
   }
   return (
     <div className="style-controls">
-      <label title="Fill color">
-        <span>Fill</span>
+      <label title={t('editor.style.fill')}>
+        <span>{t('editor.fill')}</span>
         <input type="color" disabled={disabled} value={blockFill(block)} onChange={(event) => update({ fill: event.target.value })} />
       </label>
-      <label title="Text color">
-        <span>Text</span>
+      <label title={t('editor.style.text')}>
+        <span>{t('editor.text')}</span>
         <input type="color" disabled={disabled} value={blockTextColor(block)} onChange={(event) => update({ textColor: event.target.value })} />
       </label>
-      <label title="Border color">
-        <span>Border</span>
+      <label title={t('editor.style.border')}>
+        <span>{t('editor.border')}</span>
         <input type="color" disabled={disabled} value={blockBorderColor(block)} onChange={(event) => update({ borderColor: event.target.value })} />
       </label>
-      <label title="Border width">
-        <span>Width</span>
+      <label title={t('editor.style.width')}>
+        <span>{t('editor.width')}</span>
         <input type="number" min="0" max="12" disabled={disabled} value={blockBorderWidth(block)} onChange={(event) => update({ borderWidth: Number(event.target.value) })} />
       </label>
     </div>
@@ -360,8 +366,8 @@ function stringData(block: WhiteboardBlock, key: string, fallback: string) {
   return typeof value === 'string' ? value : fallback;
 }
 
-function formatSavedAt(value: string) {
+function formatSavedAt(value: string, formatTime: (value: string | Date) => string) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return '--:--';
-  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return formatTime(date);
 }

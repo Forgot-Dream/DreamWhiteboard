@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { FolderKanban, LayoutGrid, Plus, Users } from 'lucide-react';
 import { api, canManage, type Board, type Project, type ProjectMember, type ProjectRole, type User } from '../lib/api';
+import { useI18n } from '../lib/i18n';
 
 interface ProjectsProps {
   user: User;
@@ -8,6 +9,7 @@ interface ProjectsProps {
 }
 
 export function Projects({ user, onOpenBoard }: ProjectsProps) {
+  const { t, formatDateTime } = useI18n();
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedID, setSelectedID] = useState('');
   const [boards, setBoards] = useState<Board[]>([]);
@@ -60,7 +62,7 @@ export function Projects({ user, onOpenBoard }: ProjectsProps) {
       await loadProjects();
       setSelectedID(project.id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Create project failed');
+      setError(err instanceof Error ? err.message : t('projects.createProjectFailed'));
     }
   }
 
@@ -89,13 +91,13 @@ export function Projects({ user, onOpenBoard }: ProjectsProps) {
     <div className="workspace-grid">
       <aside className="sidebar panel">
         <div className="section-head">
-          <h2>Projects</h2>
+          <h2>{t('projects.title')}</h2>
           <FolderKanban size={20} />
         </div>
         <form className="stack-form" onSubmit={createProject}>
-          <input placeholder="New project" value={projectName} onChange={(event) => setProjectName(event.target.value)} />
+          <input placeholder={t('projects.newProject')} value={projectName} onChange={(event) => setProjectName(event.target.value)} />
           <button className="primary" type="submit">
-            <Plus size={16} /> Create
+            <Plus size={16} /> {t('projects.create')}
           </button>
         </form>
         <div className="nav-list">
@@ -110,15 +112,15 @@ export function Projects({ user, onOpenBoard }: ProjectsProps) {
       <section className="panel">
         <div className="section-head">
           <div>
-            <h2>{selected?.name ?? 'Boards'}</h2>
-            <p>{selected?.description || 'Create and open project whiteboards.'}</p>
+            <h2>{selected?.name ?? t('projects.boardsFallback')}</h2>
+            <p>{selected?.description || t('projects.boardsDescription')}</p>
           </div>
           <LayoutGrid size={22} />
         </div>
         <form className="inline-form" onSubmit={createBoard}>
-          <input placeholder="Board name" value={boardName} onChange={(event) => setBoardName(event.target.value)} disabled={!selected} />
+          <input placeholder={t('projects.boardName')} value={boardName} onChange={(event) => setBoardName(event.target.value)} disabled={!selected} />
           <button className="primary" type="submit" disabled={!selected}>
-            <Plus size={16} /> Board
+            <Plus size={16} /> {t('projects.board')}
           </button>
         </form>
         {error && <p className="error">{error}</p>}
@@ -126,7 +128,7 @@ export function Projects({ user, onOpenBoard }: ProjectsProps) {
           {boards.map((board) => (
             <button className="board-card" key={board.id} onClick={() => selected && onOpenBoard(board, selected, myRole)}>
               <strong>{board.name}</strong>
-              <span>v{board.version} · {new Date(board.updated_at).toLocaleString()}</span>
+              <span>{t('projects.updatedAt', { version: board.version, time: formatDateTime(board.updated_at) })}</span>
             </button>
           ))}
         </div>
@@ -134,24 +136,24 @@ export function Projects({ user, onOpenBoard }: ProjectsProps) {
 
       <section className="panel">
         <div className="section-head">
-          <h2>Members</h2>
+          <h2>{t('projects.members')}</h2>
           <Users size={20} />
         </div>
         {canManage(myRole, user) && (
           <form className="inline-form member-form" onSubmit={addMember}>
             <select value={memberUser} onChange={(event) => setMemberUser(event.target.value)}>
-              <option value="">Select user</option>
+              <option value="">{t('projects.selectUser')}</option>
               {users.map((nextUser) => (
                 <option key={nextUser.id} value={nextUser.id}>{nextUser.email}</option>
               ))}
             </select>
             <select value={memberRole} onChange={(event) => setMemberRole(event.target.value as ProjectRole)}>
-              <option value="admin">admin</option>
-              <option value="editor">editor</option>
-              <option value="viewer">viewer</option>
+              <option value="admin">{t('role.admin')}</option>
+              <option value="editor">{t('role.editor')}</option>
+              <option value="viewer">{t('role.viewer')}</option>
             </select>
             <button className="primary" type="submit">
-              <Plus size={16} /> Add
+              <Plus size={16} /> {t('projects.add')}
             </button>
           </form>
         )}
@@ -159,7 +161,7 @@ export function Projects({ user, onOpenBoard }: ProjectsProps) {
           {members.map((member) => (
             <div className="table-row" key={member.user_id}>
               <span>{member.user?.email ?? member.user_id}</span>
-              <span className="badge">{member.role}</span>
+              <span className="badge">{t(`role.${member.role}`)}</span>
             </div>
           ))}
         </div>
