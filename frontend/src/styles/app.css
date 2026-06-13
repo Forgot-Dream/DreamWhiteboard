@@ -441,7 +441,7 @@ textarea {
   border-style: solid;
   border-color: transparent;
   border-width: 0;
-  border-radius: 8px;
+  border-radius: 0;
   background: transparent;
   box-shadow: none;
   overflow: visible;
@@ -460,7 +460,7 @@ textarea {
   align-items: center;
   justify-content: center;
   border: 1px solid rgba(32, 48, 45, 0.16);
-  border-radius: 999px;
+  border-radius: 0;
   color: #40514d;
   background: rgba(255, 255, 255, 0.88);
   cursor: grab;
@@ -478,7 +478,7 @@ textarea {
   position: absolute;
   inset: -7px;
   border: 2px solid #23666b;
-  border-radius: 12px;
+  border-radius: 0;
   pointer-events: none;
   z-index: 2;
 }
@@ -489,7 +489,7 @@ textarea {
   width: 10px;
   height: 10px;
   border: 2px solid #23666b;
-  border-radius: 50%;
+  border-radius: 0;
   background: #ffffff;
   padding: 0;
 }

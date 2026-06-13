@@ -1,4 +1,4 @@
-import { PointerEvent, WheelEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { MouseEvent, PointerEvent, WheelEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, FileImage, GripHorizontal, MousePointer2, Trash2, Type, ZoomIn, ZoomOut } from 'lucide-react';
 import { api, assetURL, canEdit as canUserEdit, wsURL, type Board, type BoardSnapshot, type Project, type ProjectRole, type User, type WhiteboardBlock } from '../lib/api';
 import { createBlock } from '../lib/blockRegistry';
@@ -160,13 +160,17 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
   function pointerDownCanvas(event: PointerEvent<HTMLDivElement>) {
     if (event.target !== event.currentTarget) return;
     if (tool === 'text' && canEdit) {
-      const point = worldFromScreen(event.clientX, event.clientY);
-      addTextBlock(point.x, point.y);
       return;
     }
     setSelected('');
     drag.current = { mode: 'pan', startX: event.clientX, startY: event.clientY, originX: offset.x, originY: offset.y };
     event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function clickCanvas(event: MouseEvent<HTMLDivElement>) {
+    if (event.target !== event.currentTarget || tool !== 'text' || !canEdit) return;
+    const point = worldFromScreen(event.clientX, event.clientY);
+    addTextBlock(point.x, point.y);
   }
 
   function pointerDownBlock(event: PointerEvent<HTMLElement>, block: WhiteboardBlock) {
@@ -305,7 +309,7 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
         </div>
       </header>
       {error && <div className="toast">{error}</div>}
-      <div className={`canvas ${tool === 'text' && canEdit ? 'canvas-text-tool' : ''}`} onPointerDown={pointerDownCanvas} onPointerMove={pointerMove} onPointerUp={pointerUp} onWheel={wheel}>
+      <div className={`canvas ${tool === 'text' && canEdit ? 'canvas-text-tool' : ''}`} onClick={clickCanvas} onPointerDown={pointerDownCanvas} onPointerMove={pointerMove} onPointerUp={pointerUp} onWheel={wheel}>
         <div className="world" style={{ transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})` }}>
           {blocks.map((block) => (
             <WhiteboardBlockView
