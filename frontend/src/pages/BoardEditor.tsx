@@ -14,8 +14,11 @@ interface BoardEditorProps {
 
 interface SocketMessage {
   type: string;
+  client_id?: string;
+  user_id?: string;
   snapshot?: BoardSnapshot;
   operation?: { type: string; version: number; payload: Record<string, unknown>; created_at?: string };
+  payload?: Record<string, unknown>;
   error?: string;
 }
 
@@ -23,6 +26,19 @@ type Tool = 'select' | 'text';
 type ResizeHandle = 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'nw';
 const TEXT_INSET_X = 4;
 const TEXT_INSET_Y = 4;
+const PRESENCE_THROTTLE_MS = 80;
+const PRESENCE_STALE_MS = 10000;
+
+interface RemotePresence {
+  clientID: string;
+  userID: string;
+  name: string;
+  color: string;
+  x: number;
+  y: number;
+  selectedID: string;
+  updatedAt: number;
+}
 
 interface DragState {
   mode: 'pan' | 'block' | 'resize';
@@ -48,12 +64,26 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
   const [scale, setScale] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [error, setError] = useState('');
+  const [remotes, setRemotes] = useState<Record<string, RemotePresence>>({});
   const socket = useRef<WebSocket | null>(null);
   const saveTimers = useRef<Record<string, number>>({});
   const pendingCreates = useRef<Set<string>>(new Set());
   const drag = useRef<DragState | null>(null);
+  const selectedRef = useRef(selected);
+  const lastCursorPoint = useRef<{ x: number; y: number } | null>(null);
+  const lastPresenceSent = useRef(0);
   const canEdit = canUserEdit(role, user);
   const clientID = useMemo(() => `cli_${crypto.randomUUID()}`, []);
+  const clientColor = useMemo(() => collaboratorColor(clientID), [clientID]);
+  const remoteList = useMemo(() => Object.values(remotes), [remotes]);
+  const remoteSelectionsByBlock = useMemo(() => {
+    const selections: Record<string, RemotePresence[]> = {};
+    for (const remote of remoteList) {
+      if (!remote.selectedID) continue;
+      selections[remote.selectedID] = [...(selections[remote.selectedID] ?? []), remote];
+    }
+    return selections;
+  }, [remoteList]);
 
   useEffect(() => {
     let alive = true;
@@ -87,12 +117,20 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
         setSavedAt(message.snapshot.updated_at);
         setSaving(false);
       }
+      if ((message.type === 'cursor' || message.type === 'presence') && message.client_id !== clientID) {
+        const presence = remotePresenceFromMessage(message);
+        if (presence) {
+          setRemotes((current) => ({ ...current, [presence.clientID]: presence }));
+        }
+      }
       if (message.type === 'error') setError(message.error ?? 'Socket error');
     };
     ws.onopen = () => {
       setConnection('live');
       setError('');
       ws.send(JSON.stringify({ type: 'join', client_id: clientID }));
+      const point = lastCursorPoint.current;
+      if (point) sendPresence(point, true);
     };
     ws.onerror = () => setConnection('offline');
     ws.onclose = () => setConnection('offline');
@@ -102,6 +140,23 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
       ws.close();
     };
   }, [board.id, clientID]);
+
+  useEffect(() => {
+    selectedRef.current = selected;
+    const point = lastCursorPoint.current;
+    if (point) sendPresence(point, true);
+  }, [selected]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const cutoff = Date.now() - PRESENCE_STALE_MS;
+      setRemotes((current) => {
+        const next = Object.fromEntries(Object.entries(current).filter(([, remote]) => remote.updatedAt >= cutoff));
+        return Object.keys(next).length === Object.keys(current).length ? current : next;
+      });
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   function sendOperation(operation: string, payload: Record<string, unknown>) {
     if (!canEdit || socket.current?.readyState !== WebSocket.OPEN) return;
@@ -127,11 +182,31 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
     return { x: (clientX - offset.x) / scale, y: (clientY - offset.y) / scale };
   }
 
+  function sendPresence(point: { x: number; y: number }, force = false, selectedID = selectedRef.current) {
+    lastCursorPoint.current = point;
+    if (socket.current?.readyState !== WebSocket.OPEN) return;
+    const now = Date.now();
+    if (!force && now - lastPresenceSent.current < PRESENCE_THROTTLE_MS) return;
+    lastPresenceSent.current = now;
+    socket.current.send(JSON.stringify({
+      type: 'cursor',
+      client_id: clientID,
+      payload: {
+        x: point.x,
+        y: point.y,
+        selected_id: selectedID,
+        name: user.name || user.email,
+        color: clientColor
+      }
+    }));
+  }
+
   function addTextBlock(x = (120 - offset.x) / scale, y = (120 - offset.y) / scale) {
     const draft = createBlock('note', 0, 0, blocks.length + 1);
     const block = { ...draft, x: x - TEXT_INSET_X, y: y - TEXT_INSET_Y, data: { ...draft.data, text: '' } };
     setBlocks((current) => [...current, block]);
     setSelected(block.id);
+    return block;
   }
 
   async function uploadImage(file: File) {
@@ -163,6 +238,7 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
       return;
     }
     setSelected('');
+    sendPresence(worldFromScreen(event.clientX, event.clientY), true, '');
     drag.current = { mode: 'pan', startX: event.clientX, startY: event.clientY, originX: offset.x, originY: offset.y };
     event.currentTarget.setPointerCapture(event.pointerId);
   }
@@ -170,16 +246,19 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
   function clickCanvas(event: MouseEvent<HTMLDivElement>) {
     if (event.target !== event.currentTarget || tool !== 'text' || !canEdit) return;
     const point = worldFromScreen(event.clientX, event.clientY);
-    addTextBlock(point.x, point.y);
+    const block = addTextBlock(point.x, point.y);
+    sendPresence(point, true, block.id);
   }
 
   function pointerDownBlock(event: PointerEvent<HTMLElement>, block: WhiteboardBlock) {
     event.stopPropagation();
     if (!canEdit) {
       setSelected(block.id);
+      sendPresence(worldFromScreen(event.clientX, event.clientY), true, block.id);
       return;
     }
     setSelected(block.id);
+    sendPresence(worldFromScreen(event.clientX, event.clientY), true, block.id);
     drag.current = { mode: 'block', id: block.id, startX: event.clientX, startY: event.clientY, originX: block.x, originY: block.y };
     event.currentTarget.setPointerCapture(event.pointerId);
   }
@@ -188,6 +267,7 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
     event.stopPropagation();
     if (!canEdit) return;
     setSelected(block.id);
+    sendPresence(worldFromScreen(event.clientX, event.clientY), true, block.id);
     drag.current = {
       mode: 'resize',
       id: block.id,
@@ -203,6 +283,7 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
   }
 
   function pointerMove(event: PointerEvent<HTMLDivElement>) {
+    sendPresence(worldFromScreen(event.clientX, event.clientY));
     const active = drag.current;
     if (!active) return;
     if (active.mode === 'pan') {
@@ -316,8 +397,13 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
               key={block.id}
               block={block}
               selected={selected === block.id}
+              remoteSelections={remoteSelectionsByBlock[block.id] ?? []}
               readOnly={!canEdit}
-              onSelect={() => setSelected(block.id)}
+              onSelect={() => {
+                setSelected(block.id);
+                const point = lastCursorPoint.current;
+                if (point) sendPresence(point, true, block.id);
+              }}
               onDragStart={(event) => pointerDownBlock(event, block)}
               onCommit={updateBlock}
               onDraft={updateBlockDraft}
@@ -325,15 +411,19 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
               autoFocus={selected === block.id && isPendingTextBlock(block)}
             />
           ))}
+          {remoteList.map((remote) => (
+            <RemoteCursor key={remote.clientID} remote={remote} />
+          ))}
         </div>
       </div>
     </div>
   );
 }
 
-function WhiteboardBlockView({ block, selected, readOnly, onSelect, onDragStart, onResizeStart, onCommit, onDraft, autoFocus }: {
+function WhiteboardBlockView({ block, selected, remoteSelections, readOnly, onSelect, onDragStart, onResizeStart, onCommit, onDraft, autoFocus }: {
   block: WhiteboardBlock;
   selected: boolean;
+  remoteSelections: RemotePresence[];
   readOnly: boolean;
   onSelect: () => void;
   onDragStart: (event: PointerEvent<HTMLElement>) => void;
@@ -357,6 +447,15 @@ function WhiteboardBlockView({ block, selected, readOnly, onSelect, onDragStart,
   return (
     <div className={`block block-${block.type} ${selected ? 'selected' : ''}`} style={style}>
       <div className="block-hit-area" onPointerDown={onDragStart} />
+      {remoteSelections.map((remote, index) => (
+        <div
+          className="remote-selection"
+          key={remote.clientID}
+          style={{ borderColor: remote.color, inset: -12 - index * 5 }}
+        >
+          <span style={{ backgroundColor: remote.color }}>{remote.name}</span>
+        </div>
+      ))}
       {selected && !readOnly && (
         <ResizeHandles onResizeStart={onResizeStart} />
       )}
@@ -376,6 +475,15 @@ function WhiteboardBlockView({ block, selected, readOnly, onSelect, onDragStart,
         />
       )}
       {block.type === 'image' && <img src={String(block.data.url ?? '')} alt={String(block.data.alt ?? '')} draggable={false} />}
+    </div>
+  );
+}
+
+function RemoteCursor({ remote }: { remote: RemotePresence }) {
+  return (
+    <div className="remote-cursor" style={{ left: remote.x, top: remote.y, color: remote.color }}>
+      <div className="remote-cursor-tip" />
+      <div className="remote-cursor-label" style={{ backgroundColor: remote.color }}>{remote.name}</div>
     </div>
   );
 }
@@ -611,6 +719,42 @@ function fitImageSize(width: number, height: number) {
   const maxH = 360;
   const ratio = Math.min(1, maxW / Math.max(width, 1), maxH / Math.max(height, 1));
   return { w: Math.max(80, Math.round(width * ratio)), h: Math.max(54, Math.round(height * ratio)) };
+}
+
+function remotePresenceFromMessage(message: SocketMessage): RemotePresence | null {
+  if (!message.client_id || !message.payload) return null;
+  const x = numberPayload(message.payload, 'x');
+  const y = numberPayload(message.payload, 'y');
+  if (x === null || y === null) return null;
+  return {
+    clientID: message.client_id,
+    userID: message.user_id ?? '',
+    name: stringPayload(message.payload, 'name', message.user_id ? `User ${message.user_id.slice(0, 6)}` : 'Collaborator'),
+    color: stringPayload(message.payload, 'color', collaboratorColor(message.client_id)),
+    x,
+    y,
+    selectedID: stringPayload(message.payload, 'selected_id', ''),
+    updatedAt: Date.now()
+  };
+}
+
+function numberPayload(payload: Record<string, unknown>, key: string) {
+  const value = payload[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function stringPayload(payload: Record<string, unknown>, key: string, fallback: string) {
+  const value = payload[key];
+  return typeof value === 'string' ? value : fallback;
+}
+
+function collaboratorColor(seed: string) {
+  const colors = ['#c2410c', '#047857', '#1d4ed8', '#7c3aed', '#be123c', '#0f766e', '#a16207', '#4338ca'];
+  let hash = 0;
+  for (let index = 0; index < seed.length; index += 1) {
+    hash = (hash * 31 + seed.charCodeAt(index)) >>> 0;
+  }
+  return colors[hash % colors.length];
 }
 
 function stringData(block: WhiteboardBlock, key: string, fallback: string) {
