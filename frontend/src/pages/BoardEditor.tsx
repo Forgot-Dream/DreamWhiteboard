@@ -135,12 +135,25 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
   }
 
   async function uploadImage(file: File) {
+    const dimensions = await readImageDimensions(file);
     const form = new FormData();
     form.append('file', file);
     const asset = await api<{ id: string }>(`/api/projects/${project.id}/assets`, { method: 'POST', body: form });
+    const size = fitImageSize(dimensions.width, dimensions.height);
     const block = createBlock('image', (160 - offset.x) / scale, (160 - offset.y) / scale, blocks.length + 1);
-    block.data = { asset_id: asset.id, url: assetURL(asset.id), alt: file.name };
+    block.w = size.w;
+    block.h = size.h;
+    block.data = {
+      asset_id: asset.id,
+      url: assetURL(asset.id),
+      alt: file.name,
+      naturalWidth: dimensions.width,
+      naturalHeight: dimensions.height,
+      aspectRatio: dimensions.width / dimensions.height,
+      aspectLocked: true
+    };
     setBlocks((current) => [...current, block]);
+    setSelected(block.id);
     sendOperation('create_block', { block });
   }
 
@@ -282,6 +295,9 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
           {selectedBlock && selectedBlock.type !== 'image' && (
             <BlockStyleControls block={selectedBlock} disabled={!canEdit} onChange={updateBlock} />
           )}
+          {selectedBlock?.type === 'image' && (
+            <ImageControls block={selectedBlock} disabled={!canEdit} onChange={updateBlock} />
+          )}
           <button className="icon-btn" onClick={() => setScale((value) => Math.max(0.25, value - 0.1))} title={t('editor.zoomOut')}><ZoomOut size={18} /></button>
           <span className="zoom-readout">{Math.round(scale * 100)}%</span>
           <button className="icon-btn" onClick={() => setScale((value) => Math.min(2.5, value + 0.1))} title={t('editor.zoomIn')}><ZoomIn size={18} /></button>
@@ -297,6 +313,7 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
               block={block}
               selected={selected === block.id}
               readOnly={!canEdit}
+              onSelect={() => setSelected(block.id)}
               onDragStart={(event) => pointerDownBlock(event, block)}
               onCommit={updateBlock}
               onDraft={updateBlockDraft}
@@ -311,10 +328,11 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
   );
 }
 
-function WhiteboardBlockView({ block, selected, readOnly, onDragStart, onResizeStart, onCommit, onDraft, dragTitle, autoFocus }: {
+function WhiteboardBlockView({ block, selected, readOnly, onSelect, onDragStart, onResizeStart, onCommit, onDraft, dragTitle, autoFocus }: {
   block: WhiteboardBlock;
   selected: boolean;
   readOnly: boolean;
+  onSelect: () => void;
   onDragStart: (event: PointerEvent<HTMLElement>) => void;
   onResizeStart: (event: PointerEvent<HTMLElement>, handle: ResizeHandle) => void;
   onCommit: (block: WhiteboardBlock) => void;
@@ -336,7 +354,7 @@ function WhiteboardBlockView({ block, selected, readOnly, onDragStart, onResizeS
   const textStyle = { color: blockTextColor(block) };
   return (
     <div className={`block block-${block.type} ${selected ? 'selected' : ''}`} style={style}>
-      {selected && block.type !== 'image' && !readOnly && (
+      {selected && !readOnly && (
         <ResizeHandles onResizeStart={onResizeStart} />
       )}
       <button className="block-handle" type="button" onPointerDown={onDragStart} title={dragTitle}>
@@ -348,7 +366,11 @@ function WhiteboardBlockView({ block, selected, readOnly, onDragStart, onResizeS
           value={blockText(block)}
           style={textStyle}
           autoFocus={autoFocus}
-          onPointerDown={(event) => event.stopPropagation()}
+          onPointerDown={(event) => {
+            event.stopPropagation();
+            onSelect();
+          }}
+          onFocus={onSelect}
           onChange={(event) => onDraft({ ...block, data: { ...block.data, text: event.target.value } })}
           onBlur={(event) => onCommit({ ...block, data: { ...block.data, text: event.target.value } })}
         />
@@ -409,6 +431,25 @@ function BlockStyleControls({ block, disabled, onChange }: {
   );
 }
 
+function ImageControls({ block, disabled, onChange }: {
+  block: WhiteboardBlock;
+  disabled: boolean;
+  onChange: (block: WhiteboardBlock) => void;
+}) {
+  const { t } = useI18n();
+  return (
+    <label className="toggle-control" title={t('editor.aspectLock')}>
+      <input
+        type="checkbox"
+        checked={isAspectLocked(block)}
+        disabled={disabled}
+        onChange={(event) => onChange({ ...block, data: { ...block.data, aspectLocked: event.target.checked } })}
+      />
+      <span>{t('editor.aspectLock')}</span>
+    </label>
+  );
+}
+
 function upsert(blocks: WhiteboardBlock[], block: WhiteboardBlock) {
   const index = blocks.findIndex((item) => item.id === block.id);
   if (index === -1) return [...blocks, block];
@@ -453,7 +494,27 @@ function transformDraggedBlock(block: WhiteboardBlock, active: DragState, client
     y = active.originY + ((active.originH ?? block.h) - nextH);
     h = nextH;
   }
+  if (block.type === 'image' && isAspectLocked(block)) {
+    const locked = lockImageAspect(block, active, w, h);
+    w = locked.w;
+    h = locked.h;
+    if (active.handle.includes('w')) x = active.originX + ((active.originW ?? block.w) - w);
+    if (active.handle.includes('n')) y = active.originY + ((active.originH ?? block.h) - h);
+  }
   return { ...block, x, y, w, h };
+}
+
+function lockImageAspect(block: WhiteboardBlock, active: DragState, w: number, h: number) {
+  const ratio = imageAspectRatio(block);
+  const originW = active.originW ?? block.w;
+  const originH = active.originH ?? block.h;
+  const horizontal = active.handle?.includes('e') || active.handle?.includes('w');
+  const vertical = active.handle?.includes('n') || active.handle?.includes('s');
+  if (horizontal && !vertical) return { w, h: Math.max(54, w / ratio) };
+  if (vertical && !horizontal) return { w: Math.max(80, h * ratio), h };
+  const wChange = Math.abs(w - originW) / Math.max(originW, 1);
+  const hChange = Math.abs(h - originH) / Math.max(originH, 1);
+  return wChange >= hChange ? { w, h: Math.max(54, w / ratio) } : { w: Math.max(80, h * ratio), h };
 }
 
 function blockText(block: WhiteboardBlock) {
@@ -516,6 +577,39 @@ function blockBorderWidth(block: WhiteboardBlock) {
 
 function blockShadow(block: WhiteboardBlock) {
   return block.type === 'image' ? '0 12px 28px rgba(28, 44, 43, 0.14)' : 'none';
+}
+
+function isAspectLocked(block: WhiteboardBlock) {
+  return block.data.aspectLocked !== false;
+}
+
+function imageAspectRatio(block: WhiteboardBlock) {
+  const value = block.data.aspectRatio;
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value;
+  return block.w / Math.max(block.h, 1);
+}
+
+function readImageDimensions(file: File) {
+  return new Promise<{ width: number; height: number }>((resolve) => {
+    const image = new Image();
+    const url = URL.createObjectURL(file);
+    image.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve({ width: image.naturalWidth || 320, height: image.naturalHeight || 220 });
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      resolve({ width: 320, height: 220 });
+    };
+    image.src = url;
+  });
+}
+
+function fitImageSize(width: number, height: number) {
+  const maxW = 520;
+  const maxH = 360;
+  const ratio = Math.min(1, maxW / Math.max(width, 1), maxH / Math.max(height, 1));
+  return { w: Math.max(80, Math.round(width * ratio)), h: Math.max(54, Math.round(height * ratio)) };
 }
 
 function stringData(block: WhiteboardBlock, key: string, fallback: string) {

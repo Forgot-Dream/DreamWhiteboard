@@ -380,6 +380,25 @@ textarea {
   font-size: 12px;
 }
 
+.toggle-control {
+  height: 38px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 9px;
+  border: 1px solid #d3ddda;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #40514d;
+  font-size: 12px;
+}
+
+.toggle-control input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+}
+
 .toast {
   position: fixed;
   right: 18px;

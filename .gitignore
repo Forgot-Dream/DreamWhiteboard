@@ -9,4 +9,4 @@ tmp/
 *.log
 deploy/uploads/*
 !deploy/uploads/.gitkeep
-
+backend/uploads/
