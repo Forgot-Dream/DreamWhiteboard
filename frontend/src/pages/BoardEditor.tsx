@@ -1,7 +1,6 @@
 import { PointerEvent, WheelEvent, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, FileImage, GripHorizontal, MousePointer2, Square, StickyNote, Trash2, Type, ZoomIn, ZoomOut } from 'lucide-react';
-import { RichTextBlock } from '../components/RichTextBlock';
-import { api, assetURL, canEdit as canUserEdit, wsURL, type Board, type BoardSnapshot, type BlockType, type Project, type ProjectRole, type User, type WhiteboardBlock } from '../lib/api';
+import { ArrowLeft, FileImage, GripHorizontal, MousePointer2, Trash2, Type, ZoomIn, ZoomOut } from 'lucide-react';
+import { api, assetURL, canEdit as canUserEdit, wsURL, type Board, type BoardSnapshot, type Project, type ProjectRole, type User, type WhiteboardBlock } from '../lib/api';
 import { createBlock } from '../lib/blockRegistry';
 
 interface BoardEditorProps {
@@ -19,12 +18,15 @@ interface SocketMessage {
   error?: string;
 }
 
+type Tool = 'select' | 'text';
+
 export function BoardEditor({ user, board, project, role, onBack }: BoardEditorProps) {
   const [blocks, setBlocks] = useState<WhiteboardBlock[]>([]);
   const [version, setVersion] = useState(0);
   const [savedAt, setSavedAt] = useState(board.updated_at);
   const [saving, setSaving] = useState(false);
   const [connection, setConnection] = useState<'connecting' | 'live' | 'offline'>('connecting');
+  const [tool, setTool] = useState<Tool>('select');
   const [selected, setSelected] = useState('');
   const [scale, setScale] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
@@ -107,10 +109,11 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
     return { x: (clientX - offset.x) / scale, y: (clientY - offset.y) / scale };
   }
 
-  function addBlock(type: BlockType) {
-    const block = createBlock(type, (120 - offset.x) / scale, (120 - offset.y) / scale, blocks.length + 1);
+  function addTextBlock(x = (120 - offset.x) / scale, y = (120 - offset.y) / scale) {
+    const block = createBlock('note', x, y, blocks.length + 1);
     setBlocks((current) => [...current, block]);
     setSelected(block.id);
+    setTool('select');
     sendOperation('create_block', { block });
   }
 
@@ -126,6 +129,11 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
 
   function pointerDownCanvas(event: PointerEvent<HTMLDivElement>) {
     if (event.target !== event.currentTarget) return;
+    if (tool === 'text' && canEdit) {
+      const point = worldFromScreen(event.clientX, event.clientY);
+      addTextBlock(point.x, point.y);
+      return;
+    }
     setSelected('');
     drag.current = { mode: 'pan', startX: event.clientX, startY: event.clientY, originX: offset.x, originY: offset.y };
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -193,6 +201,8 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
     sendOperation('delete_block', { id });
   }
 
+  const selectedBlock = blocks.find((block) => block.id === selected);
+
   return (
     <div className="editor-shell">
       <header className="topbar">
@@ -202,14 +212,15 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
           <span>{project.name} · {saving ? 'Saving...' : `Saved ${formatSavedAt(savedAt)}`} · {connection === 'live' ? 'live' : connection}</span>
         </div>
         <div className="toolbar">
-          <button className="icon-btn selected" title="Select"><MousePointer2 size={18} /></button>
-          <button className="icon-btn" disabled={!canEdit} onClick={() => addBlock('note')} title="Note"><StickyNote size={18} /></button>
-          <button className="icon-btn" disabled={!canEdit} onClick={() => addBlock('rich_text')} title="Rich text"><Type size={18} /></button>
-          <button className="icon-btn" disabled={!canEdit} onClick={() => addBlock('shape')} title="Shape"><Square size={18} /></button>
+          <button className={`icon-btn ${tool === 'select' ? 'selected' : ''}`} onClick={() => setTool('select')} title="Select"><MousePointer2 size={18} /></button>
+          <button className={`icon-btn ${tool === 'text' ? 'selected' : ''}`} disabled={!canEdit} onClick={() => setTool('text')} title="Text box"><Type size={18} /></button>
           <label className={`icon-btn ${!canEdit ? 'disabled' : ''}`} title="Upload image">
             <FileImage size={18} />
             <input type="file" accept="image/*" disabled={!canEdit} onChange={(event) => event.target.files?.[0] && uploadImage(event.target.files[0])} />
           </label>
+          {selectedBlock && selectedBlock.type !== 'image' && (
+            <BlockStyleControls block={selectedBlock} disabled={!canEdit} onChange={updateBlock} />
+          )}
           <button className="icon-btn" onClick={() => setScale((value) => Math.max(0.25, value - 0.1))} title="Zoom out"><ZoomOut size={18} /></button>
           <span className="zoom-readout">{Math.round(scale * 100)}%</span>
           <button className="icon-btn" onClick={() => setScale((value) => Math.min(2.5, value + 0.1))} title="Zoom in"><ZoomIn size={18} /></button>
@@ -244,30 +255,63 @@ function WhiteboardBlockView({ block, selected, readOnly, onDragStart, onCommit,
   onCommit: (block: WhiteboardBlock) => void;
   onDraft: (block: WhiteboardBlock) => void;
 }) {
-  const style = { left: block.x, top: block.y, width: block.w, height: block.h, zIndex: block.z };
+  const style = {
+    left: block.x,
+    top: block.y,
+    width: block.w,
+    height: block.h,
+    zIndex: block.z,
+    background: blockFill(block),
+    borderColor: blockBorderColor(block),
+    borderWidth: blockBorderWidth(block)
+  };
+  const textStyle = { color: blockTextColor(block) };
   return (
     <div className={`block block-${block.type} ${selected ? 'selected' : ''}`} style={style}>
       <button className="block-handle" type="button" onPointerDown={onDragStart} title="Drag block">
         <GripHorizontal size={16} />
       </button>
-      {block.type === 'note' && (
+      {block.type !== 'image' && (
         <textarea
           readOnly={readOnly}
-          value={String(block.data.text ?? '')}
+          value={blockText(block)}
+          style={textStyle}
           onPointerDown={(event) => event.stopPropagation()}
           onChange={(event) => onDraft({ ...block, data: { ...block.data, text: event.target.value } })}
           onBlur={(event) => onCommit({ ...block, data: { ...block.data, text: event.target.value } })}
         />
       )}
-      {block.type === 'rich_text' && (
-        <RichTextBlock
-          readOnly={readOnly}
-          value={block.data.doc}
-          onChange={(doc) => onCommit({ ...block, data: { ...block.data, doc } })}
-        />
-      )}
       {block.type === 'image' && <img src={String(block.data.url ?? '')} alt={String(block.data.alt ?? '')} draggable={false} />}
-      {block.type === 'shape' && <div className={`shape ${block.data.shape === 'ellipse' ? 'ellipse' : ''}`} style={{ background: String(block.data.color ?? '#2f6f73') }} />}
+    </div>
+  );
+}
+
+function BlockStyleControls({ block, disabled, onChange }: {
+  block: WhiteboardBlock;
+  disabled: boolean;
+  onChange: (block: WhiteboardBlock) => void;
+}) {
+  function update(data: Record<string, unknown>) {
+    onChange({ ...block, data: { ...block.data, ...data } });
+  }
+  return (
+    <div className="style-controls">
+      <label title="Fill color">
+        <span>Fill</span>
+        <input type="color" disabled={disabled} value={blockFill(block)} onChange={(event) => update({ fill: event.target.value })} />
+      </label>
+      <label title="Text color">
+        <span>Text</span>
+        <input type="color" disabled={disabled} value={blockTextColor(block)} onChange={(event) => update({ textColor: event.target.value })} />
+      </label>
+      <label title="Border color">
+        <span>Border</span>
+        <input type="color" disabled={disabled} value={blockBorderColor(block)} onChange={(event) => update({ borderColor: event.target.value })} />
+      </label>
+      <label title="Border width">
+        <span>Width</span>
+        <input type="number" min="0" max="12" disabled={disabled} value={blockBorderWidth(block)} onChange={(event) => update({ borderWidth: Number(event.target.value) })} />
+      </label>
     </div>
   );
 }
@@ -278,6 +322,42 @@ function upsert(blocks: WhiteboardBlock[], block: WhiteboardBlock) {
   const next = blocks.slice();
   next[index] = block;
   return next;
+}
+
+function blockText(block: WhiteboardBlock) {
+  if (typeof block.data.text === 'string') return block.data.text;
+  if (block.type === 'rich_text') return extractRichText(block.data.doc);
+  return '';
+}
+
+function extractRichText(doc: unknown): string {
+  if (!doc || typeof doc !== 'object') return '';
+  const node = doc as { text?: unknown; content?: unknown };
+  const ownText = typeof node.text === 'string' ? node.text : '';
+  const children = Array.isArray(node.content) ? node.content.map(extractRichText).filter(Boolean).join('\n') : '';
+  return [ownText, children].filter(Boolean).join('\n');
+}
+
+function blockFill(block: WhiteboardBlock) {
+  return stringData(block, 'fill', block.type === 'note' ? '#fff8c8' : '#ffffff');
+}
+
+function blockTextColor(block: WhiteboardBlock) {
+  return stringData(block, 'textColor', '#3b3220');
+}
+
+function blockBorderColor(block: WhiteboardBlock) {
+  return stringData(block, 'borderColor', '#becbc7');
+}
+
+function blockBorderWidth(block: WhiteboardBlock) {
+  const value = block.data.borderWidth;
+  return typeof value === 'number' && Number.isFinite(value) ? value : 1;
+}
+
+function stringData(block: WhiteboardBlock, key: string, fallback: string) {
+  const value = block.data[key];
+  return typeof value === 'string' ? value : fallback;
 }
 
 function formatSavedAt(value: string) {

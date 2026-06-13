@@ -17,8 +17,18 @@ export const blockRegistry: Record<BlockType, BlockDefinition> = {
   note: {
     type: 'note',
     label: 'Note',
-    defaults: { w: 260, h: 160, data: { text: 'New note' } },
-    schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }
+    defaults: { w: 280, h: 170, data: { text: 'Text', fill: '#fff8c8', textColor: '#3b3220', borderColor: '#becbc7', borderWidth: 1 } },
+    schema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string' },
+        fill: { type: 'string' },
+        textColor: { type: 'string' },
+        borderColor: { type: 'string' },
+        borderWidth: { type: 'number' }
+      },
+      required: ['text']
+    }
   },
   image: {
     type: 'image',
@@ -47,4 +57,3 @@ export function createBlock(type: BlockType, x: number, y: number, z: number): W
     data: structuredClone(definition.defaults.data)
   };
 }
-

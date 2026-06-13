@@ -183,6 +183,14 @@ textarea {
   margin-bottom: 16px;
 }
 
+.member-form {
+  grid-template-columns: minmax(0, 1fr) minmax(88px, 112px) auto;
+}
+
+.member-form .primary {
+  min-width: 68px;
+}
+
 .nav-list {
   display: grid;
   gap: 8px;
@@ -272,6 +280,7 @@ textarea {
   display: flex;
   gap: 6px;
   align-items: center;
+  flex-wrap: wrap;
 }
 
 .icon-btn {
@@ -299,6 +308,41 @@ textarea {
   color: #40514d;
   background: #f7faf8;
   font-size: 13px;
+}
+
+.style-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 4px;
+}
+
+.style-controls label {
+  height: 38px;
+  display: inline-grid;
+  grid-template-columns: auto 30px;
+  align-items: center;
+  gap: 5px;
+  padding: 0 7px;
+  border: 1px solid #d3ddda;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #40514d;
+  font-size: 12px;
+}
+
+.style-controls input[type="color"] {
+  width: 28px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.style-controls input[type="number"] {
+  width: 44px;
+  height: 26px;
+  padding: 2px 5px;
 }
 
 .toast {
@@ -378,8 +422,7 @@ textarea {
   border: 0;
   border-radius: 0;
   padding: 34px 14px 14px;
-  background: #fff8c8;
-  color: #3b3220;
+  background: transparent;
 }
 
 .rich-editor {
@@ -401,21 +444,16 @@ textarea {
   display: block;
 }
 
-.shape {
-  width: 100%;
-  height: 100%;
-}
-
-.shape.ellipse {
-  border-radius: 50%;
-}
-
 @media (max-width: 1000px) {
   .workspace-grid {
     grid-template-columns: 1fr;
   }
 
   .inline-form {
+    grid-template-columns: 1fr;
+  }
+
+  .member-form {
     grid-template-columns: 1fr;
   }
 

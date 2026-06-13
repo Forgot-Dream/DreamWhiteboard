@@ -138,7 +138,7 @@ export function Projects({ user, onOpenBoard }: ProjectsProps) {
           <Users size={20} />
         </div>
         {canManage(myRole, user) && (
-          <form className="inline-form" onSubmit={addMember}>
+          <form className="inline-form member-form" onSubmit={addMember}>
             <select value={memberUser} onChange={(event) => setMemberUser(event.target.value)}>
               <option value="">Select user</option>
               {users.map((nextUser) => (
@@ -167,4 +167,3 @@ export function Projects({ user, onOpenBoard }: ProjectsProps) {
     </div>
   );
 }
-
