@@ -17,7 +17,7 @@ export const blockRegistry: Record<BlockType, BlockDefinition> = {
   note: {
     type: 'note',
     label: 'Note',
-    defaults: { w: 280, h: 170, data: { text: 'Text', fill: '#fff8c8', textColor: '#3b3220', borderColor: '#becbc7', borderWidth: 1 } },
+    defaults: { w: 280, h: 170, data: { text: 'Text', fill: 'transparent', textColor: '#3b3220', borderColor: '#becbc7', borderWidth: 1 } },
     schema: {
       type: 'object',
       properties: {

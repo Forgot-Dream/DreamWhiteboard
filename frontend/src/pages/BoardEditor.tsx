@@ -20,6 +20,19 @@ interface SocketMessage {
 }
 
 type Tool = 'select' | 'text';
+type ResizeHandle = 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'nw';
+
+interface DragState {
+  mode: 'pan' | 'block' | 'resize';
+  id?: string;
+  handle?: ResizeHandle;
+  startX: number;
+  startY: number;
+  originX: number;
+  originY: number;
+  originW?: number;
+  originH?: number;
+}
 
 export function BoardEditor({ user, board, project, role, onBack }: BoardEditorProps) {
   const { t, formatTime } = useI18n();
@@ -35,7 +48,7 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
   const [error, setError] = useState('');
   const socket = useRef<WebSocket | null>(null);
   const saveTimers = useRef<Record<string, number>>({});
-  const drag = useRef<{ mode: 'pan' | 'block'; id?: string; startX: number; startY: number; originX: number; originY: number } | null>(null);
+  const drag = useRef<DragState | null>(null);
   const canEdit = canUserEdit(role, user);
   const clientID = useMemo(() => `cli_${crypto.randomUUID()}`, []);
 
@@ -116,7 +129,6 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
     block.data = { ...block.data, text: t('editor.defaultText') };
     setBlocks((current) => [...current, block]);
     setSelected(block.id);
-    setTool('select');
     sendOperation('create_block', { block });
   }
 
@@ -153,24 +165,44 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
     event.currentTarget.setPointerCapture(event.pointerId);
   }
 
+  function pointerDownResize(event: PointerEvent<HTMLElement>, block: WhiteboardBlock, handle: ResizeHandle) {
+    event.stopPropagation();
+    if (!canEdit) return;
+    setSelected(block.id);
+    drag.current = {
+      mode: 'resize',
+      id: block.id,
+      handle,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: block.x,
+      originY: block.y,
+      originW: block.w,
+      originH: block.h
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
   function pointerMove(event: PointerEvent<HTMLDivElement>) {
     const active = drag.current;
     if (!active) return;
     if (active.mode === 'pan') {
       setOffset({ x: active.originX + event.clientX - active.startX, y: active.originY + event.clientY - active.startY });
     } else if (active.id) {
-      const dx = (event.clientX - active.startX) / scale;
-      const dy = (event.clientY - active.startY) / scale;
-      setBlocks((current) => current.map((block) => block.id === active.id ? { ...block, x: active.originX + dx, y: active.originY + dy } : block));
+      setBlocks((current) => current.map((block) => block.id === active.id ? transformDraggedBlock(block, active, event.clientX, event.clientY, scale) : block));
     }
   }
 
-  function pointerUp() {
+  function pointerUp(event: PointerEvent<HTMLDivElement>) {
     const active = drag.current;
     drag.current = null;
     if (active?.mode === 'block' && active.id) {
       const block = blocks.find((item) => item.id === active.id);
-      if (block) sendOperation('move_block', { ...block });
+      if (block) sendOperation('move_block', { ...transformDraggedBlock(block, active, event.clientX, event.clientY, scale) });
+    }
+    if (active?.mode === 'resize' && active.id) {
+      const block = blocks.find((item) => item.id === active.id);
+      if (block) sendOperation('resize_block', { ...transformDraggedBlock(block, active, event.clientX, event.clientY, scale) });
     }
   }
 
@@ -242,6 +274,7 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
               onDragStart={(event) => pointerDownBlock(event, block)}
               onCommit={updateBlock}
               onDraft={updateBlockDraft}
+              onResizeStart={(event, handle) => pointerDownResize(event, block, handle)}
               dragTitle={t('editor.dragBlock')}
             />
           ))}
@@ -251,11 +284,12 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
   );
 }
 
-function WhiteboardBlockView({ block, selected, readOnly, onDragStart, onCommit, onDraft, dragTitle }: {
+function WhiteboardBlockView({ block, selected, readOnly, onDragStart, onResizeStart, onCommit, onDraft, dragTitle }: {
   block: WhiteboardBlock;
   selected: boolean;
   readOnly: boolean;
   onDragStart: (event: PointerEvent<HTMLElement>) => void;
+  onResizeStart: (event: PointerEvent<HTMLElement>, handle: ResizeHandle) => void;
   onCommit: (block: WhiteboardBlock) => void;
   onDraft: (block: WhiteboardBlock) => void;
   dragTitle: string;
@@ -273,6 +307,9 @@ function WhiteboardBlockView({ block, selected, readOnly, onDragStart, onCommit,
   const textStyle = { color: blockTextColor(block) };
   return (
     <div className={`block block-${block.type} ${selected ? 'selected' : ''}`} style={style}>
+      {selected && block.type !== 'image' && !readOnly && (
+        <ResizeHandles onResizeStart={onResizeStart} />
+      )}
       <button className="block-handle" type="button" onPointerDown={onDragStart} title={dragTitle}>
         <GripHorizontal size={16} />
       </button>
@@ -291,6 +328,23 @@ function WhiteboardBlockView({ block, selected, readOnly, onDragStart, onCommit,
   );
 }
 
+function ResizeHandles({ onResizeStart }: { onResizeStart: (event: PointerEvent<HTMLElement>, handle: ResizeHandle) => void }) {
+  const handles: ResizeHandle[] = ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw'];
+  return (
+    <>
+      {handles.map((handle) => (
+        <button
+          className={`resize-handle resize-${handle}`}
+          key={handle}
+          type="button"
+          onPointerDown={(event) => onResizeStart(event, handle)}
+          aria-label={`resize ${handle}`}
+        />
+      ))}
+    </>
+  );
+}
+
 function BlockStyleControls({ block, disabled, onChange }: {
   block: WhiteboardBlock;
   disabled: boolean;
@@ -304,8 +358,11 @@ function BlockStyleControls({ block, disabled, onChange }: {
     <div className="style-controls">
       <label title={t('editor.style.fill')}>
         <span>{t('editor.fill')}</span>
-        <input type="color" disabled={disabled} value={blockFill(block)} onChange={(event) => update({ fill: event.target.value })} />
+        <input type="color" disabled={disabled} value={blockFillInput(block)} onChange={(event) => update({ fill: event.target.value })} />
       </label>
+      <button className="style-mini-btn" type="button" disabled={disabled} onClick={() => update({ fill: 'transparent' })}>
+        {t('editor.noFill')}
+      </button>
       <label title={t('editor.style.text')}>
         <span>{t('editor.text')}</span>
         <input type="color" disabled={disabled} value={blockTextColor(block)} onChange={(event) => update({ textColor: event.target.value })} />
@@ -330,6 +387,36 @@ function upsert(blocks: WhiteboardBlock[], block: WhiteboardBlock) {
   return next;
 }
 
+function transformDraggedBlock(block: WhiteboardBlock, active: DragState, clientX: number, clientY: number, scale: number) {
+  const dx = (clientX - active.startX) / scale;
+  const dy = (clientY - active.startY) / scale;
+  if (active.mode === 'block') {
+    return { ...block, x: active.originX + dx, y: active.originY + dy };
+  }
+  if (active.mode !== 'resize' || !active.handle) return block;
+
+  const minW = 80;
+  const minH = 54;
+  let x = active.originX;
+  let y = active.originY;
+  let w = active.originW ?? block.w;
+  let h = active.originH ?? block.h;
+
+  if (active.handle.includes('e')) w = Math.max(minW, (active.originW ?? block.w) + dx);
+  if (active.handle.includes('s')) h = Math.max(minH, (active.originH ?? block.h) + dy);
+  if (active.handle.includes('w')) {
+    const nextW = Math.max(minW, (active.originW ?? block.w) - dx);
+    x = active.originX + ((active.originW ?? block.w) - nextW);
+    w = nextW;
+  }
+  if (active.handle.includes('n')) {
+    const nextH = Math.max(minH, (active.originH ?? block.h) - dy);
+    y = active.originY + ((active.originH ?? block.h) - nextH);
+    h = nextH;
+  }
+  return { ...block, x, y, w, h };
+}
+
 function blockText(block: WhiteboardBlock) {
   if (typeof block.data.text === 'string') return block.data.text;
   if (block.type === 'rich_text') return extractRichText(block.data.doc);
@@ -345,7 +432,12 @@ function extractRichText(doc: unknown): string {
 }
 
 function blockFill(block: WhiteboardBlock) {
-  return stringData(block, 'fill', block.type === 'note' ? '#fff8c8' : '#ffffff');
+  return stringData(block, 'fill', 'transparent');
+}
+
+function blockFillInput(block: WhiteboardBlock) {
+  const fill = blockFill(block);
+  return fill === 'transparent' ? '#ffffff' : fill;
 }
 
 function blockTextColor(block: WhiteboardBlock) {

@@ -370,6 +370,16 @@ textarea {
   padding: 2px 5px;
 }
 
+.style-mini-btn {
+  height: 38px;
+  border: 1px solid #d3ddda;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #40514d;
+  padding: 0 8px;
+  font-size: 12px;
+}
+
 .toast {
   position: fixed;
   right: 18px;
@@ -400,6 +410,7 @@ textarea {
   position: absolute;
   inset: 0;
   transform-origin: 0 0;
+  pointer-events: none;
 }
 
 .block {
@@ -408,7 +419,8 @@ textarea {
   border-radius: 8px;
   background: #ffffff;
   box-shadow: 0 12px 28px rgba(28, 44, 43, 0.14);
-  overflow: hidden;
+  overflow: visible;
+  pointer-events: auto;
 }
 
 .block-handle {
@@ -436,9 +448,77 @@ textarea {
   opacity: 1;
 }
 
-.block.selected {
-  outline: 2px solid #23666b;
-  outline-offset: 2px;
+.block.selected::after {
+  content: "";
+  position: absolute;
+  inset: -7px;
+  border: 2px solid #23666b;
+  border-radius: 12px;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.resize-handle {
+  position: absolute;
+  z-index: 5;
+  width: 10px;
+  height: 10px;
+  border: 2px solid #23666b;
+  border-radius: 50%;
+  background: #ffffff;
+  padding: 0;
+}
+
+.resize-n {
+  top: -12px;
+  left: 50%;
+  transform: translateX(-50%);
+  cursor: ns-resize;
+}
+
+.resize-ne {
+  top: -12px;
+  right: -12px;
+  cursor: nesw-resize;
+}
+
+.resize-e {
+  top: 50%;
+  right: -12px;
+  transform: translateY(-50%);
+  cursor: ew-resize;
+}
+
+.resize-se {
+  right: -12px;
+  bottom: -12px;
+  cursor: nwse-resize;
+}
+
+.resize-s {
+  bottom: -12px;
+  left: 50%;
+  transform: translateX(-50%);
+  cursor: ns-resize;
+}
+
+.resize-sw {
+  bottom: -12px;
+  left: -12px;
+  cursor: nesw-resize;
+}
+
+.resize-w {
+  top: 50%;
+  left: -12px;
+  transform: translateY(-50%);
+  cursor: ew-resize;
+}
+
+.resize-nw {
+  top: -12px;
+  left: -12px;
+  cursor: nwse-resize;
 }
 
 .block textarea {
@@ -448,6 +528,7 @@ textarea {
   border-radius: 0;
   padding: 34px 14px 14px;
   background: transparent;
+  outline: 0;
 }
 
 .rich-editor {
