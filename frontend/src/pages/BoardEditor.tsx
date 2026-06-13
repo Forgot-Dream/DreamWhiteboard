@@ -50,6 +50,7 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
   const [error, setError] = useState('');
   const socket = useRef<WebSocket | null>(null);
   const saveTimers = useRef<Record<string, number>>({});
+  const pendingCreates = useRef<Set<string>>(new Set());
   const drag = useRef<DragState | null>(null);
   const canEdit = canUserEdit(role, user);
   const clientID = useMemo(() => `cli_${crypto.randomUUID()}`, []);
@@ -70,7 +71,7 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
     ws.onmessage = (event) => {
       const message = JSON.parse(event.data) as SocketMessage;
       if (message.type === 'snapshot' && message.snapshot) {
-        setBlocks(message.snapshot.blocks ?? []);
+        setBlocks((current) => mergeServerBlocks(message.snapshot?.blocks ?? [], current, pendingCreates.current));
         setVersion(message.snapshot.version);
         setSavedAt(message.snapshot.updated_at);
         setSaving(false);
@@ -81,7 +82,7 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
         if (message.operation.created_at) setSavedAt(message.operation.created_at);
       }
       if (message.type === 'operation_ack' && message.snapshot) {
-        setBlocks(message.snapshot.blocks ?? []);
+        setBlocks((current) => mergeServerBlocks(message.snapshot?.blocks ?? [], current, pendingCreates.current));
         setVersion(message.snapshot.version);
         setSavedAt(message.snapshot.updated_at);
         setSaving(false);
@@ -131,7 +132,6 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
     const block = { ...draft, x: x - TEXT_INSET_X, y: y - TEXT_INSET_Y, data: { ...draft.data, text: '' } };
     setBlocks((current) => [...current, block]);
     setSelected(block.id);
-    sendOperation('create_block', { block });
   }
 
   async function uploadImage(file: File) {
@@ -222,17 +222,28 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
       removeBlock(block.id);
       return;
     }
-    const next = { ...block, data: { ...block.data, transient: false } };
+    const wasPending = shouldCreateOnSync(block, pendingCreates.current);
+    const next = cleanLocalCreateState(block);
     setBlocks((current) => upsert(current, next));
-    sendOperation('update_block', { ...next });
+    if (wasPending) pendingCreates.current.add(block.id);
+    sendOperation(wasPending ? 'create_block' : 'update_block', wasPending ? { block: cleanBlockForSync(next) } : { ...next });
   }
 
   function updateBlockDraft(block: WhiteboardBlock) {
-    const next = blockText(block).trim() ? { ...block, data: { ...block.data, transient: false } } : block;
+    const wasPending = shouldCreateOnSync(block, pendingCreates.current);
+    const next = wasPending ? block : cleanLocalCreateState(block);
     setBlocks((current) => upsert(current, next));
     window.clearTimeout(saveTimers.current[block.id]);
     saveTimers.current[block.id] = window.setTimeout(() => {
-      if (!shouldDeleteEmptyTextBlock(next)) sendOperation('update_block', { ...next });
+      if (shouldDeleteEmptyTextBlock(next)) return;
+      if (wasPending) {
+        pendingCreates.current.add(next.id);
+        const synced = cleanLocalCreateState(next);
+        setBlocks((current) => upsert(current, synced));
+        sendOperation('create_block', { block: cleanBlockForSync(synced) });
+        return;
+      }
+      sendOperation('update_block', { ...next });
     }, 800);
   }
 
@@ -244,9 +255,11 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
 
   function removeBlock(id: string) {
     window.clearTimeout(saveTimers.current[id]);
+    const shouldSyncDelete = !blocks.some((block) => block.id === id && isPendingTextBlock(block) && !pendingCreates.current.has(id));
+    pendingCreates.current.delete(id);
     setBlocks((current) => current.filter((block) => block.id !== id));
     setSelected((current) => current === id ? '' : current);
-    sendOperation('delete_block', { id });
+    if (shouldSyncDelete) sendOperation('delete_block', { id });
   }
 
   const selectedBlock = blocks.find((block) => block.id === selected);
@@ -289,7 +302,7 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
               onDraft={updateBlockDraft}
               onResizeStart={(event, handle) => pointerDownResize(event, block, handle)}
               dragTitle={t('editor.dragBlock')}
-              autoFocus={selected === block.id && Boolean(block.data.transient)}
+              autoFocus={selected === block.id && isPendingTextBlock(block)}
             />
           ))}
         </div>
@@ -404,6 +417,15 @@ function upsert(blocks: WhiteboardBlock[], block: WhiteboardBlock) {
   return next;
 }
 
+function mergeServerBlocks(serverBlocks: WhiteboardBlock[], currentBlocks: WhiteboardBlock[], pendingCreates: Set<string>) {
+  const serverIDs = new Set(serverBlocks.map((block) => block.id));
+  for (const id of Array.from(pendingCreates)) {
+    if (serverIDs.has(id)) pendingCreates.delete(id);
+  }
+  const localDrafts = currentBlocks.filter((block) => (isPendingTextBlock(block) || pendingCreates.has(block.id)) && !serverIDs.has(block.id));
+  return [...serverBlocks, ...localDrafts];
+}
+
 function transformDraggedBlock(block: WhiteboardBlock, active: DragState, clientX: number, clientY: number, scale: number) {
   const dx = (clientX - active.startX) / scale;
   const dy = (clientY - active.startY) / scale;
@@ -441,7 +463,25 @@ function blockText(block: WhiteboardBlock) {
 }
 
 function shouldDeleteEmptyTextBlock(block: WhiteboardBlock) {
-  return block.type !== 'image' && Boolean(block.data.transient) && blockText(block).trim() === '';
+  return isPendingTextBlock(block) && blockText(block).trim() === '';
+}
+
+function isPendingTextBlock(block: WhiteboardBlock) {
+  return block.type !== 'image' && Boolean(block.data.pendingCreate);
+}
+
+function shouldCreateOnSync(block: WhiteboardBlock, pendingCreates: Set<string>) {
+  return isPendingTextBlock(block) && !pendingCreates.has(block.id);
+}
+
+function cleanLocalCreateState(block: WhiteboardBlock) {
+  return { ...block, data: { ...block.data, pendingCreate: false } };
+}
+
+function cleanBlockForSync(block: WhiteboardBlock) {
+  const { pendingCreate, ...data } = block.data;
+  void pendingCreate;
+  return { ...block, data };
 }
 
 function extractRichText(doc: unknown): string {
