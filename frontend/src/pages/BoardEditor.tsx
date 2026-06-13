@@ -21,8 +21,8 @@ interface SocketMessage {
 
 type Tool = 'select' | 'text';
 type ResizeHandle = 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'nw';
-const TEXT_INSET_X = 14;
-const TEXT_INSET_Y = 34;
+const TEXT_INSET_X = 4;
+const TEXT_INSET_Y = 4;
 
 interface DragState {
   mode: 'pan' | 'block' | 'resize';
@@ -576,7 +576,8 @@ function blockBorderWidth(block: WhiteboardBlock) {
 }
 
 function blockShadow(block: WhiteboardBlock) {
-  return block.type === 'image' ? '0 12px 28px rgba(28, 44, 43, 0.14)' : 'none';
+  void block;
+  return 'none';
 }
 
 function isAspectLocked(block: WhiteboardBlock) {

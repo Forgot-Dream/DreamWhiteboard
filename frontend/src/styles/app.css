@@ -438,9 +438,11 @@ textarea {
 
 .block {
   position: absolute;
-  border: 1px solid #becbc7;
+  border-style: solid;
+  border-color: transparent;
+  border-width: 0;
   border-radius: 8px;
-  background: #ffffff;
+  background: transparent;
   box-shadow: none;
   overflow: visible;
   pointer-events: auto;
@@ -549,7 +551,7 @@ textarea {
   height: 100%;
   border: 0;
   border-radius: 0;
-  padding: 34px 14px 14px;
+  padding: 4px;
   background: transparent;
   outline: 0;
 }
