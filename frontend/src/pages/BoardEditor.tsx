@@ -302,7 +302,8 @@ function WhiteboardBlockView({ block, selected, readOnly, onDragStart, onResizeS
     zIndex: block.z,
     background: blockFill(block),
     borderColor: blockBorderColor(block),
-    borderWidth: blockBorderWidth(block)
+    borderWidth: blockBorderWidth(block),
+    boxShadow: blockShadow(block)
   };
   const textStyle = { color: blockTextColor(block) };
   return (
@@ -451,6 +452,10 @@ function blockBorderColor(block: WhiteboardBlock) {
 function blockBorderWidth(block: WhiteboardBlock) {
   const value = block.data.borderWidth;
   return typeof value === 'number' && Number.isFinite(value) ? value : 1;
+}
+
+function blockShadow(block: WhiteboardBlock) {
+  return block.type === 'image' ? '0 12px 28px rgba(28, 44, 43, 0.14)' : 'none';
 }
 
 function stringData(block: WhiteboardBlock, key: string, fallback: string) {

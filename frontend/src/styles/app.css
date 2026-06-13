@@ -418,7 +418,7 @@ textarea {
   border: 1px solid #becbc7;
   border-radius: 8px;
   background: #ffffff;
-  box-shadow: 0 12px 28px rgba(28, 44, 43, 0.14);
+  box-shadow: none;
   overflow: visible;
   pointer-events: auto;
 }
