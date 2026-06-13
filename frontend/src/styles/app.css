@@ -562,6 +562,7 @@ textarea {
   height: 100%;
   object-fit: cover;
   display: block;
+  pointer-events: none;
 }
 
 @media (max-width: 1000px) {
