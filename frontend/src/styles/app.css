@@ -406,6 +406,10 @@ textarea {
   background-size: 32px 32px;
 }
 
+.canvas-text-tool {
+  cursor: text;
+}
+
 .world {
   position: absolute;
   inset: 0;

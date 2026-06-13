@@ -21,6 +21,8 @@ interface SocketMessage {
 
 type Tool = 'select' | 'text';
 type ResizeHandle = 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'nw';
+const TEXT_INSET_X = 14;
+const TEXT_INSET_Y = 34;
 
 interface DragState {
   mode: 'pan' | 'block' | 'resize';
@@ -125,8 +127,8 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
   }
 
   function addTextBlock(x = (120 - offset.x) / scale, y = (120 - offset.y) / scale) {
-    const block = createBlock('note', x, y, blocks.length + 1);
-    block.data = { ...block.data, text: t('editor.defaultText') };
+    const draft = createBlock('note', 0, 0, blocks.length + 1);
+    const block = { ...draft, x: x - TEXT_INSET_X, y: y - TEXT_INSET_Y, data: { ...draft.data, text: '' } };
     setBlocks((current) => [...current, block]);
     setSelected(block.id);
     sendOperation('create_block', { block });
@@ -216,23 +218,34 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
 
   function updateBlock(block: WhiteboardBlock) {
     window.clearTimeout(saveTimers.current[block.id]);
-    setBlocks((current) => upsert(current, block));
-    sendOperation('update_block', { ...block });
+    if (shouldDeleteEmptyTextBlock(block)) {
+      removeBlock(block.id);
+      return;
+    }
+    const next = { ...block, data: { ...block.data, transient: false } };
+    setBlocks((current) => upsert(current, next));
+    sendOperation('update_block', { ...next });
   }
 
   function updateBlockDraft(block: WhiteboardBlock) {
-    setBlocks((current) => upsert(current, block));
+    const next = blockText(block).trim() ? { ...block, data: { ...block.data, transient: false } } : block;
+    setBlocks((current) => upsert(current, next));
     window.clearTimeout(saveTimers.current[block.id]);
     saveTimers.current[block.id] = window.setTimeout(() => {
-      sendOperation('update_block', { ...block });
+      if (!shouldDeleteEmptyTextBlock(next)) sendOperation('update_block', { ...next });
     }, 800);
   }
 
   function deleteSelected() {
     const id = selected;
     if (!id) return;
+    removeBlock(id);
+  }
+
+  function removeBlock(id: string) {
+    window.clearTimeout(saveTimers.current[id]);
     setBlocks((current) => current.filter((block) => block.id !== id));
-    setSelected('');
+    setSelected((current) => current === id ? '' : current);
     sendOperation('delete_block', { id });
   }
 
@@ -263,7 +276,7 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
         </div>
       </header>
       {error && <div className="toast">{error}</div>}
-      <div className="canvas" onPointerDown={pointerDownCanvas} onPointerMove={pointerMove} onPointerUp={pointerUp} onWheel={wheel}>
+      <div className={`canvas ${tool === 'text' && canEdit ? 'canvas-text-tool' : ''}`} onPointerDown={pointerDownCanvas} onPointerMove={pointerMove} onPointerUp={pointerUp} onWheel={wheel}>
         <div className="world" style={{ transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})` }}>
           {blocks.map((block) => (
             <WhiteboardBlockView
@@ -276,6 +289,7 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
               onDraft={updateBlockDraft}
               onResizeStart={(event, handle) => pointerDownResize(event, block, handle)}
               dragTitle={t('editor.dragBlock')}
+              autoFocus={selected === block.id && Boolean(block.data.transient)}
             />
           ))}
         </div>
@@ -284,7 +298,7 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
   );
 }
 
-function WhiteboardBlockView({ block, selected, readOnly, onDragStart, onResizeStart, onCommit, onDraft, dragTitle }: {
+function WhiteboardBlockView({ block, selected, readOnly, onDragStart, onResizeStart, onCommit, onDraft, dragTitle, autoFocus }: {
   block: WhiteboardBlock;
   selected: boolean;
   readOnly: boolean;
@@ -293,6 +307,7 @@ function WhiteboardBlockView({ block, selected, readOnly, onDragStart, onResizeS
   onCommit: (block: WhiteboardBlock) => void;
   onDraft: (block: WhiteboardBlock) => void;
   dragTitle: string;
+  autoFocus: boolean;
 }) {
   const style = {
     left: block.x,
@@ -319,6 +334,7 @@ function WhiteboardBlockView({ block, selected, readOnly, onDragStart, onResizeS
           readOnly={readOnly}
           value={blockText(block)}
           style={textStyle}
+          autoFocus={autoFocus}
           onPointerDown={(event) => event.stopPropagation()}
           onChange={(event) => onDraft({ ...block, data: { ...block.data, text: event.target.value } })}
           onBlur={(event) => onCommit({ ...block, data: { ...block.data, text: event.target.value } })}
@@ -422,6 +438,10 @@ function blockText(block: WhiteboardBlock) {
   if (typeof block.data.text === 'string') return block.data.text;
   if (block.type === 'rich_text') return extractRichText(block.data.doc);
   return '';
+}
+
+function shouldDeleteEmptyTextBlock(block: WhiteboardBlock) {
+  return block.type !== 'image' && Boolean(block.data.transient) && blockText(block).trim() === '';
 }
 
 function extractRichText(doc: unknown): string {
