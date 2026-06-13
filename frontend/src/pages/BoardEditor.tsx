@@ -355,7 +355,8 @@ function WhiteboardBlockView({ block, selected, readOnly, onSelect, onDragStart,
   };
   const textStyle = { color: blockTextColor(block) };
   return (
-    <div className={`block block-${block.type} ${selected ? 'selected' : ''}`} style={style} onPointerDown={onDragStart}>
+    <div className={`block block-${block.type} ${selected ? 'selected' : ''}`} style={style}>
+      <div className="block-hit-area" onPointerDown={onDragStart} />
       {selected && !readOnly && (
         <ResizeHandles onResizeStart={onResizeStart} />
       )}
