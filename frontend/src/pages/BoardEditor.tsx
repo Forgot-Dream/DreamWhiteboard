@@ -1,5 +1,5 @@
 import { PointerEvent, WheelEvent, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, FileImage, MousePointer2, Plus, Square, StickyNote, Trash2, Type, ZoomIn, ZoomOut } from 'lucide-react';
+import { ArrowLeft, FileImage, GripHorizontal, MousePointer2, Square, StickyNote, Trash2, Type, ZoomIn, ZoomOut } from 'lucide-react';
 import { RichTextBlock } from '../components/RichTextBlock';
 import { api, assetURL, canEdit as canUserEdit, wsURL, type Board, type BoardSnapshot, type BlockType, type Project, type ProjectRole, type User, type WhiteboardBlock } from '../lib/api';
 import { createBlock } from '../lib/blockRegistry';
@@ -15,18 +15,22 @@ interface BoardEditorProps {
 interface SocketMessage {
   type: string;
   snapshot?: BoardSnapshot;
-  operation?: { type: string; version: number; payload: Record<string, unknown> };
+  operation?: { type: string; version: number; payload: Record<string, unknown>; created_at?: string };
   error?: string;
 }
 
 export function BoardEditor({ user, board, project, role, onBack }: BoardEditorProps) {
   const [blocks, setBlocks] = useState<WhiteboardBlock[]>([]);
   const [version, setVersion] = useState(0);
+  const [savedAt, setSavedAt] = useState(board.updated_at);
+  const [saving, setSaving] = useState(false);
+  const [connection, setConnection] = useState<'connecting' | 'live' | 'offline'>('connecting');
   const [selected, setSelected] = useState('');
   const [scale, setScale] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [error, setError] = useState('');
   const socket = useRef<WebSocket | null>(null);
+  const saveTimers = useRef<Record<string, number>>({});
   const drag = useRef<{ mode: 'pan' | 'block'; id?: string; startX: number; startY: number; originX: number; originY: number } | null>(null);
   const canEdit = canUserEdit(role, user);
   const clientID = useMemo(() => `cli_${crypto.randomUUID()}`, []);
@@ -38,6 +42,7 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
         if (!alive) return;
         setBlocks(result.snapshot.blocks ?? []);
         setVersion(result.snapshot.version);
+        setSavedAt(result.snapshot.updated_at);
       })
       .catch((err) => setError(err.message));
 
@@ -48,27 +53,39 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
       if (message.type === 'snapshot' && message.snapshot) {
         setBlocks(message.snapshot.blocks ?? []);
         setVersion(message.snapshot.version);
+        setSavedAt(message.snapshot.updated_at);
+        setSaving(false);
       }
       if (message.type === 'operation_broadcast' && message.operation) {
         applyRemoteOperation(message.operation.type, message.operation.payload);
         setVersion(message.operation.version);
+        if (message.operation.created_at) setSavedAt(message.operation.created_at);
       }
       if (message.type === 'operation_ack' && message.snapshot) {
         setBlocks(message.snapshot.blocks ?? []);
         setVersion(message.snapshot.version);
+        setSavedAt(message.snapshot.updated_at);
+        setSaving(false);
       }
       if (message.type === 'error') setError(message.error ?? 'Socket error');
     };
-    ws.onopen = () => ws.send(JSON.stringify({ type: 'join', client_id: clientID }));
-    ws.onerror = () => setError('Live connection failed');
+    ws.onopen = () => {
+      setConnection('live');
+      setError('');
+      ws.send(JSON.stringify({ type: 'join', client_id: clientID }));
+    };
+    ws.onerror = () => setConnection('offline');
+    ws.onclose = () => setConnection('offline');
     return () => {
       alive = false;
+      Object.values(saveTimers.current).forEach((timer) => window.clearTimeout(timer));
       ws.close();
     };
   }, [board.id, clientID]);
 
   function sendOperation(operation: string, payload: Record<string, unknown>) {
     if (!canEdit || socket.current?.readyState !== WebSocket.OPEN) return;
+    setSaving(true);
     socket.current.send(JSON.stringify({
       type: 'operation',
       client_id: clientID,
@@ -114,7 +131,7 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
     event.currentTarget.setPointerCapture(event.pointerId);
   }
 
-  function pointerDownBlock(event: PointerEvent<HTMLDivElement>, block: WhiteboardBlock) {
+  function pointerDownBlock(event: PointerEvent<HTMLElement>, block: WhiteboardBlock) {
     event.stopPropagation();
     if (!canEdit) {
       setSelected(block.id);
@@ -155,8 +172,17 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
   }
 
   function updateBlock(block: WhiteboardBlock) {
+    window.clearTimeout(saveTimers.current[block.id]);
     setBlocks((current) => upsert(current, block));
     sendOperation('update_block', { ...block });
+  }
+
+  function updateBlockDraft(block: WhiteboardBlock) {
+    setBlocks((current) => upsert(current, block));
+    window.clearTimeout(saveTimers.current[block.id]);
+    saveTimers.current[block.id] = window.setTimeout(() => {
+      sendOperation('update_block', { ...block });
+    }, 800);
   }
 
   function deleteSelected() {
@@ -173,7 +199,7 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
         <button className="icon-btn" onClick={onBack} title="Back"><ArrowLeft size={19} /></button>
         <div className="title-block">
           <strong>{board.name}</strong>
-          <span>{project.name} · v{version} · {canEdit ? 'editing' : 'read only'}</span>
+          <span>{project.name} · {saving ? 'Saving...' : `Saved ${formatSavedAt(savedAt)}`} · {connection === 'live' ? 'live' : connection}</span>
         </div>
         <div className="toolbar">
           <button className="icon-btn selected" title="Select"><MousePointer2 size={18} /></button>
@@ -185,6 +211,7 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
             <input type="file" accept="image/*" disabled={!canEdit} onChange={(event) => event.target.files?.[0] && uploadImage(event.target.files[0])} />
           </label>
           <button className="icon-btn" onClick={() => setScale((value) => Math.max(0.25, value - 0.1))} title="Zoom out"><ZoomOut size={18} /></button>
+          <span className="zoom-readout">{Math.round(scale * 100)}%</span>
           <button className="icon-btn" onClick={() => setScale((value) => Math.min(2.5, value + 0.1))} title="Zoom in"><ZoomIn size={18} /></button>
           <button className="icon-btn danger" disabled={!selected || !canEdit} onClick={deleteSelected} title="Delete"><Trash2 size={18} /></button>
         </div>
@@ -198,8 +225,9 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
               block={block}
               selected={selected === block.id}
               readOnly={!canEdit}
-              onPointerDown={(event) => pointerDownBlock(event, block)}
-              onChange={updateBlock}
+              onDragStart={(event) => pointerDownBlock(event, block)}
+              onCommit={updateBlock}
+              onDraft={updateBlockDraft}
             />
           ))}
         </div>
@@ -208,29 +236,34 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
   );
 }
 
-function WhiteboardBlockView({ block, selected, readOnly, onPointerDown, onChange }: {
+function WhiteboardBlockView({ block, selected, readOnly, onDragStart, onCommit, onDraft }: {
   block: WhiteboardBlock;
   selected: boolean;
   readOnly: boolean;
-  onPointerDown: (event: PointerEvent<HTMLDivElement>) => void;
-  onChange: (block: WhiteboardBlock) => void;
+  onDragStart: (event: PointerEvent<HTMLElement>) => void;
+  onCommit: (block: WhiteboardBlock) => void;
+  onDraft: (block: WhiteboardBlock) => void;
 }) {
   const style = { left: block.x, top: block.y, width: block.w, height: block.h, zIndex: block.z };
   return (
-    <div className={`block block-${block.type} ${selected ? 'selected' : ''}`} style={style} onPointerDown={onPointerDown}>
+    <div className={`block block-${block.type} ${selected ? 'selected' : ''}`} style={style}>
+      <button className="block-handle" type="button" onPointerDown={onDragStart} title="Drag block">
+        <GripHorizontal size={16} />
+      </button>
       {block.type === 'note' && (
         <textarea
           readOnly={readOnly}
           value={String(block.data.text ?? '')}
           onPointerDown={(event) => event.stopPropagation()}
-          onChange={(event) => onChange({ ...block, data: { ...block.data, text: event.target.value } })}
+          onChange={(event) => onDraft({ ...block, data: { ...block.data, text: event.target.value } })}
+          onBlur={(event) => onCommit({ ...block, data: { ...block.data, text: event.target.value } })}
         />
       )}
       {block.type === 'rich_text' && (
         <RichTextBlock
           readOnly={readOnly}
           value={block.data.doc}
-          onChange={(doc) => onChange({ ...block, data: { ...block.data, doc } })}
+          onChange={(doc) => onCommit({ ...block, data: { ...block.data, doc } })}
         />
       )}
       {block.type === 'image' && <img src={String(block.data.url ?? '')} alt={String(block.data.alt ?? '')} draggable={false} />}
@@ -245,4 +278,10 @@ function upsert(blocks: WhiteboardBlock[], block: WhiteboardBlock) {
   const next = blocks.slice();
   next[index] = block;
   return next;
+}
+
+function formatSavedAt(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '--:--';
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
