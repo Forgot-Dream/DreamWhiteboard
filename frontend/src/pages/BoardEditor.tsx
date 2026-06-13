@@ -1,5 +1,5 @@
 import { MouseEvent, PointerEvent, WheelEvent, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, FileImage, GripHorizontal, MousePointer2, Trash2, Type, ZoomIn, ZoomOut } from 'lucide-react';
+import { ArrowLeft, FileImage, MousePointer2, Trash2, Type, ZoomIn, ZoomOut } from 'lucide-react';
 import { api, assetURL, canEdit as canUserEdit, wsURL, type Board, type BoardSnapshot, type Project, type ProjectRole, type User, type WhiteboardBlock } from '../lib/api';
 import { createBlock } from '../lib/blockRegistry';
 import { useI18n } from '../lib/i18n';
@@ -322,7 +322,6 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
               onCommit={updateBlock}
               onDraft={updateBlockDraft}
               onResizeStart={(event, handle) => pointerDownResize(event, block, handle)}
-              dragTitle={t('editor.dragBlock')}
               autoFocus={selected === block.id && isPendingTextBlock(block)}
             />
           ))}
@@ -332,7 +331,7 @@ export function BoardEditor({ user, board, project, role, onBack }: BoardEditorP
   );
 }
 
-function WhiteboardBlockView({ block, selected, readOnly, onSelect, onDragStart, onResizeStart, onCommit, onDraft, dragTitle, autoFocus }: {
+function WhiteboardBlockView({ block, selected, readOnly, onSelect, onDragStart, onResizeStart, onCommit, onDraft, autoFocus }: {
   block: WhiteboardBlock;
   selected: boolean;
   readOnly: boolean;
@@ -341,7 +340,6 @@ function WhiteboardBlockView({ block, selected, readOnly, onSelect, onDragStart,
   onResizeStart: (event: PointerEvent<HTMLElement>, handle: ResizeHandle) => void;
   onCommit: (block: WhiteboardBlock) => void;
   onDraft: (block: WhiteboardBlock) => void;
-  dragTitle: string;
   autoFocus: boolean;
 }) {
   const style = {
@@ -357,13 +355,10 @@ function WhiteboardBlockView({ block, selected, readOnly, onSelect, onDragStart,
   };
   const textStyle = { color: blockTextColor(block) };
   return (
-    <div className={`block block-${block.type} ${selected ? 'selected' : ''}`} style={style}>
+    <div className={`block block-${block.type} ${selected ? 'selected' : ''}`} style={style} onPointerDown={onDragStart}>
       {selected && !readOnly && (
         <ResizeHandles onResizeStart={onResizeStart} />
       )}
-      <button className="block-handle" type="button" onPointerDown={onDragStart} title={dragTitle}>
-        <GripHorizontal size={16} />
-      </button>
       {block.type !== 'image' && (
         <textarea
           readOnly={readOnly}

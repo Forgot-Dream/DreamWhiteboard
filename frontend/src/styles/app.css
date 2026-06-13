@@ -446,31 +446,7 @@ textarea {
   box-shadow: none;
   overflow: visible;
   pointer-events: auto;
-}
-
-.block-handle {
-  position: absolute;
-  top: 6px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 3;
-  width: 34px;
-  height: 22px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid rgba(32, 48, 45, 0.16);
-  border-radius: 0;
-  color: #40514d;
-  background: rgba(255, 255, 255, 0.88);
-  cursor: grab;
-  opacity: 0;
-  transition: opacity 120ms ease;
-}
-
-.block:hover .block-handle,
-.block.selected .block-handle {
-  opacity: 1;
+  cursor: move;
 }
 
 .block.selected::after {
@@ -554,6 +530,7 @@ textarea {
   padding: 4px;
   background: transparent;
   outline: 0;
+  cursor: text;
 }
 
 .rich-editor {
