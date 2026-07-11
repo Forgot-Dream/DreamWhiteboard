@@ -1,4 +1,8 @@
 import { expect, test, type Page } from '@playwright/test';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 
 const bootstrapEmail = process.env.E2E_ADMIN_EMAIL ?? 'admin@example.com';
 const bootstrapPassword = process.env.E2E_ADMIN_PASSWORD ?? 'replace-with-a-unique-12+-character-password';
@@ -68,10 +72,14 @@ test('admin setup, dual-session collaboration, reconnect, viewer permissions, an
   }, { timeout: 15_000 }).not.toBe('');
 
   const converged = await editorText.inputValue();
-  await editorContext.setOffline(true);
-  await expect(editor.locator('.title-block')).toContainText(/offline|saving/);
-  await editorText.fill(`${converged} offline replay`);
-  await editorContext.setOffline(false);
+  await compose('stop', 'api');
+  try {
+    await expect(editor.locator('.title-block')).toContainText('offline', { timeout: 20_000 });
+    await editorText.fill(`${converged} offline replay`);
+  } finally {
+    await compose('up', '-d', 'api');
+  }
+  await expect.poll(async () => fetch(`${process.env.E2E_BASE_URL ?? 'http://127.0.0.1:8080'}/readyz`).then((response) => response.status).catch(() => 0), { timeout: 30_000 }).toBe(200);
   await expect(editor.locator('.title-block')).toContainText('synced', { timeout: 20_000 });
   await expect(adminText).toHaveValue(`${converged} offline replay`, { timeout: 20_000 });
 
@@ -132,4 +140,10 @@ async function addMember(page: Page, email: string, role: 'editor' | 'viewer') {
   await form.locator('select').nth(1).selectOption(role);
   await form.getByRole('button', { name: 'Add' }).click();
   await expect(page.locator('.member-row', { hasText: email })).toContainText(role);
+}
+
+async function compose(...args: string[]) {
+  await execFileAsync('docker', ['compose', '-f', '../deploy/docker-compose.yml', '--env-file', '../deploy/.env.example', ...args], {
+    cwd: process.cwd()
+  });
 }
