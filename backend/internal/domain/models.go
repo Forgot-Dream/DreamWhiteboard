@@ -11,19 +11,27 @@ const (
 	RoleEditor = "editor"
 	RoleViewer = "viewer"
 
-	BlockRichText = "rich_text"
-	BlockNote     = "note"
-	BlockImage    = "image"
-	BlockShape    = "shape"
+	BlockText  = "text"
+	BlockImage = "image"
 )
 
 type User struct {
-	ID           string    `json:"id"`
-	Email        string    `json:"email"`
-	Name         string    `json:"name"`
-	SystemRole   string    `json:"system_role"`
-	PasswordHash string    `json:"-"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID                 string     `json:"id"`
+	Email              string     `json:"email"`
+	Name               string     `json:"name"`
+	SystemRole         string     `json:"system_role"`
+	PasswordHash       string     `json:"-"`
+	MustChangePassword bool       `json:"must_change_password"`
+	PasswordChangedAt  *time.Time `json:"password_changed_at,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+}
+
+type Session struct {
+	TokenHash      string    `json:"-"`
+	UserID         string    `json:"user_id"`
+	ExpiresAt      time.Time `json:"expires_at"`
+	LastAccessedAt time.Time `json:"last_accessed_at"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 type Project struct {
@@ -46,41 +54,28 @@ type Board struct {
 	ID        string    `json:"id"`
 	ProjectID string    `json:"project_id"`
 	Name      string    `json:"name"`
-	Version   int64     `json:"version"`
 	CreatedBy string    `json:"created_by"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-type Block struct {
-	ID       string         `json:"id"`
-	Type     string         `json:"type"`
-	X        float64        `json:"x"`
-	Y        float64        `json:"y"`
-	W        float64        `json:"w"`
-	H        float64        `json:"h"`
-	Z        int            `json:"z"`
-	Data     map[string]any `json:"data"`
-	LockedBy string         `json:"locked_by,omitempty"`
+type BoardDocument struct {
+	BoardID            string    `json:"board_id"`
+	Checkpoint         []byte    `json:"checkpoint,omitempty"`
+	CheckpointSequence int64     `json:"checkpoint_sequence"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
-type BoardSnapshot struct {
-	BoardID   string    `json:"board_id"`
-	Version   int64     `json:"version"`
-	Blocks    []Block   `json:"blocks"`
-	UpdatedAt time.Time `json:"updated_at"`
-}
-
-type Operation struct {
-	ID          string         `json:"id"`
-	BoardID     string         `json:"board_id"`
-	ClientID    string         `json:"client_id"`
-	UserID      string         `json:"user_id"`
-	Type        string         `json:"type"`
-	BaseVersion int64          `json:"base_version"`
-	Version     int64          `json:"version"`
-	Payload     map[string]any `json:"payload"`
-	CreatedAt   time.Time      `json:"created_at"`
+type BoardUpdate struct {
+	BoardID        string     `json:"board_id"`
+	ServerSequence int64      `json:"server_sequence"`
+	UpdateID       string     `json:"update_id"`
+	ClientID       string     `json:"client_id"`
+	UserID         string     `json:"user_id"`
+	Update         []byte     `json:"update"`
+	UpdateHash     string     `json:"-"`
+	CompactedAt    *time.Time `json:"-"`
+	CreatedAt      time.Time  `json:"created_at"`
 }
 
 type Asset struct {
@@ -90,7 +85,11 @@ type Asset struct {
 	FileName    string    `json:"file_name"`
 	ContentType string    `json:"content_type"`
 	Size        int64     `json:"size"`
-	Path        string    `json:"path"`
+	Path        string    `json:"-"`
+	StorageKey  string    `json:"-"`
+	SHA256      string    `json:"sha256"`
+	Width       int       `json:"width,omitempty"`
+	Height      int       `json:"height,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 }
 
@@ -104,4 +103,12 @@ func CanManageMembers(role string) bool {
 
 func IsProjectRole(role string) bool {
 	return role == RoleOwner || role == RoleAdmin || role == RoleEditor || role == RoleViewer
+}
+
+func IsSystemRole(role string) bool {
+	return role == SystemAdmin || role == SystemUser
+}
+
+func RemovesLastOwner(currentRole, nextRole string, ownerCount int) bool {
+	return currentRole == RoleOwner && nextRole != RoleOwner && ownerCount <= 1
 }

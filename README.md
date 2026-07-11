@@ -1,219 +1,217 @@
 # DreamWhiteboard
 
-DreamWhiteboard is a self-hosted online collaborative whiteboard MVP. It includes account login, system administration, project roles, multi-board projects, an infinite canvas, realtime WebSocket collaboration, customizable text/image blocks, local uploads, and a Docker Compose deployment stack.
+DreamWhiteboard is a single-host, self-hosted collaborative whiteboard. The v2 architecture uses a Go/Postgres control plane, Yjs CRDT documents over authenticated WebSockets, and a React DOM canvas.
 
-## Features
+## What is included
 
-- Account login with bearer token and cookie session support.
-- System roles: `system_admin` and `user`.
-- Project roles: `owner`, `admin`, `editor`, and `viewer`.
-- Project, member, board, user, asset, and snapshot REST APIs.
-- Infinite whiteboard canvas with pan, zoom, selection, drag, resize, edit, delete, image upload, and saved-time feedback.
-- Realtime collaboration over WebSocket:
-  - Server-assigned monotonic board versions for mutating operations.
-  - Collaborator cursor presence.
-  - Remote selected-object indicators.
-  - Viewer mutation rejection.
-- Minimal whiteboard controls for text and image blocks, with custom fill, text color, border color, border width, and image aspect-ratio locking.
-- Local upload storage for images and attachments.
-- Internationalized frontend with English and Simplified Chinese (`zh_cn`) support.
-- Docker Compose stack for frontend, Go API, Postgres, and local upload volume.
+- HttpOnly cookie sessions persisted as SHA-256 token hashes in Postgres; passwords use Argon2id.
+- Project roles (`owner`, `admin`, `editor`, `viewer`) with last-owner protection.
+- Versioned SQL migrations, health/readiness endpoints, structured request logs, request IDs, body limits, login throttling, security headers, and a CORS allowlist.
+- Yjs `Y.Map("blocks")` documents with `text` and `image` block schemas, durable ordered updates, stable update IDs, acknowledgements, automatic reconnect/replay, checkpoints, and Awareness presence.
+- A routed React UI using TanStack Query and Zustand, including multi-select, box select, undo/redo, copy/cut/paste, duplicate, z-ordering, align/distribute, keyboard movement, image upload progress/cancel/retry, and saved per-board viewports.
+- Same-origin Nginx proxying, private API/Postgres networks, container health checks, graceful shutdown, backup/restore verification scripts, CI, dependency updates, vulnerability scans, and tagged image publishing.
 
-## Tech Stack
+The collaboration service is intentionally single-instance. There is no Redis fan-out and no refresh-persistent offline editing; unacknowledged edits survive reconnects only while the page remains open.
 
-- Frontend: React, Vite, TypeScript, TipTap, lucide-react.
-- Backend: Go standard library HTTP server plus a lightweight WebSocket implementation.
-- Storage:
-  - In-memory repository for local development and tests.
-  - Postgres repository and migrations for deployment.
-- Deployment: Docker Compose with frontend, API, Postgres, and upload volume.
+## Quick start
 
-## Repository Layout
-
-```text
-backend/              Go API, domain models, realtime hub, stores, migrations
-frontend/             React/Vite application
-deploy/               Docker Compose stack and local upload volume
-README.md             Project documentation
-LICENSE               GNU GPLv3 license text
-```
-
-## Quick Start
-
-Start the full stack:
+Requirements: Docker Engine with Compose v2.
 
 ```bash
-docker compose -f deploy/docker-compose.yml up --build
+cp deploy/.env.example deploy/.env
 ```
 
-Default local endpoints:
+Edit `deploy/.env`. At minimum, replace both password placeholders with unique values. Then start the stack:
 
-- Frontend: <http://localhost:5173>
-- Backend API: <http://localhost:8080>
-- Postgres: `localhost:5432`
+```bash
+docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d --build
+```
 
-Default initial system administrator:
+Open <http://127.0.0.1:8080>. The bootstrap administrator is required to change the configured one-time password on first login.
 
-- Email: `admin@example.com`
-- Password: `admin123`
+After that password change succeeds, remove `FIRST_ADMIN_EMAIL` and `FIRST_ADMIN_PASSWORD` from `deploy/.env` (or leave them empty) and restart. Bootstrap runs only for an empty database, so the one-time secret does not need to remain on the host.
 
-Change these credentials before using a persistent or shared deployment.
+Check service status:
 
-## Local Development
+```bash
+curl --fail http://127.0.0.1:8080/healthz
+curl --fail http://127.0.0.1:8080/readyz
+docker compose -f deploy/docker-compose.yml --env-file deploy/.env ps
+```
 
-Run the backend with the in-memory store:
+Only Nginx binds a host port. Postgres and the API are reachable only on the internal Compose network.
+
+## Local development
+
+Start Postgres from the Compose stack after creating `deploy/.env`:
+
+```bash
+docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d postgres
+```
+
+Run the API (the production executable deliberately has no in-memory fallback):
 
 ```bash
 cd backend
+DATABASE_URL='postgres://dreamwhiteboard:YOUR_URL_SAFE_PASSWORD@localhost:5432/dreamwhiteboard?sslmode=disable' \
+FIRST_ADMIN_EMAIL='admin@example.com' \
+FIRST_ADMIN_PASSWORD='a-unique-one-time-password' \
+SESSION_COOKIE_SECURE=false \
 go run ./cmd/server
 ```
 
-Run the backend tests:
+For host-based backend development, expose Postgres with a local-only Compose override or run a separate development Postgres container. Do not expose the production database publicly.
 
-```bash
-cd backend
-go test ./...
-```
-
-Run the frontend:
+Run the frontend; Vite proxies `/api` and WebSocket upgrades to port 8080:
 
 ```bash
 cd frontend
-npm install
+npm ci
 npm run dev
 ```
 
-Build the frontend:
+## Data model and migrations
+
+The API applies numbered files from `backend/migrations` before accepting traffic, and refuses readiness when the schema is behind. Each migration records its version in `schema_migrations`.
+
+Version 2 is a breaking development upgrade. It removes the prototype `board_snapshots`, `board_operations`, and board version column, replacing them with:
+
+- `board_documents`: current Yjs checkpoint and covered server sequence.
+- `board_updates`: ordered opaque Yjs updates plus durable update-ID receipts for idempotent replay.
+- `sessions`: hashed browser sessions and expiration/last-access timestamps.
+
+Prototype whiteboard content is not migrated. For a clean development upgrade:
 
 ```bash
-cd frontend
-npm run build
+docker compose -f deploy/docker-compose.yml --env-file deploy/.env down -v
+docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d --build
 ```
 
-When the frontend and backend run on different origins, set `VITE_API_BASE` for the frontend:
+This deletes all database and upload volumes; use it only when that is intended.
+
+## Collaboration protocol
+
+Connect with the session cookie to `GET /api/boards/:id/ws`. No token is accepted in localStorage, headers, asset URLs, or the WebSocket query string. The optional `client_id` query value is a non-secret page-lifetime identifier.
+
+Messages are WebSocket text frames containing JSON. Binary Yjs data uses standard base64 in `data`.
+
+Initial sync is ordered:
+
+1. `sync_start` with the authoritative client/user IDs and `can_edit` permission.
+2. An optional `checkpoint`.
+3. Zero or more `update` messages ordered by `server_sequence`.
+4. `sync_complete`.
+
+An editor sends `{type:"update", update_id, data}`. The server persists it before replying with `update_ack` and broadcasting it. `(board_id, update_id)` is unique, so an ACK-lost update can be replayed without applying or broadcasting twice—even after checkpoint compaction.
+
+Awareness messages carry participant, cursor, viewport, and selection state but are never persisted and do not mark a board as saved. On disconnect, the server immediately broadcasts a removal message. Viewers receive document and awareness traffic, but document updates and checkpoints are rejected.
+
+## REST API
+
+REST owns authentication and metadata; it never modifies whiteboard content.
+
+- Authentication: `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/me`, `POST /api/me/password`.
+- Projects: `GET/POST /api/projects`, `GET/PATCH/DELETE /api/projects/:id`.
+- Members: `GET/POST /api/projects/:id/members`, `PATCH/DELETE /api/projects/:id/members/:userID`.
+- Boards: `GET/POST /api/projects/:id/boards`, `GET/PATCH/DELETE /api/boards/:id`.
+- Assets: `POST /api/projects/:id/assets`, `GET/DELETE /api/assets/:id`.
+- Administrators: `GET/POST /api/admin/users`, `PATCH /api/admin/users/:id`, `POST /api/admin/users/:id/password`.
+
+Errors have a stable shape:
+
+```json
+{
+  "error": {
+    "code": "validation_failed",
+    "message": "request validation failed",
+    "request_id": "...",
+    "fields": { "name": "name is required" }
+  }
+}
+```
+
+`GET /api/boards/:id` returns board metadata, permission, and the collaboration endpoint, not a block snapshot.
+
+## Editor shortcuts
+
+| Shortcut | Action |
+| --- | --- |
+| `Delete` / `Backspace` | Delete selection |
+| `Escape` | Clear selection and return to select tool |
+| `Ctrl/Cmd+C`, `X`, `V` | Copy, cut, paste (image blocks reuse asset references) |
+| `Ctrl/Cmd+D` | Duplicate |
+| `Ctrl/Cmd+Z`, `Shift+Ctrl/Cmd+Z` | Undo, redo current-user commands |
+| Arrow keys | Move selection by 1 world pixel |
+| `Shift` + arrow keys | Move selection by 10 world pixels |
+| `Ctrl/Cmd+A` | Select all blocks |
+
+Use Shift-click for additive selection. Drag an empty canvas area with the select tool for box selection; use the hand tool or middle mouse button to pan.
+
+## Backup and restore
+
+Create a consistent database dump and upload archive:
 
 ```bash
-VITE_API_BASE=http://localhost:8080 npm run dev
+deploy/scripts/backup.sh
 ```
+
+Verify checksums, archive readability, and an isolated Postgres restore without replacing the live database:
+
+```bash
+deploy/scripts/verify-backup.sh deploy/backups/20260101T000000Z
+```
+
+Restore is destructive and requires an explicit flag:
+
+```bash
+deploy/scripts/restore.sh --confirm deploy/backups/20260101T000000Z
+```
+
+Keep backups outside the application host and test restoration regularly.
 
 ## Configuration
 
-Backend environment variables:
+Important API settings:
 
-| Variable | Default | Description |
+| Variable | Default | Purpose |
 | --- | --- | --- |
-| `HTTP_ADDR` | `:8080` | API listen address. |
-| `DATABASE_URL` | unset | Postgres connection string. If unset, the server uses the in-memory repository. |
-| `UPLOAD_DIR` | `./uploads` | Local upload directory for asset files. |
-| `FIRST_ADMIN_EMAIL` | `admin@example.com` | Email for the initial system administrator. |
-| `FIRST_ADMIN_PASSWORD` | `admin123` | Password for the initial system administrator. |
+| `DATABASE_URL` | required | Postgres connection URL. |
+| `FIRST_ADMIN_EMAIL` / `FIRST_ADMIN_PASSWORD` | required for an empty DB | One-time bootstrap credentials; password must be at least 12 characters. |
+| `SESSION_TTL` | `168h` | Persistent session lifetime. |
+| `SESSION_COOKIE_SECURE` | `true` in the API | Must be `true` behind public HTTPS; the local HTTP Compose example sets `false`. |
+| `ALLOWED_ORIGINS` | local Vite origins | Comma-separated cross-origin development allowlist; same-origin is accepted automatically. |
+| `MAX_REQUEST_BYTES` | `1 MiB` | JSON request limit. |
+| `MAX_UPLOAD_BYTES` | `25 MiB` | Multipart upload limit. |
+| `MAX_IMAGE_PIXELS` | `40,000,000` | Decoded image dimension limit. |
+| `LOGIN_RATE_LIMIT` / `LOGIN_RATE_WINDOW` | `5` / `5m` | Failed login throttle. |
+| `WS_AUTH_CHECK_INTERVAL` | `10s` | Maximum interval before an open collaboration socket revalidates its session and project access. |
+| `UPLOAD_DIR` | `./uploads` | Local asset root. |
+| `LOG_LEVEL` | `info` | JSON log level (`debug`, `info`, `warn`, `error`). |
 
-Frontend environment variables:
+For a shared deployment, terminate TLS in front of Nginx, set `SESSION_COOKIE_SECURE=true`, bind only to the intended interface, use a URL-safe random database password, restrict backup permissions, and do not reuse the bootstrap password.
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `VITE_API_BASE` | current origin | Base URL used for REST, asset, and WebSocket API calls. |
+## Quality gates
 
-## API Summary
+Run locally:
 
-Authentication:
+```bash
+cd backend
+gofmt -w .
+go vet ./...
+go test ./...
+go test -race ./...
 
-- `POST /api/auth/login`
-- `POST /api/auth/logout`
-- `GET /api/me`
+cd ../frontend
+npm run typecheck
+npm test
+npm run build
+npm audit --audit-level=high
 
-Projects and members:
-
-- `GET /api/projects`
-- `POST /api/projects`
-- `GET /api/projects/:id`
-- `PATCH /api/projects/:id`
-- `DELETE /api/projects/:id`
-- `GET /api/projects/:id/members`
-- `POST /api/projects/:id/members`
-- `DELETE /api/projects/:id/members?user_id=:userID`
-
-Boards:
-
-- `GET /api/projects/:id/boards`
-- `POST /api/projects/:id/boards`
-- `GET /api/boards/:id`
-- `PATCH /api/boards/:id`
-- `DELETE /api/boards/:id`
-- `GET /api/boards/:id/ws`
-
-Assets:
-
-- `POST /api/projects/:id/assets`
-- `GET /api/assets/:id`
-
-System administration:
-
-- `GET /api/admin/users`
-- `POST /api/admin/users`
-- `PATCH /api/admin/users/:id`
-
-## WebSocket Protocol
-
-Connect to:
-
-```text
-GET /api/boards/:id/ws
+cd ..
+docker compose -f deploy/docker-compose.yml --env-file deploy/.env.example config
 ```
 
-The client passes `client_id` in the query string. If token auth is used outside cookies, pass `token` as a query parameter.
-
-Client message types:
-
-- `join`
-- `operation`
-- `cursor`
-- `presence`
-
-Server message types:
-
-- `snapshot`
-- `operation_ack`
-- `operation_broadcast`
-- `cursor`
-- `presence`
-- `error`
-
-Supported whiteboard operations:
-
-- `create_block`
-- `update_block`
-- `delete_block`
-- `move_block`
-- `resize_block`
-- `reorder_block`
-
-Cursor and presence messages are broadcast-only and do not increment board versions. Mutating operations are validated on the server and receive a persisted board version.
-
-## Permissions
-
-- `system_admin`: can administer all users and access all projects.
-- `owner`: owns a project and can manage project members and boards.
-- `admin`: can manage project members and boards.
-- `editor`: can create and edit boards and whiteboard blocks.
-- `viewer`: can view boards and realtime presence, but cannot mutate board state.
-
-## Deployment Notes
-
-The included Compose stack uses:
-
-- Postgres 16 Alpine.
-- Backend container built from `backend/Dockerfile`.
-- Frontend container built from `frontend/Dockerfile`.
-- `deploy/uploads` mounted into the API container for local asset storage.
-
-For production-like deployments:
-
-- Replace the default initial administrator credentials.
-- Use a strong database password.
-- Put the API behind HTTPS.
-- Persist Postgres and upload volumes.
-- Consider replacing local upload storage with S3-compatible storage.
+GitHub Actions runs the same checks with Postgres, builds and scans both images, and publishes versioned GHCR images for `v*` tags. Dependabot tracks Go, npm, Docker, and Actions updates.
 
 ## License
 

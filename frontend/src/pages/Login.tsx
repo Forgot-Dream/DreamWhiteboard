@@ -1,52 +1,45 @@
 import { FormEvent, useState } from 'react';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { LogIn } from 'lucide-react';
-import { api, setToken, type User } from '../lib/api';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { authQueryKey } from '../App';
+import { api, type User } from '../lib/api';
 import { LocaleSelect, useI18n } from '../lib/i18n';
 
-interface LoginProps {
-  onLogin: (user: User) => void;
-}
-
-export function Login({ onLogin }: LoginProps) {
+export function Login() {
   const { t } = useI18n();
-  const [email, setEmail] = useState('admin@example.com');
-  const [password, setPassword] = useState('admin123');
-  const [error, setError] = useState('');
-
-  async function submit(event: FormEvent) {
-    event.preventDefault();
-    setError('');
-    try {
-      const result = await api<{ token: string; user: User }>('/api/auth/login', {
-        method: 'POST',
-        body: JSON.stringify({ email, password })
-      });
-      setToken(result.token);
-      onLogin(result.user);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : t('login.failed'));
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const mutation = useMutation({
+    mutationFn: () => api<{ user: User }>('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password })
+    }),
+    onSuccess: ({ user }) => {
+      queryClient.setQueryData(authQueryKey, user);
+      const state = location.state as { from?: string } | null;
+      navigate(user.must_change_password ? '/change-password' : state?.from ?? '/projects', { replace: true });
     }
+  });
+
+  function submit(event: FormEvent) {
+    event.preventDefault();
+    mutation.mutate();
   }
 
   return (
     <main className="login-shell">
       <form className="login-panel" onSubmit={submit}>
         <LocaleSelect />
-        <div>
-          <h1>DreamWhiteboard</h1>
-          <p>{t('login.subtitle')}</p>
-        </div>
-        <label>
-          {t('login.email')}
-          <input value={email} onChange={(event) => setEmail(event.target.value)} />
-        </label>
-        <label>
-          {t('login.password')}
-          <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
-        </label>
-        {error && <p className="error">{error}</p>}
-        <button className="primary" type="submit">
-          <LogIn size={18} /> {t('login.signIn')}
+        <div><h1>DreamWhiteboard</h1><p>{t('login.subtitle')}</p></div>
+        <label>{t('login.email')}<input type="email" autoComplete="username" value={email} onChange={(event) => setEmail(event.target.value)} required autoFocus /></label>
+        <label>{t('login.password')}<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
+        {mutation.error && <p className="error" role="alert">{mutation.error.message}</p>}
+        <button className="primary" type="submit" disabled={mutation.isPending}>
+          <LogIn size={18} /> {mutation.isPending ? `${t('login.signIn')}…` : t('login.signIn')}
         </button>
       </form>
     </main>

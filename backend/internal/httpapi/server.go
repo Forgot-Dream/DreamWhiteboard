@@ -1,457 +1,367 @@
 package httpapi
 
 import (
-	"crypto/rand"
-	"encoding/hex"
-	"encoding/json"
+	"context"
 	"errors"
-	"io"
-	"mime"
+	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"dreamwhiteboard/backend/internal/domain"
 	"dreamwhiteboard/backend/internal/realtime"
 	"dreamwhiteboard/backend/internal/store"
+	"github.com/go-chi/chi/v5"
 )
 
-type Server struct {
-	repo      store.Repository
-	uploadDir string
-	hub       *realtime.Hub
-	sessions  map[string]string
-	mu        sync.RWMutex
+const sessionCookieName = "dw_session"
+
+type Config struct {
+	UploadDir      string
+	AllowedOrigins []string
+	SessionTTL     time.Duration
+	CookieSecure   bool
+	CookieSameSite http.SameSite
+	MaxBodyBytes   int64
+	MaxUploadBytes int64
+	MaxImagePixels int64
+	LoginLimit     int
+	LoginWindow    time.Duration
+	WSAuthInterval time.Duration
+	TrustProxy     bool
+	Logger         *slog.Logger
+	Now            func() time.Time
 }
 
+func DefaultConfig(uploadDir string) Config {
+	return Config{
+		UploadDir:      uploadDir,
+		AllowedOrigins: []string{"http://localhost:5173", "http://127.0.0.1:5173"},
+		SessionTTL:     7 * 24 * time.Hour,
+		CookieSecure:   true,
+		CookieSameSite: http.SameSiteLaxMode,
+		MaxBodyBytes:   1 << 20,
+		MaxUploadBytes: 25 << 20,
+		MaxImagePixels: 40_000_000,
+		LoginLimit:     5,
+		LoginWindow:    5 * time.Minute,
+		WSAuthInterval: 10 * time.Second,
+		Logger:         slog.Default(),
+		Now:            time.Now,
+	}
+}
+
+type Server struct {
+	repo        store.Repository
+	uploadDir   string
+	hub         *realtime.Hub
+	handler     http.Handler
+	config      Config
+	logger      *slog.Logger
+	login       *loginLimiter
+	startupErr  error
+	wsHandlers  sync.WaitGroup
+	wsLifecycle sync.Mutex
+	wsClosing   bool
+}
+
+// NewServer preserves the original constructor for tests and embedders. Production
+// callers should use NewServerWithConfig so security-sensitive values are explicit.
 func NewServer(repo store.Repository, uploadDir string) http.Handler {
+	return NewServerWithConfig(repo, DefaultConfig(uploadDir))
+}
+
+func NewServerWithConfig(repo store.Repository, cfg Config) *Server {
+	cfg = normalizeConfig(cfg)
 	s := &Server{
 		repo:      repo,
-		uploadDir: uploadDir,
+		uploadDir: cfg.UploadDir,
 		hub:       realtime.NewHub(),
-		sessions:  map[string]string{},
+		config:    cfg,
+		logger:    cfg.Logger,
+		login:     newLoginLimiter(cfg.LoginLimit, cfg.LoginWindow),
 	}
-	_ = os.MkdirAll(uploadDir, 0o755)
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/auth/login", s.handleLogin)
-	mux.HandleFunc("/api/auth/logout", s.withAuth(s.handleLogout))
-	mux.HandleFunc("/api/me", s.withAuth(s.handleMe))
-	mux.HandleFunc("/api/projects", s.withAuth(s.handleProjects))
-	mux.HandleFunc("/api/projects/", s.withAuth(s.handleProjectSubroutes))
-	mux.HandleFunc("/api/boards/", s.withAuth(s.handleBoardSubroutes))
-	mux.HandleFunc("/api/assets/", s.withAuth(s.handleAsset))
-	mux.HandleFunc("/api/admin/users", s.withAuth(s.requireSystemAdmin(s.handleAdminUsers)))
-	mux.HandleFunc("/api/admin/users/", s.withAuth(s.requireSystemAdmin(s.handleAdminUser)))
-	return cors(mux)
+	if err := os.MkdirAll(cfg.UploadDir, 0o750); err != nil {
+		s.startupErr = err
+	} else if err := probeUploadDirectory(cfg.UploadDir); err != nil {
+		s.startupErr = err
+	}
+
+	r := chi.NewRouter()
+	r.Use(s.requestIDMiddleware)
+	r.Use(s.accessLogMiddleware)
+	r.Use(s.securityHeadersMiddleware)
+	r.Use(s.corsMiddleware)
+	r.Use(s.bodyLimitMiddleware)
+
+	r.Get("/healthz", s.handleHealth)
+	r.Get("/readyz", s.handleReady)
+	r.Handle("/api/auth/login", http.HandlerFunc(s.handleLogin))
+	r.Handle("/api/auth/logout", http.HandlerFunc(s.handleLogout))
+	r.Handle("/api/me", s.withAuth(s.handleMe))
+	r.Handle("/api/me/password", s.withAuth(s.handlePasswordChange))
+	r.Handle("/api/projects", s.withAuth(s.handleProjects))
+	r.Handle("/api/projects/*", s.withAuth(s.handleProjectSubroutes))
+	r.Handle("/api/boards/*", s.withAuth(s.handleBoardSubroutes))
+	r.Handle("/api/assets/*", s.withAuth(s.handleAsset))
+	r.Handle("/api/admin/users", s.withAuth(s.requireSystemAdmin(s.handleAdminUsers)))
+	r.Handle("/api/admin/users/*", s.withAuth(s.requireSystemAdmin(s.handleAdminUser)))
+	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
+		writeAPIError(w, r, http.StatusNotFound, "not_found", "resource not found", nil)
+	})
+	r.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
+		writeAPIError(w, r, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", nil)
+	})
+	s.handler = r
+	return s
+}
+
+func normalizeConfig(cfg Config) Config {
+	defaults := DefaultConfig(cfg.UploadDir)
+	if strings.TrimSpace(cfg.UploadDir) == "" {
+		cfg.UploadDir = "./uploads"
+	}
+	if cfg.SessionTTL <= 0 {
+		cfg.SessionTTL = defaults.SessionTTL
+	}
+	if cfg.CookieSameSite == 0 {
+		cfg.CookieSameSite = defaults.CookieSameSite
+	}
+	if cfg.MaxBodyBytes <= 0 {
+		cfg.MaxBodyBytes = defaults.MaxBodyBytes
+	}
+	if cfg.MaxUploadBytes <= 0 {
+		cfg.MaxUploadBytes = defaults.MaxUploadBytes
+	}
+	if cfg.MaxImagePixels <= 0 {
+		cfg.MaxImagePixels = defaults.MaxImagePixels
+	}
+	if cfg.LoginLimit <= 0 {
+		cfg.LoginLimit = defaults.LoginLimit
+	}
+	if cfg.LoginWindow <= 0 {
+		cfg.LoginWindow = defaults.LoginWindow
+	}
+	if cfg.WSAuthInterval <= 0 {
+		cfg.WSAuthInterval = defaults.WSAuthInterval
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = defaults.Logger
+	}
+	if cfg.Now == nil {
+		cfg.Now = defaults.Now
+	}
+	return cfg
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.handler.ServeHTTP(w, r)
+}
+
+func (s *Server) Close() error {
+	s.wsLifecycle.Lock()
+	s.wsClosing = true
+	s.wsLifecycle.Unlock()
+	if closer, ok := any(s.hub).(interface{ Close() }); ok {
+		closer.Close()
+	}
+	done := make(chan struct{})
+	go func() {
+		s.wsHandlers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-time.After(5 * time.Second):
+		return errors.New("timed out waiting for websocket handlers to stop")
+	}
+}
+
+func (s *Server) beginWebSocket() bool {
+	s.wsLifecycle.Lock()
+	defer s.wsLifecycle.Unlock()
+	if s.wsClosing {
+		return false
+	}
+	s.wsHandlers.Add(1)
+	return true
 }
 
 type authedHandler func(http.ResponseWriter, *http.Request, domain.User)
 
-func (s *Server) withAuth(next authedHandler) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		user, ok := s.currentUser(r)
-		if !ok {
-			writeError(w, http.StatusUnauthorized, "authentication required")
+func (s *Server) withAuth(next authedHandler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, err := s.currentUser(r)
+		if errors.Is(err, store.ErrNotFound) {
+			writeAPIError(w, r, http.StatusUnauthorized, "authentication_required", "authentication required", nil)
+			return
+		}
+		if err != nil {
+			s.writeRepositoryUnavailable(w, r, "authenticate session", err)
+			return
+		}
+		if user.MustChangePassword && r.URL.Path != "/api/me" && r.URL.Path != "/api/me/password" {
+			writeAPIError(w, r, http.StatusForbidden, "password_change_required", "password must be changed before continuing", nil)
 			return
 		}
 		next(w, r, user)
-	}
+	})
 }
 
 func (s *Server) requireSystemAdmin(next authedHandler) authedHandler {
 	return func(w http.ResponseWriter, r *http.Request, user domain.User) {
 		if user.SystemRole != domain.SystemAdmin {
-			writeError(w, http.StatusForbidden, "system admin required")
+			writeAPIError(w, r, http.StatusForbidden, "system_admin_required", "system administrator access required", nil)
 			return
 		}
 		next(w, r, user)
 	}
 }
 
-func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	var req struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
-		return
-	}
-	user, ok := s.repo.Authenticate(req.Email, req.Password)
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "invalid credentials")
-		return
-	}
-	token := randomToken()
-	s.mu.Lock()
-	s.sessions[token] = user.ID
-	s.mu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "dw_session", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
-	writeJSON(w, http.StatusOK, map[string]any{"token": token, "user": publicUser(user)})
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, user domain.User) {
-	token := bearerToken(r)
-	if token == "" {
-		if cookie, err := r.Cookie("dw_session"); err == nil {
-			token = cookie.Value
-		}
-	}
-	s.mu.Lock()
-	delete(s.sessions, token)
-	s.mu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "dw_session", Value: "", Path: "/", MaxAge: -1})
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
-func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, user domain.User) {
-	writeJSON(w, http.StatusOK, publicUser(user))
-}
-
-func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request, user domain.User) {
-	switch r.Method {
-	case http.MethodGet:
-		writeJSON(w, http.StatusOK, s.repo.ListProjects(user))
-	case http.MethodPost:
-		var req struct {
-			Name        string `json:"name"`
-			Description string `json:"description"`
-		}
-		if decodeJSON(w, r, &req) {
-			project, err := s.repo.CreateProject(req.Name, req.Description, user.ID)
-			writeResult(w, project, err)
-		}
-	default:
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-	}
-}
-
-func (s *Server) handleProjectSubroutes(w http.ResponseWriter, r *http.Request, user domain.User) {
-	parts := splitPath(strings.TrimPrefix(r.URL.Path, "/api/projects/"))
-	if len(parts) == 0 {
-		writeError(w, http.StatusNotFound, "not found")
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if s.startupErr != nil {
+		writeAPIError(w, r, http.StatusServiceUnavailable, "not_ready", "service is not ready", nil)
 		return
 	}
-	projectID := parts[0]
-	if len(parts) == 1 {
-		s.handleProject(w, r, user, projectID)
-		return
-	}
-	switch parts[1] {
-	case "members":
-		s.handleMembers(w, r, user, projectID)
-	case "boards":
-		s.handleProjectBoards(w, r, user, projectID)
-	case "assets":
-		s.handleAssetUpload(w, r, user, projectID)
-	default:
-		writeError(w, http.StatusNotFound, "not found")
-	}
-}
-
-func (s *Server) handleProject(w http.ResponseWriter, r *http.Request, user domain.User, projectID string) {
-	if !s.canViewProject(user, projectID) {
-		writeError(w, http.StatusForbidden, "project access denied")
-		return
-	}
-	switch r.Method {
-	case http.MethodGet:
-		project, err := s.repo.GetProject(projectID)
-		writeResult(w, project, err)
-	case http.MethodPatch:
-		if !s.canManageProject(user, projectID) {
-			writeError(w, http.StatusForbidden, "project admin required")
+	if ready, ok := s.repo.(interface{ Ready(context.Context) error }); ok {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := ready.Ready(ctx); err != nil {
+			s.logger.Error("readiness check failed", "request_id", requestID(r.Context()), "error", err)
+			writeAPIError(w, r, http.StatusServiceUnavailable, "not_ready", "service is not ready", nil)
 			return
 		}
-		var req struct {
-			Name        string `json:"name"`
-			Description string `json:"description"`
-		}
-		if decodeJSON(w, r, &req) {
-			project, err := s.repo.UpdateProject(projectID, req.Name, req.Description)
-			writeResult(w, project, err)
-		}
-	case http.MethodDelete:
-		if !s.canManageProject(user, projectID) {
-			writeError(w, http.StatusForbidden, "project admin required")
-			return
-		}
-		writeResult(w, map[string]bool{"ok": true}, s.repo.DeleteProject(projectID))
-	default:
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
-}
-
-func (s *Server) handleMembers(w http.ResponseWriter, r *http.Request, user domain.User, projectID string) {
-	if !s.canViewProject(user, projectID) {
-		writeError(w, http.StatusForbidden, "project access denied")
+	if err := probeUploadDirectory(s.uploadDir); err != nil {
+		s.logger.Error("upload directory readiness check failed", "request_id", requestID(r.Context()), "error", err)
+		writeAPIError(w, r, http.StatusServiceUnavailable, "not_ready", "service is not ready", nil)
 		return
 	}
-	switch r.Method {
-	case http.MethodGet:
-		members, err := s.repo.ListMembers(projectID)
-		writeResult(w, members, err)
-	case http.MethodPost:
-		if !s.canManageProject(user, projectID) {
-			writeError(w, http.StatusForbidden, "project admin required")
-			return
-		}
-		var req struct {
-			UserID string `json:"user_id"`
-			Role   string `json:"role"`
-		}
-		if decodeJSON(w, r, &req) {
-			member, err := s.repo.UpsertMember(projectID, req.UserID, req.Role)
-			writeResult(w, member, err)
-		}
-	case http.MethodDelete:
-		if !s.canManageProject(user, projectID) {
-			writeError(w, http.StatusForbidden, "project admin required")
-			return
-		}
-		userID := r.URL.Query().Get("user_id")
-		writeResult(w, map[string]bool{"ok": true}, s.repo.DeleteMember(projectID, userID))
-	default:
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
-func (s *Server) handleProjectBoards(w http.ResponseWriter, r *http.Request, user domain.User, projectID string) {
-	if !s.canViewProject(user, projectID) {
-		writeError(w, http.StatusForbidden, "project access denied")
-		return
-	}
-	switch r.Method {
-	case http.MethodGet:
-		boards, err := s.repo.ListBoards(projectID)
-		writeResult(w, boards, err)
-	case http.MethodPost:
-		if !s.canEditProject(user, projectID) {
-			writeError(w, http.StatusForbidden, "editor required")
-			return
-		}
-		var req struct {
-			Name string `json:"name"`
-		}
-		if decodeJSON(w, r, &req) {
-			board, err := s.repo.CreateBoard(projectID, req.Name, user.ID)
-			writeResult(w, board, err)
-		}
-	default:
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-	}
-}
-
-func (s *Server) handleBoardSubroutes(w http.ResponseWriter, r *http.Request, user domain.User) {
-	parts := splitPath(strings.TrimPrefix(r.URL.Path, "/api/boards/"))
-	if len(parts) == 0 {
-		writeError(w, http.StatusNotFound, "not found")
-		return
-	}
-	boardID := parts[0]
-	board, err := s.repo.GetBoard(boardID)
+func probeUploadDirectory(directory string) error {
+	info, err := os.Lstat(directory)
 	if err != nil {
-		writeResult(w, nil, err)
-		return
+		return err
 	}
-	if !s.canViewProject(user, board.ProjectID) {
-		writeError(w, http.StatusForbidden, "board access denied")
-		return
+	if !info.IsDir() {
+		return errors.New("upload path is not a directory")
 	}
-	if len(parts) == 2 && parts[1] == "ws" {
-		s.handleBoardWS(w, r, user, board)
-		return
-	}
-	switch r.Method {
-	case http.MethodGet:
-		snapshot, err := s.repo.Snapshot(boardID)
-		writeResult(w, map[string]any{"board": board, "snapshot": snapshot}, err)
-	case http.MethodPatch:
-		if !s.canEditProject(user, board.ProjectID) {
-			writeError(w, http.StatusForbidden, "editor required")
-			return
-		}
-		var req struct {
-			Name string `json:"name"`
-		}
-		if decodeJSON(w, r, &req) {
-			board, err := s.repo.UpdateBoard(boardID, req.Name)
-			writeResult(w, board, err)
-		}
-	case http.MethodDelete:
-		if !s.canManageProject(user, board.ProjectID) {
-			writeError(w, http.StatusForbidden, "project admin required")
-			return
-		}
-		writeResult(w, map[string]bool{"ok": true}, s.repo.DeleteBoard(boardID))
-	default:
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-	}
-}
-
-func (s *Server) handleAssetUpload(w http.ResponseWriter, r *http.Request, user domain.User, projectID string) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	if !s.canEditProject(user, projectID) {
-		writeError(w, http.StatusForbidden, "editor required")
-		return
-	}
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid multipart upload")
-		return
-	}
-	file, header, err := r.FormFile("file")
+	probe, err := os.CreateTemp(directory, ".ready-*")
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "file is required")
-		return
+		return err
 	}
-	defer file.Close()
-
-	assetID := randomID("ast")
-	ext := strings.ToLower(filepath.Ext(header.Filename))
-	if ext == "" {
-		exts, _ := mime.ExtensionsByType(header.Header.Get("Content-Type"))
-		if len(exts) > 0 {
-			ext = exts[0]
-		}
+	path := probe.Name()
+	closeErr := probe.Close()
+	removeErr := os.Remove(path)
+	if closeErr != nil {
+		return closeErr
 	}
-	projectDir := filepath.Join(s.uploadDir, projectID)
-	if err := os.MkdirAll(projectDir, 0o755); err != nil {
-		writeError(w, http.StatusInternalServerError, "create upload directory failed")
-		return
-	}
-	path := filepath.Join(projectDir, assetID+ext)
-	out, err := os.Create(path)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "create upload failed")
-		return
-	}
-	size, copyErr := io.Copy(out, file)
-	closeErr := out.Close()
-	if copyErr != nil || closeErr != nil {
-		writeError(w, http.StatusInternalServerError, "save upload failed")
-		return
-	}
-	asset := s.repo.SaveAsset(domain.Asset{
-		ID:          assetID,
-		ProjectID:   projectID,
-		UploadedBy:  user.ID,
-		FileName:    header.Filename,
-		ContentType: header.Header.Get("Content-Type"),
-		Size:        size,
-		Path:        path,
-	})
-	writeJSON(w, http.StatusCreated, asset)
+	return removeErr
 }
 
-func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request, user domain.User) {
-	assetID := strings.TrimPrefix(r.URL.Path, "/api/assets/")
-	asset, err := s.repo.GetAsset(assetID)
-	if err != nil {
-		writeResult(w, nil, err)
-		return
-	}
-	if !s.canViewProject(user, asset.ProjectID) {
-		writeError(w, http.StatusForbidden, "asset access denied")
-		return
-	}
-	w.Header().Set("Content-Type", asset.ContentType)
-	http.ServeFile(w, r, asset.Path)
-}
-
-func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request, user domain.User) {
-	switch r.Method {
-	case http.MethodGet:
-		writeJSON(w, http.StatusOK, publicUsers(s.repo.ListUsers()))
-	case http.MethodPost:
-		var req struct {
-			Email      string `json:"email"`
-			Name       string `json:"name"`
-			Password   string `json:"password"`
-			SystemRole string `json:"system_role"`
-		}
-		if decodeJSON(w, r, &req) {
-			if req.Password == "" {
-				req.Password = "changeme123"
-			}
-			user, err := s.repo.CreateUser(req.Email, req.Name, req.Password, req.SystemRole)
-			writeResult(w, publicUser(user), err)
-		}
-	default:
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-	}
-}
-
-func (s *Server) handleAdminUser(w http.ResponseWriter, r *http.Request, user domain.User) {
-	if r.Method != http.MethodPatch {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	id := strings.TrimPrefix(r.URL.Path, "/api/admin/users/")
-	var req struct {
-		Name       string `json:"name"`
-		SystemRole string `json:"system_role"`
-	}
-	if decodeJSON(w, r, &req) {
-		updated, err := s.repo.UpdateUser(id, req.Name, req.SystemRole)
-		writeResult(w, publicUser(updated), err)
-	}
-}
-
-func (s *Server) canViewProject(user domain.User, projectID string) bool {
+func (s *Server) canViewProject(user domain.User, projectID string) (bool, error) {
 	if user.SystemRole == domain.SystemAdmin {
-		return true
+		return true, nil
 	}
-	_, ok := s.repo.MemberRole(projectID, user.ID)
-	return ok
+	_, err := s.repo.MemberRole(projectID, user.ID)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
-func (s *Server) canEditProject(user domain.User, projectID string) bool {
+func (s *Server) canEditProject(user domain.User, projectID string) (bool, error) {
 	if user.SystemRole == domain.SystemAdmin {
-		return true
+		return true, nil
 	}
-	role, ok := s.repo.MemberRole(projectID, user.ID)
-	return ok && domain.CanEdit(role)
+	role, err := s.repo.MemberRole(projectID, user.ID)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return domain.CanEdit(role), nil
 }
 
-func (s *Server) canManageProject(user domain.User, projectID string) bool {
+func (s *Server) canManageProject(user domain.User, projectID string) (bool, error) {
 	if user.SystemRole == domain.SystemAdmin {
-		return true
+		return true, nil
 	}
-	role, ok := s.repo.MemberRole(projectID, user.ID)
-	return ok && domain.CanManageMembers(role)
+	role, err := s.repo.MemberRole(projectID, user.ID)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return domain.CanManageMembers(role), nil
 }
 
-func (s *Server) currentUser(r *http.Request) (domain.User, bool) {
-	token := bearerToken(r)
-	if token == "" {
-		if cookie, err := r.Cookie("dw_session"); err == nil {
-			token = cookie.Value
-		}
+func (s *Server) currentUser(r *http.Request) (domain.User, error) {
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil || cookie.Value == "" {
+		return domain.User{}, store.ErrNotFound
 	}
-	s.mu.RLock()
-	userID := s.sessions[token]
-	s.mu.RUnlock()
-	if userID == "" {
-		return domain.User{}, false
+	session, err := s.repo.GetSession(store.HashSessionToken(cookie.Value), s.config.Now().UTC())
+	if err != nil {
+		return domain.User{}, err
 	}
-	return s.repo.GetUser(userID)
+	return s.repo.GetUser(session.UserID)
 }
 
-func bearerToken(r *http.Request) string {
-	auth := r.Header.Get("Authorization")
-	if strings.HasPrefix(auth, "Bearer ") {
-		return strings.TrimPrefix(auth, "Bearer ")
+func (s *Server) writeRepositoryUnavailable(w http.ResponseWriter, r *http.Request, operation string, err error) {
+	s.logger.Error("repository unavailable", "request_id", requestID(r.Context()), "operation", operation, "error", err)
+	writeAPIError(w, r, http.StatusServiceUnavailable, "service_unavailable", "service is temporarily unavailable", nil)
+}
+
+func (s *Server) requirePermission(w http.ResponseWriter, r *http.Request, allowed bool, err error, code, message string) bool {
+	if err != nil {
+		s.writeRepositoryUnavailable(w, r, "authorize project access", err)
+		return false
 	}
-	return r.URL.Query().Get("token")
+	if !allowed {
+		writeAPIError(w, r, http.StatusForbidden, code, message, nil)
+		return false
+	}
+	return true
+}
+
+func writeResult(w http.ResponseWriter, r *http.Request, value any, err error) {
+	writeResultStatus(w, r, http.StatusOK, value, err)
+}
+
+func writeResultStatus(w http.ResponseWriter, r *http.Request, status int, value any, err error) {
+	if err == nil {
+		writeJSON(w, status, value)
+		return
+	}
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeAPIError(w, r, http.StatusNotFound, "not_found", "resource not found", nil)
+	case errors.Is(err, store.ErrConflict):
+		writeAPIError(w, r, http.StatusConflict, "conflict", "resource conflicts with existing state", nil)
+	case errors.Is(err, store.ErrForbidden):
+		writeAPIError(w, r, http.StatusForbidden, "forbidden", "operation is not allowed", nil)
+	case errors.Is(err, store.ErrLastOwner):
+		writeAPIError(w, r, http.StatusConflict, "last_owner_required", "a project must retain at least one owner", nil)
+	case errors.Is(err, store.ErrLastSystemAdmin):
+		writeAPIError(w, r, http.StatusConflict, "last_system_admin_required", "at least one system administrator is required", nil)
+	case errors.Is(err, store.ErrInvalidInput):
+		writeAPIError(w, r, http.StatusUnprocessableEntity, "validation_failed", "request validation failed", nil)
+	default:
+		slog.Default().Error("repository request failed", "request_id", requestID(r.Context()), "error", err)
+		writeAPIError(w, r, http.StatusServiceUnavailable, "service_unavailable", "service is temporarily unavailable", nil)
+	}
 }
 
 func publicUser(user domain.User) domain.User {
@@ -465,74 +375,4 @@ func publicUsers(users []domain.User) []domain.User {
 		out[i] = publicUser(users[i])
 	}
 	return out
-}
-
-func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
-	if err := json.NewDecoder(r.Body).Decode(target); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid json")
-		return false
-	}
-	return true
-}
-
-func writeResult(w http.ResponseWriter, value any, err error) {
-	if err == nil {
-		writeJSON(w, http.StatusOK, value)
-		return
-	}
-	switch {
-	case errors.Is(err, store.ErrNotFound):
-		writeError(w, http.StatusNotFound, "not found")
-	case errors.Is(err, store.ErrConflict):
-		writeError(w, http.StatusConflict, "conflict")
-	case errors.Is(err, store.ErrForbidden):
-		writeError(w, http.StatusForbidden, "forbidden")
-	default:
-		writeError(w, http.StatusBadRequest, err.Error())
-	}
-}
-
-func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
-}
-
-func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, map[string]string{"error": message})
-}
-
-func splitPath(path string) []string {
-	raw := strings.Split(strings.Trim(path, "/"), "/")
-	parts := []string{}
-	for _, part := range raw {
-		if part != "" {
-			parts = append(parts, part)
-		}
-	}
-	return parts
-}
-
-func randomToken() string { return randomID("tok") }
-
-func randomID(prefix string) string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic(err)
-	}
-	return prefix + "_" + hex.EncodeToString(b[:])
-}
-
-func cors(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
 }

@@ -1,73 +1,95 @@
-import { useEffect, useState } from 'react';
+import { useEffect } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { LogOut, Shield, SquareStack } from 'lucide-react';
-import { Login } from './pages/Login';
-import { Projects } from './pages/Projects';
+import { Navigate, NavLink, Outlet, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
+import { api, APIError, AUTH_EXPIRED_EVENT, type User } from './lib/api';
+import { LocaleSelect, useI18n } from './lib/i18n';
 import { Admin } from './pages/Admin';
 import { BoardEditor } from './pages/BoardEditor';
-import { api, setToken, type Board, type Project, type ProjectRole, type User } from './lib/api';
-import { LocaleSelect, useI18n } from './lib/i18n';
+import { ChangePassword } from './pages/ChangePassword';
+import { Login } from './pages/Login';
+import { Projects } from './pages/Projects';
 
-type View = 'projects' | 'admin' | 'board';
+export const authQueryKey = ['auth', 'me'] as const;
 
 export function App() {
-  const { t } = useI18n();
-  const [user, setUser] = useState<User | null>(null);
-  const [view, setView] = useState<View>('projects');
-  const [active, setActive] = useState<{ board: Board; project: Project; role?: ProjectRole } | null>(null);
-  const [loading, setLoading] = useState(true);
+  const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const auth = useQuery({
+    queryKey: authQueryKey,
+    queryFn: () => api<User>('/api/me'),
+    retry: (count, error) => !(error instanceof APIError && error.status === 401) && count < 1
+  });
 
   useEffect(() => {
-    api<User>('/api/me')
-      .then(setUser)
-      .catch(() => setToken(''))
-      .finally(() => setLoading(false));
-  }, []);
+    const expired = () => {
+      queryClient.clear();
+      queryClient.setQueryData<User | null>(authQueryKey, null);
+      navigate('/login', { replace: true });
+    };
+    window.addEventListener(AUTH_EXPIRED_EVENT, expired);
+    return () => window.removeEventListener(AUTH_EXPIRED_EVENT, expired);
+  }, [navigate, queryClient]);
 
-  if (loading) return <div className="loading">{t('app.loading')}</div>;
-  if (!user) return <Login onLogin={setUser} />;
-  if (view === 'board' && active) {
-    return <BoardEditor user={user} board={active.board} project={active.project} role={active.role} onBack={() => setView('projects')} />;
-  }
+  if (auth.isLoading) return <div className="loading">Loading…</div>;
+
+  return (
+    <Routes>
+      <Route path="/login" element={auth.data ? <Navigate to="/projects" replace /> : <Login />} />
+      <Route element={<RequireAuth user={auth.data} />}>
+        <Route path="/change-password" element={<ChangePassword user={auth.data!} />} />
+        <Route element={<RequirePasswordChanged user={auth.data!} />}>
+          <Route element={<AppLayout user={auth.data!} />}>
+            <Route path="/projects" element={<Projects user={auth.data!} />} />
+            <Route path="/projects/:projectId" element={<Projects user={auth.data!} />} />
+            <Route path="/admin" element={auth.data?.system_role === 'system_admin' ? <Admin /> : <Navigate to="/projects" replace />} />
+          </Route>
+          <Route path="/boards/:boardId" element={<BoardEditor user={auth.data!} />} />
+        </Route>
+      </Route>
+      <Route path="*" element={<Navigate to={auth.data ? '/projects' : '/login'} replace />} />
+    </Routes>
+  );
+}
+
+function RequireAuth({ user }: { user?: User }) {
+  const location = useLocation();
+  if (!user) return <Navigate to="/login" replace state={{ from: location.pathname + location.search }} />;
+  return <Outlet />;
+}
+
+function RequirePasswordChanged({ user }: { user: User }) {
+  if (user.must_change_password) return <Navigate to="/change-password" replace />;
+  return <Outlet />;
+}
+
+function AppLayout({ user }: { user: User }) {
+  const { t } = useI18n();
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
 
   async function logout() {
     await api('/api/auth/logout', { method: 'POST' }).catch(() => undefined);
-    setToken('');
-    setUser(null);
+    queryClient.clear();
+    queryClient.setQueryData<User | null>(authQueryKey, null);
+    navigate('/login', { replace: true });
   }
 
   return (
     <div className="app-shell">
       <header className="app-header">
-        <div className="brand">
+        <NavLink className="brand" to="/projects">
           <SquareStack size={24} />
-          <div>
-            <strong>DreamWhiteboard</strong>
-            <span>{user.email}</span>
-          </div>
-        </div>
+          <div><strong>DreamWhiteboard</strong><span>{user.email}</span></div>
+        </NavLink>
         <nav>
-          <button className={view === 'projects' ? 'active' : ''} onClick={() => setView('projects')}>{t('nav.projects')}</button>
-          {user.system_role === 'system_admin' && (
-            <button className={view === 'admin' ? 'active' : ''} onClick={() => setView('admin')}>
-              <Shield size={16} /> {t('nav.admin')}
-            </button>
-          )}
+          <NavLink to="/projects">{t('nav.projects')}</NavLink>
+          {user.system_role === 'system_admin' && <NavLink to="/admin"><Shield size={16} /> {t('nav.admin')}</NavLink>}
           <LocaleSelect />
           <button onClick={logout}><LogOut size={16} /> {t('nav.signOut')}</button>
         </nav>
       </header>
-      <main className="app-main">
-        {view === 'projects' && (
-          <Projects
-            user={user}
-            onOpenBoard={(board, project, role) => {
-              setActive({ board, project, role });
-              setView('board');
-            }}
-          />
-        )}
-        {view === 'admin' && <Admin />}
-      </main>
+      <main className="app-main"><Outlet /></main>
     </div>
   );
 }

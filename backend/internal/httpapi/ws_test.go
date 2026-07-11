@@ -1,0 +1,415 @@
+package httpapi
+
+import (
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
+
+	"dreamwhiteboard/backend/internal/domain"
+	"dreamwhiteboard/backend/internal/realtime"
+	"dreamwhiteboard/backend/internal/store"
+)
+
+type wsTestRepository struct {
+	*store.MemoryStore
+}
+
+// These tests exercise session authentication without also exercising the
+// first-login password flow, which has its own HTTP tests.
+func (r *wsTestRepository) GetUser(id string) (domain.User, error) {
+	user, err := r.MemoryStore.GetUser(id)
+	user.MustChangePassword = false
+	return user, err
+}
+
+type wsFixture struct {
+	t       *testing.T
+	repo    *wsTestRepository
+	server  *Server
+	http    *httptest.Server
+	project domain.Project
+	board   domain.Board
+	editor  domain.User
+}
+
+func newWSFixture(t *testing.T) *wsFixture {
+	t.Helper()
+	repo := &wsTestRepository{MemoryStore: store.NewMemoryStore()}
+	editor, err := repo.CreateUser("editor@example.com", "Editor", "editor-password", domain.SystemUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := repo.CreateProject("Realtime", "", editor.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	board, err := repo.CreateBoard(project.ID, "Board", editor.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := DefaultConfig(t.TempDir())
+	config.CookieSecure = false
+	config.WSAuthInterval = 20 * time.Millisecond
+	config.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := NewServerWithConfig(repo, config)
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(func() {
+		server.Close()
+		httpServer.Close()
+	})
+	return &wsFixture{
+		t: t, repo: repo, server: server, http: httpServer,
+		project: project, board: board, editor: editor,
+	}
+}
+
+func (f *wsFixture) dial(user domain.User) *websocket.Conn {
+	f.t.Helper()
+	connection, _ := f.dialWithToken(user)
+	return connection
+}
+
+func (f *wsFixture) dialWithToken(user domain.User) (*websocket.Conn, string) {
+	f.t.Helper()
+	token := randomHex(32)
+	if _, err := f.repo.CreateSession(store.HashSessionToken(token), user.ID, time.Now().Add(time.Hour)); err != nil {
+		f.t.Fatal(err)
+	}
+	header := http.Header{}
+	header.Set("Cookie", (&http.Cookie{Name: sessionCookieName, Value: token, Path: "/api"}).String())
+	wsURL := "ws" + strings.TrimPrefix(f.http.URL, "http") + "/api/boards/" + f.board.ID + "/ws"
+	connection, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		if response != nil {
+			f.t.Fatalf("websocket dial: %v (status %d)", err, response.StatusCode)
+		}
+		f.t.Fatalf("websocket dial: %v", err)
+	}
+	f.t.Cleanup(func() { _ = connection.Close() })
+	return connection, token
+}
+
+func (f *wsFixture) connect(user domain.User) (*websocket.Conn, realtime.Message) {
+	f.t.Helper()
+	connection := f.dial(user)
+	start := readRealtimeMessage(f.t, connection)
+	if start.Type != realtime.MessageSyncStart || start.Protocol != realtime.ProtocolVersion || start.ClientID == "" {
+		f.t.Fatalf("unexpected sync start: %#v", start)
+	}
+	complete := readRealtimeMessage(f.t, connection)
+	if complete.Type != realtime.MessageSyncComplete {
+		f.t.Fatalf("unexpected sync completion: %#v", complete)
+	}
+	return connection, start
+}
+
+func TestBoardWebSocketInitialSyncReplaysCheckpointThenUpdates(t *testing.T) {
+	fixture := newWSFixture(t)
+	first, inserted, err := fixture.repo.AppendBoardUpdate(domain.BoardUpdate{
+		BoardID: fixture.board.ID, UpdateID: "first", ClientID: "old-client",
+		UserID: fixture.editor.ID, Update: []byte{1},
+	})
+	if err != nil || !inserted {
+		t.Fatalf("append first update: inserted=%v err=%v", inserted, err)
+	}
+	checkpoint := []byte{7, 7, 7}
+	if _, err := fixture.repo.SaveBoardCheckpoint(fixture.board.ID, checkpoint, first.ServerSequence); err != nil {
+		t.Fatal(err)
+	}
+	second, inserted, err := fixture.repo.AppendBoardUpdate(domain.BoardUpdate{
+		BoardID: fixture.board.ID, UpdateID: "second", ClientID: "old-client",
+		UserID: fixture.editor.ID, Update: []byte{2},
+	})
+	if err != nil || !inserted {
+		t.Fatalf("append second update: inserted=%v err=%v", inserted, err)
+	}
+
+	connection := fixture.dial(fixture.editor)
+	start := readRealtimeMessage(t, connection)
+	checkpointMessage := readRealtimeMessage(t, connection)
+	updateMessage := readRealtimeMessage(t, connection)
+	complete := readRealtimeMessage(t, connection)
+	if start.Type != realtime.MessageSyncStart ||
+		checkpointMessage.Type != realtime.MessageCheckpoint ||
+		checkpointMessage.ServerSequence != first.ServerSequence ||
+		string(checkpointMessage.Data) != string(checkpoint) ||
+		updateMessage.Type != realtime.MessageUpdate ||
+		updateMessage.UpdateID != second.UpdateID ||
+		updateMessage.ServerSequence != second.ServerSequence ||
+		complete.Type != realtime.MessageSyncComplete ||
+		complete.ServerSequence != second.ServerSequence {
+		t.Fatalf("unexpected initial sync: start=%#v checkpoint=%#v update=%#v complete=%#v", start, checkpointMessage, updateMessage, complete)
+	}
+}
+
+func TestBoardWebSocketPersistsAcknowledgesAndBroadcastsUpdate(t *testing.T) {
+	fixture := newWSFixture(t)
+	sender, _ := fixture.connect(fixture.editor)
+	peer, _ := fixture.connect(fixture.editor)
+	update := []byte{1, 2, 3, 4}
+	if err := sender.WriteJSON(wsClientMessage{
+		Type: realtime.MessageUpdate, UpdateID: "update-1", Data: update,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ack := readRealtimeMessage(t, sender)
+	if ack.Type != realtime.MessageUpdateAck || ack.UpdateID != "update-1" || ack.ServerSequence != 1 || ack.Duplicate {
+		t.Fatalf("unexpected update ack: %#v", ack)
+	}
+	broadcast := readRealtimeMessage(t, peer)
+	if broadcast.Type != realtime.MessageUpdate || broadcast.UpdateID != "update-1" || broadcast.ServerSequence != 1 || string(broadcast.Data) != string(update) {
+		t.Fatalf("unexpected update broadcast: %#v", broadcast)
+	}
+	document, updates, err := fixture.repo.LoadBoardDocument(fixture.board.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if document.CheckpointSequence != 0 || len(updates) != 1 || updates[0].UpdateID != "update-1" {
+		t.Fatalf("update was not persisted before broadcast: document=%#v updates=%#v", document, updates)
+	}
+
+	if err := sender.WriteJSON(wsClientMessage{
+		Type: realtime.MessageUpdate, UpdateID: "update-1", Data: update,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	duplicateAck := readRealtimeMessage(t, sender)
+	if duplicateAck.Type != realtime.MessageUpdateAck || !duplicateAck.Duplicate || duplicateAck.ServerSequence != 1 {
+		t.Fatalf("unexpected duplicate ack: %#v", duplicateAck)
+	}
+	if err := peer.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := peer.ReadMessage(); err == nil {
+		t.Fatal("duplicate update was broadcast to peer")
+	}
+}
+
+func TestBoardWebSocketRejectsViewerDocumentUpdate(t *testing.T) {
+	fixture := newWSFixture(t)
+	viewer, err := fixture.repo.CreateUser("viewer@example.com", "Viewer", "viewer-password", domain.SystemUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.repo.UpsertMember(fixture.project.ID, viewer.ID, domain.RoleViewer); err != nil {
+		t.Fatal(err)
+	}
+	connection, start := fixture.connect(viewer)
+	if start.CanEdit == nil || *start.CanEdit {
+		t.Fatalf("viewer sync permissions are wrong: %#v", start)
+	}
+	if err := connection.WriteJSON(wsClientMessage{
+		Type: realtime.MessageUpdate, UpdateID: "viewer-update", Data: []byte{1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	message := readRealtimeMessage(t, connection)
+	if message.Type != realtime.MessageError || message.Code != "forbidden" || message.UpdateID != "viewer-update" {
+		t.Fatalf("unexpected viewer response: %#v", message)
+	}
+	_, updates, err := fixture.repo.LoadBoardDocument(fixture.board.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) != 0 {
+		t.Fatalf("viewer update was persisted: %#v", updates)
+	}
+}
+
+func TestBoardWebSocketRevokedSessionIsEvictedWithoutClientTraffic(t *testing.T) {
+	fixture := newWSFixture(t)
+	connection, token := fixture.dialWithToken(fixture.editor)
+	if message := readRealtimeMessage(t, connection); message.Type != realtime.MessageSyncStart {
+		t.Fatalf("unexpected sync start: %#v", message)
+	}
+	if message := readRealtimeMessage(t, connection); message.Type != realtime.MessageSyncComplete {
+		t.Fatalf("unexpected sync completion: %#v", message)
+	}
+	if err := fixture.repo.DeleteSession(store.HashSessionToken(token)); err != nil {
+		t.Fatal(err)
+	}
+	assertWebSocketClosed(t, connection, time.Second)
+}
+
+func TestBoardWebSocketRemovedMemberIsEvictedWithoutClientTraffic(t *testing.T) {
+	fixture := newWSFixture(t)
+	viewer, err := fixture.repo.CreateUser("passive@example.com", "Passive", "passive-password", domain.SystemUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.repo.UpsertMember(fixture.project.ID, viewer.ID, domain.RoleViewer); err != nil {
+		t.Fatal(err)
+	}
+	connection, _ := fixture.connect(viewer)
+	if err := fixture.repo.DeleteMember(fixture.project.ID, viewer.ID); err != nil {
+		t.Fatal(err)
+	}
+	assertWebSocketClosed(t, connection, time.Second)
+}
+
+func TestServerCloseEvictsWebSocketsAndWaitsForHandlers(t *testing.T) {
+	fixture := newWSFixture(t)
+	connection, _ := fixture.connect(fixture.editor)
+	if err := fixture.server.Close(); err != nil {
+		t.Fatalf("close server with active websocket: %v", err)
+	}
+	assertWebSocketClosed(t, connection, time.Second)
+}
+
+func TestBoardWebSocketRoleDowngradeTakesEffectOnNextMessage(t *testing.T) {
+	fixture := newWSFixture(t)
+	editor, err := fixture.repo.CreateUser("second-editor@example.com", "Second editor", "second-editor-password", domain.SystemUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.repo.UpsertMember(fixture.project.ID, editor.ID, domain.RoleEditor); err != nil {
+		t.Fatal(err)
+	}
+	connection, _ := fixture.connect(editor)
+	if _, err := fixture.repo.UpsertMember(fixture.project.ID, editor.ID, domain.RoleViewer); err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.WriteJSON(wsClientMessage{
+		Type: realtime.MessageUpdate, UpdateID: "after-downgrade", Data: []byte{1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	message := readRealtimeMessage(t, connection)
+	if message.Type != realtime.MessageError || message.Code != "forbidden" || message.UpdateID != "after-downgrade" {
+		t.Fatalf("unexpected response after role downgrade: %#v", message)
+	}
+	_, updates, err := fixture.repo.LoadBoardDocument(fixture.board.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) != 0 {
+		t.Fatalf("downgraded editor update was persisted: %#v", updates)
+	}
+}
+
+func TestBoardWebSocketRejectsUpdateIDReuseWithDifferentData(t *testing.T) {
+	fixture := newWSFixture(t)
+	connection, _ := fixture.connect(fixture.editor)
+	if err := connection.WriteJSON(wsClientMessage{
+		Type: realtime.MessageUpdate, UpdateID: "same-id", Data: []byte{1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ack := readRealtimeMessage(t, connection); ack.Type != realtime.MessageUpdateAck {
+		t.Fatalf("unexpected update ack: %#v", ack)
+	}
+	if err := connection.WriteJSON(wsClientMessage{
+		Type: realtime.MessageUpdate, UpdateID: "same-id", Data: []byte{2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	conflict := readRealtimeMessage(t, connection)
+	if conflict.Type != realtime.MessageError || conflict.Code != "update_id_conflict" || conflict.UpdateID != "same-id" {
+		t.Fatalf("unexpected update ID conflict: %#v", conflict)
+	}
+}
+
+func TestBoardWebSocketBroadcastsAwarenessRemovalOnDisconnect(t *testing.T) {
+	fixture := newWSFixture(t)
+	leaving, leavingStart := fixture.connect(fixture.editor)
+	peer, _ := fixture.connect(fixture.editor)
+	if err := leaving.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+		time.Now().Add(time.Second),
+	); err != nil {
+		t.Fatal(err)
+	}
+	_ = leaving.Close()
+
+	removed := readRealtimeMessage(t, peer)
+	if removed.Type != realtime.MessageAwareness || !removed.Removed || removed.ClientID != leavingStart.ClientID || removed.UserID != fixture.editor.ID {
+		t.Fatalf("unexpected awareness removal: %#v", removed)
+	}
+}
+
+func TestBoardWebSocketDuplicateRemainsIdempotentAfterCheckpoint(t *testing.T) {
+	fixture := newWSFixture(t)
+	fixture.server.hub = realtime.NewHub(realtime.WithCheckpointPolicy(1, time.Hour))
+	connection, _ := fixture.connect(fixture.editor)
+	update := []byte{9, 8, 7}
+	if err := connection.WriteJSON(wsClientMessage{
+		Type: realtime.MessageUpdate, UpdateID: "compacted-update", Data: update,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ack := readRealtimeMessage(t, connection)
+	if ack.Type != realtime.MessageUpdateAck || ack.ServerSequence != 1 {
+		t.Fatalf("unexpected update ack: %#v", ack)
+	}
+	request := readRealtimeMessage(t, connection)
+	if request.Type != realtime.MessageCheckpointRequest || request.RequestID == "" || request.ThroughSequence != 1 {
+		t.Fatalf("unexpected checkpoint request: %#v", request)
+	}
+	checkpoint := []byte{5, 4, 3, 2, 1}
+	if err := connection.WriteJSON(wsClientMessage{
+		Type: realtime.MessageCheckpoint, RequestID: request.RequestID,
+		ThroughSequence: request.ThroughSequence, Data: checkpoint,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	checkpointAck := readRealtimeMessage(t, connection)
+	if checkpointAck.Type != realtime.MessageCheckpointAck || checkpointAck.ThroughSequence != 1 {
+		t.Fatalf("unexpected checkpoint ack: %#v", checkpointAck)
+	}
+	document, updates, err := fixture.repo.LoadBoardDocument(fixture.board.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if document.CheckpointSequence != 1 || string(document.Checkpoint) != string(checkpoint) || len(updates) != 0 {
+		t.Fatalf("checkpoint did not compact updates: document=%#v updates=%#v", document, updates)
+	}
+
+	// This models a lost ACK: the page still has the original update in its
+	// pending queue and reconnect/resend happens after compaction.
+	if err := connection.WriteJSON(wsClientMessage{
+		Type: realtime.MessageUpdate, UpdateID: "compacted-update", Data: update,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	duplicateAck := readRealtimeMessage(t, connection)
+	if duplicateAck.Type != realtime.MessageUpdateAck || !duplicateAck.Duplicate || duplicateAck.ServerSequence != 1 {
+		t.Fatalf("compacted duplicate was not idempotent: %#v", duplicateAck)
+	}
+	documentAfter, updatesAfter, err := fixture.repo.LoadBoardDocument(fixture.board.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if documentAfter.CheckpointSequence != 1 || len(updatesAfter) != 0 {
+		t.Fatalf("duplicate reappeared after checkpoint: document=%#v updates=%#v", documentAfter, updatesAfter)
+	}
+}
+
+func readRealtimeMessage(t *testing.T, connection *websocket.Conn) realtime.Message {
+	t.Helper()
+	if err := connection.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var message realtime.Message
+	if err := connection.ReadJSON(&message); err != nil {
+		t.Fatalf("read realtime message: %v", err)
+	}
+	return message
+}
+
+func assertWebSocketClosed(t *testing.T, connection *websocket.Conn, timeout time.Duration) {
+	t.Helper()
+	if err := connection.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := connection.ReadMessage(); err == nil {
+		t.Fatal("websocket remained open after authorization was revoked")
+	}
+}

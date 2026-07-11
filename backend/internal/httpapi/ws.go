@@ -1,227 +1,454 @@
 package httpapi
 
 import (
-	"bufio"
-	"crypto/sha1"
-	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
-	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"dreamwhiteboard/backend/internal/domain"
 	"dreamwhiteboard/backend/internal/realtime"
+	"dreamwhiteboard/backend/internal/store"
 )
 
-const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+const (
+	wsWriteWait          = 10 * time.Second
+	wsPongWait           = 60 * time.Second
+	wsPingPeriod         = (wsPongWait * 9) / 10
+	wsMaxMessageBytes    = 24 << 20
+	wsMaxUpdateBytes     = 8 << 20
+	wsMaxCheckpointBytes = 16 << 20
+	wsMaxAwarenessBytes  = 64 << 10
+	wsSendBuffer         = 128
+	wsMaxUpdateIDLength  = 128
+	wsCloseHandshakeWait = time.Second
+)
+
+var boardWSUpgrader = websocket.Upgrader{
+	ReadBufferSize:  4096,
+	WriteBufferSize: 4096,
+}
 
 type wsClientMessage struct {
-	Type        string         `json:"type"`
-	ClientID    string         `json:"client_id"`
-	OperationID string         `json:"op_id"`
-	Operation   string         `json:"operation"`
-	BaseVersion int64          `json:"base_version"`
-	Payload     map[string]any `json:"payload"`
+	Type            string `json:"type"`
+	UpdateID        string `json:"update_id"`
+	RequestID       string `json:"request_id"`
+	ThroughSequence int64  `json:"through_sequence"`
+	Data            []byte `json:"data"`
 }
 
 func (s *Server) handleBoardWS(w http.ResponseWriter, r *http.Request, user domain.User, board domain.Board) {
-	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		writeError(w, http.StatusBadRequest, "websocket upgrade required")
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil || cookie.Value == "" {
+		writeAPIError(w, r, http.StatusUnauthorized, "authentication_required", "authentication required", nil)
 		return
 	}
-	conn, rw, err := hijackWebSocket(w, r)
+	sessionHash := store.HashSessionToken(cookie.Value)
+	upgrader := boardWSUpgrader
+	upgrader.CheckOrigin = s.websocketOriginAllowed
+	connection, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	defer conn.Close()
-
-	client := &realtime.Client{
-		ID:      r.URL.Query().Get("client_id"),
-		UserID:  user.ID,
-		BoardID: board.ID,
-		Send:    make(chan []byte, 32),
+	connection.SetReadLimit(wsMaxMessageBytes)
+	if err := connection.SetReadDeadline(time.Now().Add(wsPongWait)); err != nil {
+		_ = connection.Close()
+		return
 	}
-	if client.ID == "" {
-		client.ID = randomID("cli")
+	connection.SetPongHandler(func(string) error {
+		return connection.SetReadDeadline(time.Now().Add(wsPongWait))
+	})
+
+	canEdit, err := s.canEditProject(user, board.ProjectID)
+	if err != nil {
+		_ = writeWSJSON(connection, realtime.Message{Type: realtime.MessageError, Code: "authorization_unavailable", Message: "could not verify board permission"})
+		_ = connection.Close()
+		return
 	}
-	s.hub.Join(client)
-	defer s.hub.Leave(client)
+	client := realtime.NewClient(randomID("cli"), user.ID, board.ID, canEdit, wsSendBuffer)
+	if err := s.hub.Join(client, func() (realtime.SyncState, error) {
+		return s.writeBoardSync(connection, user, board, client)
+	}); err != nil {
+		_ = writeWSJSON(connection, realtime.Message{
+			Type:    realtime.MessageError,
+			Code:    "sync_failed",
+			Message: "could not synchronize board",
+		})
+		_ = connection.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "sync failed"),
+			time.Now().Add(wsWriteWait),
+		)
+		_ = connection.Close()
+		return
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(wsPongWait)); err != nil {
+		s.hub.Leave(client)
+		_ = connection.Close()
+		return
+	}
 
-	snapshot, _ := s.repo.Snapshot(board.ID)
-	client.Send <- realtime.Encode(realtime.Message{Type: "snapshot", BoardID: board.ID, ClientID: client.ID, Snapshot: &snapshot})
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for payload := range client.Send {
-			if err := writeWSFrame(rw.Writer, payload); err != nil {
-				return
-			}
+	writeDone := make(chan struct{})
+	go writeBoardWS(connection, client, writeDone)
+	authStop := make(chan struct{})
+	authDone := make(chan struct{})
+	go s.monitorBoardWSAuthorization(client, board, sessionHash, authStop, authDone)
+	defer func() {
+		close(authStop)
+		<-authDone
+		s.hub.Leave(client)
+		select {
+		case <-writeDone:
+		case <-time.After(wsCloseHandshakeWait):
+			_ = connection.Close()
 		}
 	}()
 
 	for {
-		payload, err := readWSFrame(rw.Reader)
+		messageType, payload, err := connection.ReadMessage()
 		if err != nil {
 			return
 		}
-		var msg wsClientMessage
-		if err := json.Unmarshal(payload, &msg); err != nil {
-			client.Send <- realtime.Encode(realtime.Message{Type: "error", Error: "invalid json"})
+		if messageType != websocket.TextMessage {
+			if !s.sendWSError(client, "unsupported_frame", "realtime messages must be JSON text frames", "") {
+				return
+			}
 			continue
 		}
-		switch msg.Type {
-		case "join":
-			snapshot, _ := s.repo.Snapshot(board.ID)
-			client.Send <- realtime.Encode(realtime.Message{Type: "snapshot", BoardID: board.ID, ClientID: client.ID, Snapshot: &snapshot})
-		case "cursor", "presence":
-			s.hub.Broadcast(board.ID, realtime.Message{Type: msg.Type, BoardID: board.ID, ClientID: client.ID, UserID: user.ID, Payload: msg.Payload}, client)
-		case "operation":
-			if !s.canEditProject(user, board.ProjectID) {
-				client.Send <- realtime.Encode(realtime.Message{Type: "error", Error: "viewer cannot mutate board"})
-				continue
+		var message wsClientMessage
+		if err := json.Unmarshal(payload, &message); err != nil {
+			if !s.sendWSError(client, "invalid_json", "message is not valid JSON", "") {
+				return
 			}
-			op := domain.Operation{
-				ID:          msg.OperationID,
-				BoardID:     board.ID,
-				ClientID:    client.ID,
-				UserID:      user.ID,
-				Type:        msg.Operation,
-				BaseVersion: msg.BaseVersion,
-				Payload:     msg.Payload,
-			}
-			applied, snapshot, err := s.repo.ApplyOperation(op)
-			if err != nil {
-				client.Send <- realtime.Encode(realtime.Message{Type: "error", Error: err.Error()})
-				continue
-			}
-			client.Send <- realtime.Encode(realtime.Message{Type: "operation_ack", BoardID: board.ID, ClientID: client.ID, Operation: &applied, Snapshot: &snapshot})
-			s.hub.Broadcast(board.ID, realtime.Message{Type: "operation_broadcast", BoardID: board.ID, ClientID: client.ID, Operation: &applied}, client)
-		default:
-			client.Send <- realtime.Encode(realtime.Message{Type: "error", Error: "unsupported message type"})
+			continue
 		}
+		if !s.handleBoardWSMessage(client, board, sessionHash, message) {
+			return
+		}
+	}
+}
+
+func (s *Server) monitorBoardWSAuthorization(client *realtime.Client, board domain.Board, sessionHash string, stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	ticker := time.NewTicker(s.config.WSAuthInterval)
+	defer ticker.Stop()
+	for {
 		select {
-		case <-done:
+		case <-stop:
+			return
+		case <-client.Done:
+			return
+		case <-ticker.C:
+			if _, _, ok, err := s.refreshBoardWSAuthorization(client, board, sessionHash); err != nil {
+				s.sendWSError(client, "authorization_unavailable", "could not verify collaboration access", "")
+				s.hub.Leave(client)
+				return
+			} else if !ok {
+				s.hub.Leave(client)
+				return
+			}
+		}
+	}
+}
+
+func (s *Server) refreshBoardWSAuthorization(client *realtime.Client, board domain.Board, sessionHash string) (domain.User, bool, bool, error) {
+	session, err := s.repo.GetSession(sessionHash, s.config.Now().UTC())
+	if errors.Is(err, store.ErrNotFound) || (err == nil && session.UserID != client.UserID) {
+		return domain.User{}, false, false, nil
+	}
+	if err != nil {
+		return domain.User{}, false, false, err
+	}
+	user, err := s.repo.GetUser(session.UserID)
+	if errors.Is(err, store.ErrNotFound) || (err == nil && user.MustChangePassword) {
+		return domain.User{}, false, false, nil
+	}
+	if err != nil {
+		return domain.User{}, false, false, err
+	}
+	canView, err := s.canViewProject(user, board.ProjectID)
+	if err != nil {
+		return domain.User{}, false, false, err
+	}
+	if !canView {
+		return domain.User{}, false, false, nil
+	}
+	canEdit, err := s.canEditProject(user, board.ProjectID)
+	if err != nil {
+		return domain.User{}, false, false, err
+	}
+	s.hub.SetCanEdit(client, canEdit)
+	return user, canEdit, true, nil
+}
+
+func (s *Server) websocketOriginAllowed(r *http.Request) bool {
+	origin := strings.TrimRight(strings.TrimSpace(r.Header.Get("Origin")), "/")
+	if origin == "" || sameOrigin(origin, r) {
+		return true
+	}
+	for _, allowed := range s.config.AllowedOrigins {
+		if origin == strings.TrimRight(strings.TrimSpace(allowed), "/") {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) writeBoardSync(connection *websocket.Conn, user domain.User, board domain.Board, client *realtime.Client) (realtime.SyncState, error) {
+	document, updates, err := s.repo.LoadBoardDocument(board.ID)
+	if err != nil {
+		return realtime.SyncState{}, err
+	}
+	// Repositories promise sequence order, but sorting here keeps the wire
+	// contract deterministic for alternate repository implementations.
+	sort.Slice(updates, func(i, j int) bool {
+		return updates[i].ServerSequence < updates[j].ServerSequence
+	})
+
+	canEdit, err := s.canEditProject(user, board.ProjectID)
+	if err != nil {
+		return realtime.SyncState{}, err
+	}
+	client.CanEdit = canEdit
+	if err := writeWSJSON(connection, realtime.Message{
+		Type:     realtime.MessageSyncStart,
+		Protocol: realtime.ProtocolVersion,
+		BoardID:  board.ID,
+		ClientID: client.ID,
+		UserID:   user.ID,
+		CanEdit:  &canEdit,
+	}); err != nil {
+		return realtime.SyncState{}, err
+	}
+	if len(document.Checkpoint) > 0 {
+		if err := writeWSJSON(connection, realtime.Message{
+			Type:           realtime.MessageCheckpoint,
+			BoardID:        board.ID,
+			ServerSequence: document.CheckpointSequence,
+			Data:           document.Checkpoint,
+		}); err != nil {
+			return realtime.SyncState{}, err
+		}
+	}
+
+	latestSequence := document.CheckpointSequence
+	for _, update := range updates {
+		if update.ServerSequence <= document.CheckpointSequence {
+			continue
+		}
+		if err := writeWSJSON(connection, realtime.Message{
+			Type:           realtime.MessageUpdate,
+			BoardID:        board.ID,
+			UpdateID:       update.UpdateID,
+			ServerSequence: update.ServerSequence,
+			ClientID:       update.ClientID,
+			UserID:         update.UserID,
+			Data:           update.Update,
+		}); err != nil {
+			return realtime.SyncState{}, err
+		}
+		if update.ServerSequence > latestSequence {
+			latestSequence = update.ServerSequence
+		}
+	}
+	if err := writeWSJSON(connection, realtime.Message{
+		Type:           realtime.MessageSyncComplete,
+		BoardID:        board.ID,
+		ServerSequence: latestSequence,
+	}); err != nil {
+		return realtime.SyncState{}, err
+	}
+	return realtime.SyncState{
+		CheckpointSequence: document.CheckpointSequence,
+		LatestSequence:     latestSequence,
+	}, nil
+}
+
+func (s *Server) handleBoardWSMessage(client *realtime.Client, board domain.Board, sessionHash string, message wsClientMessage) bool {
+	user, canEdit, authorized, err := s.refreshBoardWSAuthorization(client, board, sessionHash)
+	if err != nil {
+		s.sendWSError(client, "authorization_unavailable", "could not verify collaboration access", message.UpdateID)
+		return false
+	}
+	if !authorized {
+		s.sendWSError(client, "forbidden", "board access was revoked", message.UpdateID)
+		return false
+	}
+
+	switch message.Type {
+	case realtime.MessageUpdate:
+		if !canEdit {
+			return s.sendWSError(client, "forbidden", "viewer cannot update the document", message.UpdateID)
+		}
+		if err := validateDocumentUpdate(message); err != nil {
+			return s.sendWSError(client, "invalid_update", err.Error(), message.UpdateID)
+		}
+		persisted, inserted, err := s.repo.AppendBoardUpdate(domain.BoardUpdate{
+			BoardID:  board.ID,
+			UpdateID: message.UpdateID,
+			ClientID: client.ID,
+			UserID:   user.ID,
+			Update:   message.Data,
+		})
+		if err != nil {
+			if errors.Is(err, store.ErrUpdateIDConflict) {
+				return s.sendWSError(client, "update_id_conflict", "update_id was already used for different data", message.UpdateID)
+			}
+			return s.sendWSError(client, "persistence_failed", "could not persist document update", message.UpdateID)
+		}
+		acknowledged := s.hub.Send(client, realtime.Message{
+			Type:           realtime.MessageUpdateAck,
+			BoardID:        board.ID,
+			UpdateID:       persisted.UpdateID,
+			ServerSequence: persisted.ServerSequence,
+			Duplicate:      !inserted,
+		})
+		// Publishing must not depend on the sender still being writable. A slow
+		// sender can lose its ACK, but peers must still receive the committed
+		// update. Re-publishing a live duplicate is safe: the hub suppresses any
+		// sequence it has already published and can use it to heal a rare gap.
+		if len(persisted.Update) > 0 {
+			s.hub.BroadcastUpdate(board.ID, realtime.Message{
+				Type:           realtime.MessageUpdate,
+				BoardID:        board.ID,
+				UpdateID:       persisted.UpdateID,
+				ServerSequence: persisted.ServerSequence,
+				ClientID:       persisted.ClientID,
+				UserID:         persisted.UserID,
+				Data:           persisted.Update,
+			}, client)
+		}
+		return acknowledged
+
+	case realtime.MessageAwareness:
+		if len(message.Data) > wsMaxAwarenessBytes {
+			return s.sendWSError(client, "awareness_too_large", "awareness update exceeds 64 KiB", "")
+		}
+		s.hub.Broadcast(board.ID, realtime.Message{
+			Type:     realtime.MessageAwareness,
+			BoardID:  board.ID,
+			ClientID: client.ID,
+			UserID:   user.ID,
+			Data:     message.Data,
+		}, client)
+		return true
+
+	case realtime.MessageCheckpoint:
+		if !canEdit {
+			return s.sendWSError(client, "forbidden", "viewer cannot save a checkpoint", "")
+		}
+		if message.RequestID == "" || message.ThroughSequence <= 0 || len(message.Data) == 0 {
+			return s.sendWSError(client, "invalid_checkpoint", "checkpoint request_id, sequence, and data are required", "")
+		}
+		if len(message.Data) > wsMaxCheckpointBytes {
+			return s.sendWSError(client, "checkpoint_too_large", "checkpoint exceeds 16 MiB", "")
+		}
+		if !s.hub.ValidateCheckpoint(client, message.RequestID, message.ThroughSequence) {
+			return s.sendWSError(client, "invalid_checkpoint", "checkpoint was not requested or has the wrong sequence", "")
+		}
+		if _, err := s.repo.SaveBoardCheckpoint(board.ID, message.Data, message.ThroughSequence); err != nil {
+			return s.sendWSError(client, "persistence_failed", "could not persist checkpoint", "")
+		}
+		if !s.hub.CompleteCheckpoint(client, message.RequestID, message.ThroughSequence) {
+			return s.sendWSError(client, "checkpoint_conflict", "checkpoint request is no longer active", "")
+		}
+		acknowledged := s.hub.Send(client, realtime.Message{
+			Type:            realtime.MessageCheckpointAck,
+			BoardID:         board.ID,
+			RequestID:       message.RequestID,
+			ThroughSequence: message.ThroughSequence,
+		})
+		// Updates may have accumulated while this request was outstanding. If
+		// the ACK evicted this client, the hub can elect another editor.
+		s.hub.ObserveUpdate(board.ID, 0)
+		return acknowledged
+
+	default:
+		return s.sendWSError(client, "unsupported_message", "unsupported realtime message type", message.UpdateID)
+	}
+}
+
+func validateDocumentUpdate(message wsClientMessage) error {
+	if message.UpdateID == "" || len(message.UpdateID) > wsMaxUpdateIDLength || strings.TrimSpace(message.UpdateID) != message.UpdateID {
+		return errors.New("update_id must be between 1 and 128 non-whitespace characters")
+	}
+	if len(message.Data) == 0 {
+		return errors.New("document update data is required")
+	}
+	if len(message.Data) > wsMaxUpdateBytes {
+		return errors.New("document update exceeds 8 MiB")
+	}
+	return nil
+}
+
+func (s *Server) sendWSError(client *realtime.Client, code, message, updateID string) bool {
+	return s.hub.Send(client, realtime.Message{
+		Type:     realtime.MessageError,
+		BoardID:  client.BoardID,
+		UpdateID: updateID,
+		Code:     code,
+		Message:  message,
+	})
+}
+
+func writeBoardWS(connection *websocket.Conn, client *realtime.Client, done chan<- struct{}) {
+	ticker := time.NewTicker(wsPingPeriod)
+	defer func() {
+		ticker.Stop()
+		_ = connection.Close()
+		close(done)
+	}()
+	for {
+		// A closed client must not drain its buffered backlog: slow-client
+		// eviction is intended to release the connection promptly.
+		select {
+		case <-client.Done:
+			writeWSClose(connection)
 			return
 		default:
 		}
+		select {
+		case <-client.Done:
+			writeWSClose(connection)
+			return
+		case payload, ok := <-client.Send:
+			if !ok {
+				writeWSClose(connection)
+				return
+			}
+			if err := connection.SetWriteDeadline(time.Now().Add(wsWriteWait)); err != nil {
+				return
+			}
+			if err := connection.WriteMessage(websocket.TextMessage, payload); err != nil {
+				return
+			}
+		case <-ticker.C:
+			if err := connection.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteWait)); err != nil {
+				return
+			}
+		}
 	}
 }
 
-func hijackWebSocket(w http.ResponseWriter, r *http.Request) (net.Conn, *bufio.ReadWriter, error) {
-	key := r.Header.Get("Sec-WebSocket-Key")
-	if key == "" {
-		return nil, nil, errors.New("missing Sec-WebSocket-Key")
-	}
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		return nil, nil, errors.New("hijacking unsupported")
-	}
-	conn, rw, err := hijacker.Hijack()
-	if err != nil {
-		return nil, nil, err
-	}
-	sum := sha1.Sum([]byte(key + wsGUID))
-	accept := base64.StdEncoding.EncodeToString(sum[:])
-	response := "HTTP/1.1 101 Switching Protocols\r\n" +
-		"Upgrade: websocket\r\n" +
-		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Accept: " + accept + "\r\n\r\n"
-	if _, err := rw.WriteString(response); err != nil {
-		_ = conn.Close()
-		return nil, nil, err
-	}
-	if err := rw.Flush(); err != nil {
-		_ = conn.Close()
-		return nil, nil, err
-	}
-	return conn, rw, nil
+func writeWSClose(connection *websocket.Conn) {
+	_ = connection.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+		time.Now().Add(wsWriteWait),
+	)
 }
 
-func readWSFrame(r *bufio.Reader) ([]byte, error) {
-	first, err := r.ReadByte()
+func writeWSJSON(connection *websocket.Conn, message realtime.Message) error {
+	payload, err := json.Marshal(message)
 	if err != nil {
-		return nil, err
-	}
-	opcode := first & 0x0f
-	if opcode == 0x8 {
-		return nil, io.EOF
-	}
-	if opcode != 0x1 {
-		return nil, fmt.Errorf("unsupported websocket opcode %d", opcode)
-	}
-	second, err := r.ReadByte()
-	if err != nil {
-		return nil, err
-	}
-	masked := second&0x80 != 0
-	length := uint64(second & 0x7f)
-	switch length {
-	case 126:
-		var n uint16
-		if err := binary.Read(r, binary.BigEndian, &n); err != nil {
-			return nil, err
-		}
-		length = uint64(n)
-	case 127:
-		if err := binary.Read(r, binary.BigEndian, &length); err != nil {
-			return nil, err
-		}
-	}
-	var mask [4]byte
-	if masked {
-		if _, err := io.ReadFull(r, mask[:]); err != nil {
-			return nil, err
-		}
-	}
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(r, payload); err != nil {
-		return nil, err
-	}
-	if masked {
-		for i := range payload {
-			payload[i] ^= mask[i%4]
-		}
-	}
-	return payload, nil
-}
-
-func writeWSFrame(w *bufio.Writer, payload []byte) error {
-	if err := w.WriteByte(0x81); err != nil {
 		return err
 	}
-	switch {
-	case len(payload) < 126:
-		if err := w.WriteByte(byte(len(payload))); err != nil {
-			return err
-		}
-	case len(payload) <= 65535:
-		if err := w.WriteByte(126); err != nil {
-			return err
-		}
-		if err := binary.Write(w, binary.BigEndian, uint16(len(payload))); err != nil {
-			return err
-		}
-	default:
-		if err := w.WriteByte(127); err != nil {
-			return err
-		}
-		if err := binary.Write(w, binary.BigEndian, uint64(len(payload))); err != nil {
-			return err
-		}
-	}
-	if _, err := w.Write(payload); err != nil {
+	if err := connection.SetWriteDeadline(time.Now().Add(wsWriteWait)); err != nil {
 		return err
 	}
-	return w.Flush()
-}
-
-func init() {
-	_ = time.Now
+	return connection.WriteMessage(websocket.TextMessage, payload)
 }

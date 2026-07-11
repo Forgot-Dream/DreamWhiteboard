@@ -1,12 +1,7 @@
 package store
 
 import (
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
-	"errors"
-	"fmt"
+	"context"
 	"sort"
 	"strings"
 	"sync"
@@ -15,141 +10,277 @@ import (
 	"dreamwhiteboard/backend/internal/domain"
 )
 
-var (
-	ErrNotFound  = errors.New("not found")
-	ErrConflict  = errors.New("conflict")
-	ErrForbidden = errors.New("forbidden")
-)
-
 type MemoryStore struct {
-	mu          sync.RWMutex
-	users       map[string]domain.User
-	userByMail  map[string]string
-	projects    map[string]domain.Project
-	members     map[string]map[string]domain.ProjectMember
-	boards      map[string]domain.Board
-	boardBlocks map[string]map[string]domain.Block
-	operations  map[string][]domain.Operation
-	assets      map[string]domain.Asset
+	mu             sync.RWMutex
+	users          map[string]domain.User
+	userByMail     map[string]string
+	sessions       map[string]domain.Session
+	projects       map[string]domain.Project
+	members        map[string]map[string]domain.ProjectMember
+	boards         map[string]domain.Board
+	boardDocuments map[string]domain.BoardDocument
+	boardUpdates   map[string][]domain.BoardUpdate
+	assets         map[string]domain.Asset
 }
 
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		users:       map[string]domain.User{},
-		userByMail:  map[string]string{},
-		projects:    map[string]domain.Project{},
-		members:     map[string]map[string]domain.ProjectMember{},
-		boards:      map[string]domain.Board{},
-		boardBlocks: map[string]map[string]domain.Block{},
-		operations:  map[string][]domain.Operation{},
-		assets:      map[string]domain.Asset{},
+		users:          map[string]domain.User{},
+		userByMail:     map[string]string{},
+		sessions:       map[string]domain.Session{},
+		projects:       map[string]domain.Project{},
+		members:        map[string]map[string]domain.ProjectMember{},
+		boards:         map[string]domain.Board{},
+		boardDocuments: map[string]domain.BoardDocument{},
+		boardUpdates:   map[string][]domain.BoardUpdate{},
+		assets:         map[string]domain.Asset{},
 	}
 }
 
+func (s *MemoryStore) Ready(context.Context) error { return nil }
+
+func (s *MemoryStore) Close() error { return nil }
+
 func (s *MemoryStore) EnsureSystemAdmin(email, password string) (domain.User, error) {
+	email = normalizeEmail(email)
+	if email == "" || password == "" {
+		return domain.User{}, ErrInvalidInput
+	}
+	s.mu.RLock()
+	existingID, exists := s.userByMail[email]
+	existing := s.users[existingID]
+	s.mu.RUnlock()
+	if exists {
+		if existing.SystemRole != domain.SystemAdmin {
+			return domain.User{}, ErrConflict
+		}
+		return publicStoreUser(existing), nil
+	}
+	hash := HashPassword(password)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	email = normalizeEmail(email)
 	if id, ok := s.userByMail[email]; ok {
-		return s.users[id], nil
+		existing := s.users[id]
+		if existing.SystemRole != domain.SystemAdmin {
+			return domain.User{}, ErrConflict
+		}
+		return publicStoreUser(existing), nil
 	}
 	user := domain.User{
-		ID:           newID("usr"),
-		Email:        email,
-		Name:         "System Admin",
-		SystemRole:   domain.SystemAdmin,
-		PasswordHash: HashPassword(password),
-		CreatedAt:    time.Now().UTC(),
+		ID:                 newID("usr"),
+		Email:              email,
+		Name:               "System Admin",
+		SystemRole:         domain.SystemAdmin,
+		PasswordHash:       hash,
+		MustChangePassword: true,
+		CreatedAt:          time.Now().UTC(),
 	}
 	s.users[user.ID] = user
 	s.userByMail[email] = user.ID
-	return user, nil
+	return publicStoreUser(user), nil
 }
 
-func (s *MemoryStore) Authenticate(email, password string) (domain.User, bool) {
+func (s *MemoryStore) Authenticate(email, password string) (domain.User, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	id, ok := s.userByMail[normalizeEmail(email)]
-	if !ok {
-		return domain.User{}, false
-	}
 	user := s.users[id]
-	return user, VerifyPassword(password, user.PasswordHash)
+	s.mu.RUnlock()
+	if !ok {
+		_ = VerifyPassword(password, dummyPasswordHash)
+		return domain.User{}, ErrInvalidCredentials
+	}
+	if !VerifyPassword(password, user.PasswordHash) {
+		return domain.User{}, ErrInvalidCredentials
+	}
+	return publicStoreUser(user), nil
 }
 
 func (s *MemoryStore) CreateUser(email, name, password, systemRole string) (domain.User, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	email = normalizeEmail(email)
-	if _, ok := s.userByMail[email]; ok {
-		return domain.User{}, ErrConflict
-	}
 	if systemRole == "" {
 		systemRole = domain.SystemUser
 	}
-	user := domain.User{
-		ID:           newID("usr"),
-		Email:        email,
-		Name:         strings.TrimSpace(name),
-		SystemRole:   systemRole,
-		PasswordHash: HashPassword(password),
-		CreatedAt:    time.Now().UTC(),
+	if email == "" || password == "" || !domain.IsSystemRole(systemRole) {
+		return domain.User{}, ErrInvalidInput
 	}
-	if user.Name == "" {
-		user.Name = email
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = email
+	}
+	hash := HashPassword(password)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.userByMail[email]; ok {
+		return domain.User{}, ErrConflict
+	}
+	user := domain.User{
+		ID:                 newID("usr"),
+		Email:              email,
+		Name:               name,
+		SystemRole:         systemRole,
+		PasswordHash:       hash,
+		MustChangePassword: true,
+		CreatedAt:          time.Now().UTC(),
 	}
 	s.users[user.ID] = user
 	s.userByMail[email] = user.ID
-	return user, nil
+	return publicStoreUser(user), nil
 }
 
 func (s *MemoryStore) UpdateUser(id, name, systemRole string) (domain.User, error) {
+	if systemRole != "" && !domain.IsSystemRole(systemRole) {
+		return domain.User{}, ErrInvalidInput
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	user, ok := s.users[id]
 	if !ok {
 		return domain.User{}, ErrNotFound
 	}
-	if strings.TrimSpace(name) != "" {
-		user.Name = strings.TrimSpace(name)
+	if name = strings.TrimSpace(name); name != "" {
+		user.Name = name
 	}
-	if systemRole == domain.SystemAdmin || systemRole == domain.SystemUser {
+	if systemRole != "" {
+		if user.SystemRole == domain.SystemAdmin && systemRole != domain.SystemAdmin && systemAdminCount(s.users) <= 1 {
+			return domain.User{}, ErrLastSystemAdmin
+		}
 		user.SystemRole = systemRole
 	}
 	s.users[id] = user
-	return user, nil
+	return publicStoreUser(user), nil
 }
 
-func (s *MemoryStore) GetUser(id string) (domain.User, bool) {
+func (s *MemoryStore) UpdatePassword(userID, newPassword string, mustChangePassword bool) error {
+	if newPassword == "" {
+		return ErrInvalidInput
+	}
+	hash := HashPassword(newPassword)
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, ok := s.users[userID]
+	if !ok {
+		return ErrNotFound
+	}
+	user.PasswordHash = hash
+	user.MustChangePassword = mustChangePassword
+	user.PasswordChangedAt = &now
+	s.users[userID] = user
+	for tokenHash, session := range s.sessions {
+		if session.UserID == userID {
+			delete(s.sessions, tokenHash)
+		}
+	}
+	return nil
+}
+
+func (s *MemoryStore) GetUser(id string) (domain.User, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	user, ok := s.users[id]
-	return user, ok
+	if !ok {
+		return domain.User{}, ErrNotFound
+	}
+	return publicStoreUser(user), nil
 }
 
-func (s *MemoryStore) ListUsers() []domain.User {
+func (s *MemoryStore) ListUsers() ([]domain.User, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	users := make([]domain.User, 0, len(s.users))
 	for _, user := range s.users {
-		users = append(users, user)
+		users = append(users, publicStoreUser(user))
 	}
 	sort.Slice(users, func(i, j int) bool { return users[i].Email < users[j].Email })
-	return users
+	return users, nil
+}
+
+func (s *MemoryStore) CreateSession(tokenHash, userID string, expiresAt time.Time) (domain.Session, error) {
+	if tokenHash == "" || expiresAt.IsZero() {
+		return domain.Session{}, ErrInvalidInput
+	}
+	now := time.Now().UTC()
+	if !expiresAt.After(now) {
+		return domain.Session{}, ErrInvalidInput
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for existingHash, existing := range s.sessions {
+		if !existing.ExpiresAt.After(now) {
+			delete(s.sessions, existingHash)
+		}
+	}
+	if _, ok := s.users[userID]; !ok {
+		return domain.Session{}, ErrNotFound
+	}
+	if _, ok := s.sessions[tokenHash]; ok {
+		return domain.Session{}, ErrConflict
+	}
+	session := domain.Session{
+		TokenHash:      tokenHash,
+		UserID:         userID,
+		ExpiresAt:      expiresAt.UTC(),
+		LastAccessedAt: now,
+		CreatedAt:      now,
+	}
+	s.sessions[tokenHash] = session
+	return session, nil
+}
+
+func (s *MemoryStore) GetSession(tokenHash string, now time.Time) (domain.Session, error) {
+	now = now.UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session, ok := s.sessions[tokenHash]
+	if !ok {
+		return domain.Session{}, ErrNotFound
+	}
+	if !session.ExpiresAt.After(now) {
+		delete(s.sessions, tokenHash)
+		return domain.Session{}, ErrNotFound
+	}
+	session.LastAccessedAt = now
+	s.sessions[tokenHash] = session
+	return session, nil
+}
+
+func (s *MemoryStore) DeleteSession(tokenHash string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.sessions, tokenHash)
+	return nil
+}
+
+func (s *MemoryStore) DeleteUserSessions(userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for tokenHash, session := range s.sessions {
+		if session.UserID == userID {
+			delete(s.sessions, tokenHash)
+		}
+	}
+	return nil
 }
 
 func (s *MemoryStore) CreateProject(name, description, createdBy string) (domain.Project, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, ok := s.users[createdBy]; !ok {
+		return domain.Project{}, ErrNotFound
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "Untitled project"
+	}
+	now := time.Now().UTC()
 	project := domain.Project{
 		ID:          newID("prj"),
-		Name:        strings.TrimSpace(name),
+		Name:        name,
 		Description: strings.TrimSpace(description),
 		CreatedBy:   createdBy,
-		CreatedAt:   time.Now().UTC(),
-	}
-	if project.Name == "" {
-		project.Name = "Untitled project"
+		CreatedAt:   now,
 	}
 	s.projects[project.ID] = project
 	s.members[project.ID] = map[string]domain.ProjectMember{
@@ -157,23 +288,24 @@ func (s *MemoryStore) CreateProject(name, description, createdBy string) (domain
 			ProjectID: project.ID,
 			UserID:    createdBy,
 			Role:      domain.RoleOwner,
-			CreatedAt: time.Now().UTC(),
+			CreatedAt: now,
 		},
 	}
 	return project, nil
 }
 
-func (s *MemoryStore) ListProjects(user domain.User) []domain.Project {
+func (s *MemoryStore) ListProjects(user domain.User) ([]domain.Project, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	projects := []domain.Project{}
 	for _, project := range s.projects {
-		if user.SystemRole == domain.SystemAdmin || s.members[project.ID][user.ID].UserID != "" {
+		_, member := s.members[project.ID][user.ID]
+		if user.SystemRole == domain.SystemAdmin || member {
 			projects = append(projects, project)
 		}
 	}
 	sort.Slice(projects, func(i, j int) bool { return projects[i].CreatedAt.After(projects[j].CreatedAt) })
-	return projects
+	return projects, nil
 }
 
 func (s *MemoryStore) GetProject(id string) (domain.Project, error) {
@@ -193,8 +325,8 @@ func (s *MemoryStore) UpdateProject(id, name, description string) (domain.Projec
 	if !ok {
 		return domain.Project{}, ErrNotFound
 	}
-	if strings.TrimSpace(name) != "" {
-		project.Name = strings.TrimSpace(name)
+	if name = strings.TrimSpace(name); name != "" {
+		project.Name = name
 	}
 	project.Description = strings.TrimSpace(description)
 	s.projects[id] = project
@@ -212,21 +344,32 @@ func (s *MemoryStore) DeleteProject(id string) error {
 	for boardID, board := range s.boards {
 		if board.ProjectID == id {
 			delete(s.boards, boardID)
-			delete(s.boardBlocks, boardID)
-			delete(s.operations, boardID)
+			delete(s.boardDocuments, boardID)
+			delete(s.boardUpdates, boardID)
+		}
+	}
+	for assetID, asset := range s.assets {
+		if asset.ProjectID == id {
+			delete(s.assets, assetID)
 		}
 	}
 	return nil
 }
 
-func (s *MemoryStore) MemberRole(projectID, userID string) (string, bool) {
+func (s *MemoryStore) MemberRole(projectID, userID string) (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	member, ok := s.members[projectID][userID]
-	return member.Role, ok
+	if !ok {
+		return "", ErrNotFound
+	}
+	return member.Role, nil
 }
 
 func (s *MemoryStore) UpsertMember(projectID, userID, role string) (domain.ProjectMember, error) {
+	if !domain.IsProjectRole(role) {
+		return domain.ProjectMember{}, ErrInvalidInput
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.projects[projectID]; !ok {
@@ -235,17 +378,22 @@ func (s *MemoryStore) UpsertMember(projectID, userID, role string) (domain.Proje
 	if _, ok := s.users[userID]; !ok {
 		return domain.ProjectMember{}, ErrNotFound
 	}
-	if !domain.IsProjectRole(role) {
-		return domain.ProjectMember{}, fmt.Errorf("invalid role")
-	}
 	if s.members[projectID] == nil {
 		s.members[projectID] = map[string]domain.ProjectMember{}
+	}
+	existing, exists := s.members[projectID][userID]
+	if exists && domain.RemovesLastOwner(existing.Role, role, ownerCount(s.members[projectID])) {
+		return domain.ProjectMember{}, ErrLastOwner
+	}
+	createdAt := time.Now().UTC()
+	if exists {
+		createdAt = existing.CreatedAt
 	}
 	member := domain.ProjectMember{
 		ProjectID: projectID,
 		UserID:    userID,
 		Role:      role,
-		CreatedAt: time.Now().UTC(),
+		CreatedAt: createdAt,
 	}
 	s.members[projectID][userID] = member
 	return member, nil
@@ -254,10 +402,18 @@ func (s *MemoryStore) UpsertMember(projectID, userID, role string) (domain.Proje
 func (s *MemoryStore) DeleteMember(projectID, userID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.members[projectID][userID]; !ok {
+	members, ok := s.members[projectID]
+	if !ok {
 		return ErrNotFound
 	}
-	delete(s.members[projectID], userID)
+	member, ok := members[userID]
+	if !ok {
+		return ErrNotFound
+	}
+	if domain.RemovesLastOwner(member.Role, "", ownerCount(members)) {
+		return ErrLastOwner
+	}
+	delete(members, userID)
 	return nil
 }
 
@@ -270,9 +426,8 @@ func (s *MemoryStore) ListMembers(projectID string) ([]domain.ProjectMember, err
 	}
 	result := make([]domain.ProjectMember, 0, len(members))
 	for _, member := range members {
-		u := s.users[member.UserID]
-		u.PasswordHash = ""
-		member.User = &u
+		user := publicStoreUser(s.users[member.UserID])
+		member.User = &user
 		result = append(result, member)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].User.Email < result[j].User.Email })
@@ -285,21 +440,24 @@ func (s *MemoryStore) CreateBoard(projectID, name, createdBy string) (domain.Boa
 	if _, ok := s.projects[projectID]; !ok {
 		return domain.Board{}, ErrNotFound
 	}
+	if _, ok := s.users[createdBy]; !ok {
+		return domain.Board{}, ErrNotFound
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "Untitled board"
+	}
 	now := time.Now().UTC()
 	board := domain.Board{
 		ID:        newID("brd"),
 		ProjectID: projectID,
-		Name:      strings.TrimSpace(name),
-		Version:   0,
+		Name:      name,
 		CreatedBy: createdBy,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	if board.Name == "" {
-		board.Name = "Untitled board"
-	}
 	s.boards[board.ID] = board
-	s.boardBlocks[board.ID] = map[string]domain.Block{}
+	s.boardDocuments[board.ID] = domain.BoardDocument{BoardID: board.ID, UpdatedAt: now}
 	return board, nil
 }
 
@@ -336,8 +494,8 @@ func (s *MemoryStore) UpdateBoard(id, name string) (domain.Board, error) {
 	if !ok {
 		return domain.Board{}, ErrNotFound
 	}
-	if strings.TrimSpace(name) != "" {
-		board.Name = strings.TrimSpace(name)
+	if name = strings.TrimSpace(name); name != "" {
+		board.Name = name
 	}
 	board.UpdatedAt = time.Now().UTC()
 	s.boards[id] = board
@@ -351,68 +509,143 @@ func (s *MemoryStore) DeleteBoard(id string) error {
 		return ErrNotFound
 	}
 	delete(s.boards, id)
-	delete(s.boardBlocks, id)
-	delete(s.operations, id)
+	delete(s.boardDocuments, id)
+	delete(s.boardUpdates, id)
 	return nil
 }
 
-func (s *MemoryStore) Snapshot(boardID string) (domain.BoardSnapshot, error) {
+func (s *MemoryStore) LoadBoardDocument(boardID string) (domain.BoardDocument, []domain.BoardUpdate, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	board, ok := s.boards[boardID]
+	if _, ok := s.boards[boardID]; !ok {
+		return domain.BoardDocument{}, nil, ErrNotFound
+	}
+	document, ok := s.boardDocuments[boardID]
 	if !ok {
-		return domain.BoardSnapshot{}, ErrNotFound
+		return domain.BoardDocument{}, nil, ErrNotFound
 	}
-	blocks := make([]domain.Block, 0, len(s.boardBlocks[boardID]))
-	for _, block := range s.boardBlocks[boardID] {
-		blocks = append(blocks, cloneBlock(block))
-	}
-	sort.Slice(blocks, func(i, j int) bool {
-		if blocks[i].Z == blocks[j].Z {
-			return blocks[i].ID < blocks[j].ID
+	document.Checkpoint = cloneBytes(document.Checkpoint)
+	updates := make([]domain.BoardUpdate, 0, len(s.boardUpdates[boardID]))
+	for _, update := range s.boardUpdates[boardID] {
+		if update.ServerSequence > document.CheckpointSequence {
+			update.Update = cloneBytes(update.Update)
+			updates = append(updates, update)
 		}
-		return blocks[i].Z < blocks[j].Z
-	})
-	return domain.BoardSnapshot{BoardID: boardID, Version: board.Version, Blocks: blocks, UpdatedAt: board.UpdatedAt}, nil
+	}
+	sort.Slice(updates, func(i, j int) bool { return updates[i].ServerSequence < updates[j].ServerSequence })
+	return document, updates, nil
 }
 
-func (s *MemoryStore) ApplyOperation(op domain.Operation) (domain.Operation, domain.BoardSnapshot, error) {
+func (s *MemoryStore) AppendBoardUpdate(update domain.BoardUpdate) (domain.BoardUpdate, bool, error) {
+	if update.BoardID == "" || update.UpdateID == "" || update.ClientID == "" || update.UserID == "" || len(update.Update) == 0 {
+		return domain.BoardUpdate{}, false, ErrInvalidInput
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	board, ok := s.boards[op.BoardID]
+	board, ok := s.boards[update.BoardID]
 	if !ok {
-		return domain.Operation{}, domain.BoardSnapshot{}, ErrNotFound
+		return domain.BoardUpdate{}, false, ErrNotFound
 	}
-	blocks := s.boardBlocks[op.BoardID]
-	if blocks == nil {
-		blocks = map[string]domain.Block{}
-		s.boardBlocks[op.BoardID] = blocks
+	if _, ok := s.users[update.UserID]; !ok {
+		return domain.BoardUpdate{}, false, ErrNotFound
 	}
-	board.Version++
-	board.UpdatedAt = time.Now().UTC()
-	op.Version = board.Version
-	op.CreatedAt = board.UpdatedAt
-	if op.ID == "" {
-		op.ID = newID("op")
+	update.UpdateHash = hashUpdate(update.Update)
+	for _, existing := range s.boardUpdates[update.BoardID] {
+		if existing.UpdateID == update.UpdateID {
+			if existing.UpdateHash != update.UpdateHash {
+				return domain.BoardUpdate{}, false, ErrUpdateIDConflict
+			}
+			existing.Update = cloneBytes(existing.Update)
+			return existing, false, nil
+		}
 	}
-	if err := applyBlockOperation(blocks, op); err != nil {
-		return domain.Operation{}, domain.BoardSnapshot{}, err
+	document, ok := s.boardDocuments[update.BoardID]
+	if !ok {
+		return domain.BoardUpdate{}, false, ErrNotFound
 	}
-	s.boards[op.BoardID] = board
-	s.operations[op.BoardID] = append(s.operations[op.BoardID], op)
-	snapshot := snapshotLocked(op.BoardID, board, blocks)
-	return op, snapshot, nil
+	sequence := document.CheckpointSequence
+	for _, existing := range s.boardUpdates[update.BoardID] {
+		if existing.ServerSequence > sequence {
+			sequence = existing.ServerSequence
+		}
+	}
+	update.ServerSequence = sequence + 1
+	update.Update = cloneBytes(update.Update)
+	update.CreatedAt = time.Now().UTC()
+	s.boardUpdates[update.BoardID] = append(s.boardUpdates[update.BoardID], update)
+	board.UpdatedAt = update.CreatedAt
+	s.boards[board.ID] = board
+	return update, true, nil
 }
 
-func (s *MemoryStore) SaveAsset(asset domain.Asset) domain.Asset {
+func (s *MemoryStore) SaveBoardCheckpoint(boardID string, checkpoint []byte, throughSequence int64) (domain.BoardDocument, error) {
+	if boardID == "" || throughSequence < 0 {
+		return domain.BoardDocument{}, ErrInvalidInput
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, ok := s.boards[boardID]; !ok {
+		return domain.BoardDocument{}, ErrNotFound
+	}
+	document, ok := s.boardDocuments[boardID]
+	if !ok {
+		return domain.BoardDocument{}, ErrNotFound
+	}
+	latest := document.CheckpointSequence
+	for _, update := range s.boardUpdates[boardID] {
+		if update.ServerSequence > latest {
+			latest = update.ServerSequence
+		}
+	}
+	if throughSequence < document.CheckpointSequence || throughSequence > latest {
+		return domain.BoardDocument{}, ErrInvalidCheckpointSequence
+	}
+	document.Checkpoint = cloneBytes(checkpoint)
+	document.CheckpointSequence = throughSequence
+	document.UpdatedAt = time.Now().UTC()
+	s.boardDocuments[boardID] = document
+	updates := s.boardUpdates[boardID]
+	for i := range updates {
+		if updates[i].ServerSequence <= throughSequence {
+			updates[i].Update = nil
+			compactedAt := document.UpdatedAt
+			updates[i].CompactedAt = &compactedAt
+		}
+	}
+	s.boardUpdates[boardID] = updates
+	document.Checkpoint = cloneBytes(document.Checkpoint)
+	return document, nil
+}
+
+func (s *MemoryStore) SaveAsset(asset domain.Asset) (domain.Asset, error) {
+	if asset.Size < 0 || asset.Width < 0 || asset.Height < 0 {
+		return domain.Asset{}, ErrInvalidInput
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.projects[asset.ProjectID]; !ok {
+		return domain.Asset{}, ErrNotFound
+	}
+	if _, ok := s.users[asset.UploadedBy]; !ok {
+		return domain.Asset{}, ErrNotFound
+	}
 	if asset.ID == "" {
 		asset.ID = newID("ast")
 	}
+	if asset.StorageKey == "" {
+		asset.StorageKey = asset.ID
+	}
+	if _, ok := s.assets[asset.ID]; ok {
+		return domain.Asset{}, ErrConflict
+	}
+	for _, existing := range s.assets {
+		if existing.StorageKey == asset.StorageKey {
+			return domain.Asset{}, ErrConflict
+		}
+	}
 	asset.CreatedAt = time.Now().UTC()
 	s.assets[asset.ID] = asset
-	return asset
+	return asset, nil
 }
 
 func (s *MemoryStore) GetAsset(id string) (domain.Asset, error) {
@@ -425,160 +658,60 @@ func (s *MemoryStore) GetAsset(id string) (domain.Asset, error) {
 	return asset, nil
 }
 
-func applyBlockOperation(blocks map[string]domain.Block, op domain.Operation) error {
-	block := blockFromPayload(op.Payload)
-	switch op.Type {
-	case "create_block":
-		if block.ID == "" {
-			block.ID = newID("blk")
-		}
-		if block.Type == "" {
-			block.Type = domain.BlockNote
-		}
-		if block.W == 0 {
-			block.W = 240
-		}
-		if block.H == 0 {
-			block.H = 160
-		}
-		blocks[block.ID] = cloneBlock(block)
-	case "update_block", "move_block", "resize_block", "reorder_block":
-		current, ok := blocks[block.ID]
-		if !ok {
-			return ErrNotFound
-		}
-		merged := mergeBlock(current, block, op.Type)
-		blocks[merged.ID] = merged
-	case "delete_block":
-		id, _ := op.Payload["id"].(string)
-		if id == "" {
-			id = block.ID
-		}
-		delete(blocks, id)
-	default:
-		return fmt.Errorf("unsupported operation %q", op.Type)
+func (s *MemoryStore) ListAssetsByProject(projectID string) ([]domain.Asset, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, ok := s.projects[projectID]; !ok {
+		return nil, ErrNotFound
 	}
+	assets := []domain.Asset{}
+	for _, asset := range s.assets {
+		if asset.ProjectID == projectID {
+			assets = append(assets, asset)
+		}
+	}
+	sort.Slice(assets, func(i, j int) bool { return assets[i].CreatedAt.Before(assets[j].CreatedAt) })
+	return assets, nil
+}
+
+func (s *MemoryStore) DeleteAsset(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.assets[id]; !ok {
+		return ErrNotFound
+	}
+	delete(s.assets, id)
 	return nil
 }
 
-func blockFromPayload(payload map[string]any) domain.Block {
-	if nested, ok := payload["block"].(map[string]any); ok {
-		payload = nested
-	}
-	return domain.Block{
-		ID:   stringField(payload, "id"),
-		Type: stringField(payload, "type"),
-		X:    floatField(payload, "x"),
-		Y:    floatField(payload, "y"),
-		W:    floatField(payload, "w"),
-		H:    floatField(payload, "h"),
-		Z:    int(floatField(payload, "z")),
-		Data: mapField(payload, "data"),
-	}
-}
-
-func mergeBlock(current, update domain.Block, opType string) domain.Block {
-	if update.Type != "" {
-		current.Type = update.Type
-	}
-	if opType == "move_block" || opType == "update_block" || opType == "create_block" {
-		current.X = update.X
-		current.Y = update.Y
-	}
-	if opType == "resize_block" || opType == "update_block" {
-		if update.W > 0 {
-			current.W = update.W
-		}
-		if update.H > 0 {
-			current.H = update.H
+func ownerCount(members map[string]domain.ProjectMember) int {
+	count := 0
+	for _, member := range members {
+		if member.Role == domain.RoleOwner {
+			count++
 		}
 	}
-	if opType == "reorder_block" || opType == "update_block" {
-		current.Z = update.Z
+	return count
+}
+
+func systemAdminCount(users map[string]domain.User) int {
+	count := 0
+	for _, user := range users {
+		if user.SystemRole == domain.SystemAdmin {
+			count++
+		}
 	}
-	if update.Data != nil {
-		current.Data = cloneMap(update.Data)
-	}
-	return current
+	return count
 }
 
-func snapshotLocked(boardID string, board domain.Board, blocks map[string]domain.Block) domain.BoardSnapshot {
-	out := make([]domain.Block, 0, len(blocks))
-	for _, block := range blocks {
-		out = append(out, cloneBlock(block))
-	}
-	return domain.BoardSnapshot{BoardID: boardID, Version: board.Version, Blocks: out, UpdatedAt: board.UpdatedAt}
+func publicStoreUser(user domain.User) domain.User {
+	user.PasswordHash = ""
+	return user
 }
 
-func stringField(m map[string]any, key string) string {
-	v, _ := m[key].(string)
-	return v
-}
-
-func floatField(m map[string]any, key string) float64 {
-	switch v := m[key].(type) {
-	case float64:
-		return v
-	case int:
-		return float64(v)
-	case int64:
-		return float64(v)
-	default:
-		return 0
-	}
-}
-
-func mapField(m map[string]any, key string) map[string]any {
-	v, _ := m[key].(map[string]any)
-	return cloneMap(v)
-}
-
-func cloneBlock(block domain.Block) domain.Block {
-	block.Data = cloneMap(block.Data)
-	return block
-}
-
-func cloneMap(in map[string]any) map[string]any {
-	if in == nil {
+func cloneBytes(value []byte) []byte {
+	if value == nil {
 		return nil
 	}
-	out := make(map[string]any, len(in))
-	for key, value := range in {
-		out[key] = value
-	}
-	return out
-}
-
-func HashPassword(password string) string {
-	salt := make([]byte, 16)
-	if _, err := rand.Read(salt); err != nil {
-		panic(err)
-	}
-	sum := sha256.Sum256(append(salt, []byte(password)...))
-	return base64.RawURLEncoding.EncodeToString(salt) + "." + hex.EncodeToString(sum[:])
-}
-
-func VerifyPassword(password, encoded string) bool {
-	parts := strings.Split(encoded, ".")
-	if len(parts) != 2 {
-		return false
-	}
-	salt, err := base64.RawURLEncoding.DecodeString(parts[0])
-	if err != nil {
-		return false
-	}
-	sum := sha256.Sum256(append(salt, []byte(password)...))
-	return hex.EncodeToString(sum[:]) == parts[1]
-}
-
-func normalizeEmail(email string) string {
-	return strings.ToLower(strings.TrimSpace(email))
-}
-
-func newID(prefix string) string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic(err)
-	}
-	return prefix + "_" + hex.EncodeToString(b[:])
+	return append([]byte(nil), value...)
 }
