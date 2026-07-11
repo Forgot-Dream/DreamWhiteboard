@@ -356,6 +356,14 @@ func writeResultStatus(w http.ResponseWriter, r *http.Request, status int, value
 		writeAPIError(w, r, http.StatusConflict, "last_owner_required", "a project must retain at least one owner", nil)
 	case errors.Is(err, store.ErrLastSystemAdmin):
 		writeAPIError(w, r, http.StatusConflict, "last_system_admin_required", "at least one system administrator is required", nil)
+	case errors.Is(err, store.ErrAssetReferenceIndexStale):
+		writeAPIError(w, r, http.StatusConflict, "asset_reference_index_stale", "asset references are not indexed through the latest board update", nil)
+	case errors.Is(err, store.ErrAssetReferenceConflict):
+		writeAPIError(w, r, http.StatusConflict, "asset_reference_conflict", "conflicting asset references were reported for the same board sequence", nil)
+	case errors.Is(err, store.ErrAssetInUse):
+		writeAPIError(w, r, http.StatusConflict, "asset_in_use", "asset is referenced by a board", nil)
+	case errors.Is(err, store.ErrInvalidAssetReference):
+		writeAPIError(w, r, http.StatusUnprocessableEntity, "invalid_asset_reference", "asset references must exist in the board project", nil)
 	case errors.Is(err, store.ErrInvalidInput):
 		writeAPIError(w, r, http.StatusUnprocessableEntity, "validation_failed", "request validation failed", nil)
 	default:

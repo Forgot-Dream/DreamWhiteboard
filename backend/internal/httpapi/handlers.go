@@ -127,16 +127,11 @@ func (s *Server) handleProject(w http.ResponseWriter, r *http.Request, user doma
 		if !s.requirePermission(w, r, allowed, permissionErr, "project_admin_required", "project administrator access required") {
 			return
 		}
-		assets, err := s.repo.ListAssetsByProject(projectID)
-		if err != nil && !isNotFound(err) {
-			writeResult(w, r, nil, err)
-			return
-		}
 		if err := s.repo.DeleteProject(projectID); err != nil {
 			writeResult(w, r, nil, err)
 			return
 		}
-		s.cleanupProjectFiles(projectID, assets, r)
+		s.cleanupProjectFiles(projectID, r)
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	default:
 		methodNotAllowed(w, r, http.MethodGet, http.MethodPatch, http.MethodDelete)
@@ -307,6 +302,10 @@ func (s *Server) handleBoardSubroutes(w http.ResponseWriter, r *http.Request, us
 		return
 	}
 	if len(parts) == 2 {
+		if parts[1] == "asset-references" {
+			s.handleBoardAssetReferences(w, r, user, board)
+			return
+		}
 		if parts[1] != "ws" {
 			writeAPIError(w, r, http.StatusNotFound, "not_found", "resource not found", nil)
 			return
@@ -379,6 +378,30 @@ func (s *Server) handleBoardSubroutes(w http.ResponseWriter, r *http.Request, us
 	default:
 		methodNotAllowed(w, r, http.MethodGet, http.MethodPatch, http.MethodDelete)
 	}
+}
+
+func (s *Server) handleBoardAssetReferences(w http.ResponseWriter, r *http.Request, user domain.User, board domain.Board) {
+	if r.Method != http.MethodPut {
+		methodNotAllowed(w, r, http.MethodPut)
+		return
+	}
+	allowed, permissionErr := s.canManageProject(user, board.ProjectID)
+	if !s.requirePermission(w, r, allowed, permissionErr, "project_admin_required", "project administrator access required") {
+		return
+	}
+	var req struct {
+		ThroughSequence int64    `json:"through_sequence"`
+		AssetIDs        []string `json:"asset_ids"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.ThroughSequence < 0 || req.AssetIDs == nil {
+		writeAPIError(w, r, http.StatusUnprocessableEntity, "validation_failed", "through_sequence and asset_ids are required", nil)
+		return
+	}
+	state, err := s.repo.SaveBoardAssetReferences(board.ID, user.ID, req.ThroughSequence, req.AssetIDs)
+	writeResult(w, r, state, err)
 }
 
 func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request, _ domain.User) {

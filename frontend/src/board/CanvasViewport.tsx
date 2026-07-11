@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type WheelEvent as ReactWheelEvent } from 'react';
+import { memo, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type WheelEvent as ReactWheelEvent } from 'react';
 import type { BoardRuntime } from './runtime';
 import { imageSource, intersects, type ImageBlock, type Rect, type WhiteboardBlock } from './schema';
 import { useBoardStore, type RemotePresence, type Viewport } from './store';
@@ -80,7 +80,7 @@ export function CanvasViewport({ runtime }: { runtime: BoardRuntime }) {
     if (!runtime.canEdit || event.button !== 0) return;
     const ids = useBoardStore.getState().selection.ids;
     if (!ids.includes(block.id)) return;
-    interaction.current = { kind: 'move', ids, last: toWorld(localPoint(event), viewport) };
+    interaction.current = { kind: 'move', ids, last: toWorld(localPoint(event), useBoardStore.getState().viewport) };
     store.setInteraction('move', true);
     event.currentTarget.setPointerCapture(event.pointerId);
   }
@@ -88,7 +88,7 @@ export function CanvasViewport({ runtime }: { runtime: BoardRuntime }) {
   function pointerDownResize(event: ReactPointerEvent<HTMLButtonElement>, block: WhiteboardBlock, handle: ResizeHandle) {
     event.stopPropagation();
     if (!runtime.canEdit) return;
-    interaction.current = { kind: 'resize', block, handle, start: toWorld(localPoint(event), viewport) };
+    interaction.current = { kind: 'resize', block, handle, start: toWorld(localPoint(event), useBoardStore.getState().viewport) };
     useBoardStore.getState().setInteraction('resize', true);
     event.currentTarget.setPointerCapture(event.pointerId);
   }
@@ -199,7 +199,7 @@ export function CanvasViewport({ runtime }: { runtime: BoardRuntime }) {
   }
 }
 
-function BlockView({ block, selected, onlySelection, readOnly, remotes, onPointerDown, onResize, onSelect, onText, onEmptyBlur }: {
+const BlockView = memo(function BlockView({ block, selected, onlySelection, readOnly, remotes, onPointerDown, onResize, onSelect, onText, onEmptyBlur }: {
   block: WhiteboardBlock;
   selected: boolean;
   onlySelection: boolean;
@@ -239,7 +239,14 @@ function BlockView({ block, selected, onlySelection, readOnly, remotes, onPointe
       ) : <img src={imageSource(block as ImageBlock)} alt={block.alt} draggable={false} />}
     </article>
   );
-}
+}, (previous, next) => (
+  previous.block === next.block &&
+  previous.selected === next.selected &&
+  previous.onlySelection === next.onlySelection &&
+  previous.readOnly === next.readOnly &&
+  previous.remotes.length === next.remotes.length &&
+  previous.remotes.every((remote, index) => remote === next.remotes[index])
+));
 
 function ResizeHandles({ onResize }: { onResize: (event: ReactPointerEvent<HTMLButtonElement>, handle: ResizeHandle) => void }) {
   const handles: ResizeHandle[] = ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw'];

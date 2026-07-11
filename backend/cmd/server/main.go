@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"dreamwhiteboard/backend/internal/httpapi"
+	"dreamwhiteboard/backend/internal/storagecleanup"
 	"dreamwhiteboard/backend/internal/store"
 )
 
@@ -86,6 +87,19 @@ func main() {
 	cfg.TrustProxy = boolEnv(logger, "TRUST_PROXY_HEADERS", false)
 	cfg.Logger = logger
 	api := httpapi.NewServerWithConfig(repo, cfg)
+	cleanupConfig := storagecleanup.DefaultConfig(uploadDir)
+	cleanupConfig.Logger = logger
+	cleanupWorker, err := storagecleanup.New(repo, cleanupConfig)
+	if err != nil {
+		logger.Error("configure storage cleanup worker", "error", err)
+		os.Exit(1)
+	}
+	cleanupCtx, stopCleanup := context.WithCancel(context.Background())
+	cleanupDone := make(chan struct{})
+	go func() {
+		cleanupWorker.Run(cleanupCtx)
+		close(cleanupDone)
+	}()
 
 	server := &http.Server{
 		Addr:              env("HTTP_ADDR", ":8080"),
@@ -126,6 +140,13 @@ func main() {
 	}
 	if err := api.Close(); err != nil {
 		logger.Error("close realtime connections", "error", err)
+		exitCode = 1
+	}
+	stopCleanup()
+	select {
+	case <-cleanupDone:
+	case <-shutdownCtx.Done():
+		logger.Error("storage cleanup worker did not stop before shutdown deadline")
 		exitCode = 1
 	}
 	if err := repo.Close(); err != nil {

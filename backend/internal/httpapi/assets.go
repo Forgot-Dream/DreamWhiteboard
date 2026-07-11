@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"dreamwhiteboard/backend/internal/domain"
+	"dreamwhiteboard/backend/internal/filestore"
 )
 
 var allowedImageTypes = map[string]string{
@@ -63,7 +64,7 @@ func (s *Server) handleAssetUpload(w http.ResponseWriter, r *http.Request, user 
 		writeAPIError(w, r, http.StatusUnprocessableEntity, "validation_failed", "file name is invalid", map[string]string{"file": "file name must contain between 1 and 255 characters"})
 		return
 	}
-	projectDir, err := safeJoin(s.uploadDir, projectID)
+	projectDir, err := filestore.ProjectPath(s.uploadDir, projectID)
 	if err != nil {
 		writeAPIError(w, r, http.StatusBadRequest, "invalid_project_id", "project identifier is invalid", nil)
 		return
@@ -174,6 +175,8 @@ func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request, user domain
 			if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 				s.logger.Error("remove asset file", "request_id", requestID(r.Context()), "asset_id", asset.ID, "error", removeErr)
 			}
+		} else {
+			s.logger.Error("resolve asset path for removal", "request_id", requestID(r.Context()), "asset_id", asset.ID, "error", pathErr)
 		}
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	default:
@@ -242,33 +245,22 @@ func inspectImage(path string, maxPixels int64) (string, int, int, error) {
 
 func (s *Server) assetPath(asset domain.Asset) (string, error) {
 	if asset.StorageKey != "" {
-		projectDir, err := safeJoin(s.uploadDir, asset.ProjectID)
-		if err != nil {
-			return "", err
-		}
-		return safeJoin(projectDir, asset.StorageKey)
+		return filestore.AssetPath(s.uploadDir, asset.ProjectID, asset.StorageKey)
 	}
 	if asset.Path == "" {
 		return "", errors.New("asset has no storage path")
 	}
-	return ensureWithin(s.uploadDir, asset.Path)
+	return filestore.EnsureWithin(s.uploadDir, asset.Path)
 }
 
-func (s *Server) cleanupProjectFiles(projectID string, assets []domain.Asset, r *http.Request) {
-	for _, asset := range assets {
-		path, err := s.assetPath(asset)
-		if err != nil {
-			continue
-		}
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			s.logger.Error("remove project asset", "request_id", requestID(r.Context()), "asset_id", asset.ID, "error", err)
-		}
+func (s *Server) cleanupProjectFiles(projectID string, r *http.Request) {
+	projectDir, err := filestore.ProjectPath(s.uploadDir, projectID)
+	if err != nil {
+		s.logger.Error("resolve project upload directory for removal", "request_id", requestID(r.Context()), "project_id", projectID, "error", err)
+		return
 	}
-	projectDir, err := safeJoin(s.uploadDir, projectID)
-	if err == nil {
-		if err := os.RemoveAll(projectDir); err != nil {
-			s.logger.Error("remove project upload directory", "request_id", requestID(r.Context()), "project_id", projectID, "error", err)
-		}
+	if err := os.RemoveAll(projectDir); err != nil {
+		s.logger.Error("remove project upload directory", "request_id", requestID(r.Context()), "project_id", projectID, "error", err)
 	}
 }
 
@@ -282,27 +274,4 @@ func safeFileName(name string) string {
 		return r
 	}, name))
 	return name
-}
-
-func safeJoin(root, segment string) (string, error) {
-	if segment == "" || segment == "." || segment == ".." || filepath.Base(segment) != segment || strings.ContainsAny(segment, `/\\`) {
-		return "", errors.New("unsafe storage path")
-	}
-	return ensureWithin(root, filepath.Join(root, segment))
-}
-
-func ensureWithin(root, path string) (string, error) {
-	rootAbs, err := filepath.Abs(root)
-	if err != nil {
-		return "", err
-	}
-	pathAbs, err := filepath.Abs(path)
-	if err != nil {
-		return "", err
-	}
-	relative, err := filepath.Rel(rootAbs, pathAbs)
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return "", errors.New("storage path escapes upload directory")
-	}
-	return pathAbs, nil
 }

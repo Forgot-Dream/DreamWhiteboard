@@ -283,6 +283,19 @@ func TestUploadValidationMetadataAndProjectCleanup(t *testing.T) {
 	if rec.Header().Get("Content-Type") != "image/png" || !bytes.Equal(rec.Body.Bytes(), imageBytes.Bytes()) {
 		t.Fatal("served asset differs from uploaded image")
 	}
+	deletedAsset := uploadFile(t, handler, cookie, "/api/projects/"+project.ID+"/assets", "delete-me.png", imageBytes.Bytes(), http.StatusCreated)
+	deletedMetadata, err := repo.GetAsset(deletedAsset.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec = requestJSON(t, handler, http.MethodDelete, "/api/assets/"+deletedAsset.ID, cookie, nil)
+	assertStatus(t, rec, http.StatusOK)
+	if _, err := repo.GetAsset(deletedAsset.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("deleted asset metadata remains: %v", err)
+	}
+	if _, err := os.Stat(deletedMetadata.Path); !os.IsNotExist(err) {
+		t.Fatalf("asset delete fast path did not remove file: %v", err)
+	}
 
 	uploadFile(t, handler, cookie, "/api/projects/"+project.ID+"/assets", "fake.png", []byte("not an image"), http.StatusUnsupportedMediaType)
 	rec = requestJSON(t, handler, http.MethodDelete, "/api/projects/"+project.ID, cookie, nil)

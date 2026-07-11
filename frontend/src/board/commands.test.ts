@@ -38,12 +38,13 @@ describe('BoardCommands', () => {
 
     const editor = new BoardCommands(doc, () => true);
     const id = editor.createImage({ x: 1, y: 2, assetId: 'ast_1', alt: 'photo', naturalWidth: 800, naturalHeight: 600, width: 400, height: 300 });
-    const serialized = exportBlocks(readBlocks(doc));
-    const pasted = editor.paste(importBlocks(serialized));
+    const serialized = exportBlocks(readBlocks(doc), 'project-1');
+    const pasted = editor.paste(importBlocks(serialized, 'project-1'));
     const blocks = readBlocks(doc);
     expect(pasted).toHaveLength(1);
     expect(pasted[0]).not.toBe(id);
     expect(blocks.every((block) => block.type !== 'image' || block.assetId === 'ast_1')).toBe(true);
+    expect(importBlocks(serialized, 'project-2')).toHaveLength(0);
   });
 
   it('aligns and distributes a multi-selection in one command layer', () => {

@@ -316,6 +316,135 @@ func TestBoardWebSocketRejectsUpdateIDReuseWithDifferentData(t *testing.T) {
 	}
 }
 
+func TestBoardWebSocketAdvertisesAssetReferenceProtocolV3(t *testing.T) {
+	fixture := newWSFixture(t)
+	connection := fixture.dial(fixture.editor)
+	start := readRealtimeMessage(t, connection)
+	if start.Type != realtime.MessageSyncStart || start.Protocol != 3 {
+		t.Fatalf("unexpected sync start protocol: %#v", start)
+	}
+	if complete := readRealtimeMessage(t, connection); complete.Type != realtime.MessageSyncComplete {
+		t.Fatalf("unexpected sync completion: %#v", complete)
+	}
+}
+
+func TestBoardWebSocketPersistsAssetReferenceManifest(t *testing.T) {
+	fixture := newWSFixture(t)
+	asset := saveWSAsset(t, fixture, fixture.project, "manifest")
+	connection, _ := fixture.connect(fixture.editor)
+	if err := connection.WriteJSON(map[string]any{
+		"type":                    realtime.MessageUpdate,
+		"update_id":               "manifest-update",
+		"data":                    []byte{1, 2, 3},
+		"reference_base_sequence": int64(0),
+		"asset_ids":               []string{asset.ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ack := readRealtimeMessage(t, connection); ack.Type != realtime.MessageUpdateAck || ack.UpdateID != "manifest-update" {
+		t.Fatalf("unexpected update ack: %#v", ack)
+	}
+
+	_, updates, err := fixture.repo.LoadBoardDocument(fixture.board.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) != 1 || updates[0].ReferenceBaseSequence == nil || *updates[0].ReferenceBaseSequence != 0 || len(updates[0].AssetIDs) != 1 || updates[0].AssetIDs[0] != asset.ID {
+		t.Fatalf("asset reference manifest was not persisted: %#v", updates)
+	}
+}
+
+func TestBoardWebSocketRejectsCrossProjectAssetReference(t *testing.T) {
+	fixture := newWSFixture(t)
+	otherProject, err := fixture.repo.CreateProject("Other realtime project", "", fixture.editor.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignAsset := saveWSAsset(t, fixture, otherProject, "foreign")
+	connection, _ := fixture.connect(fixture.editor)
+	if err := connection.WriteJSON(map[string]any{
+		"type":                    realtime.MessageUpdate,
+		"update_id":               "foreign-asset-update",
+		"data":                    []byte{1},
+		"reference_base_sequence": int64(0),
+		"asset_ids":               []string{foreignAsset.ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	message := readRealtimeMessage(t, connection)
+	if message.Type != realtime.MessageError || message.Code != "invalid_asset_reference" || message.UpdateID != "foreign-asset-update" {
+		t.Fatalf("unexpected invalid asset response: %#v", message)
+	}
+	_, updates, err := fixture.repo.LoadBoardDocument(fixture.board.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) != 0 {
+		t.Fatalf("invalid asset update was persisted: %#v", updates)
+	}
+}
+
+func TestBoardWebSocketRejectsUpdateIDReuseWithDifferentAssetManifest(t *testing.T) {
+	fixture := newWSFixture(t)
+	first := saveWSAsset(t, fixture, fixture.project, "manifest-first")
+	second := saveWSAsset(t, fixture, fixture.project, "manifest-second")
+	connection, _ := fixture.connect(fixture.editor)
+	update := map[string]any{
+		"type":                    realtime.MessageUpdate,
+		"update_id":               "same-manifest-id",
+		"data":                    []byte{7, 8, 9},
+		"reference_base_sequence": int64(0),
+		"asset_ids":               []string{first.ID},
+	}
+	if err := connection.WriteJSON(update); err != nil {
+		t.Fatal(err)
+	}
+	if ack := readRealtimeMessage(t, connection); ack.Type != realtime.MessageUpdateAck {
+		t.Fatalf("unexpected update ack: %#v", ack)
+	}
+
+	update["asset_ids"] = []string{second.ID}
+	if err := connection.WriteJSON(update); err != nil {
+		t.Fatal(err)
+	}
+	conflict := readRealtimeMessage(t, connection)
+	if conflict.Type != realtime.MessageError || conflict.Code != "update_id_conflict" || conflict.UpdateID != "same-manifest-id" {
+		t.Fatalf("unexpected manifest conflict: %#v", conflict)
+	}
+}
+
+func TestLegacyWebSocketUpdateMakesAssetDeletionStale(t *testing.T) {
+	fixture := newWSFixture(t)
+	asset := saveWSAsset(t, fixture, fixture.project, "legacy-stale")
+	connection, token := fixture.dialWithToken(fixture.editor)
+	if start := readRealtimeMessage(t, connection); start.Type != realtime.MessageSyncStart {
+		t.Fatalf("unexpected sync start: %#v", start)
+	}
+	if complete := readRealtimeMessage(t, connection); complete.Type != realtime.MessageSyncComplete {
+		t.Fatalf("unexpected sync completion: %#v", complete)
+	}
+
+	// Omitting both reference fields models a protocol-v2 client. Its update is
+	// accepted for compatibility, but the server can no longer prove that the
+	// current document does not reference an asset.
+	if err := connection.WriteJSON(wsClientMessage{
+		Type: realtime.MessageUpdate, UpdateID: "legacy-without-manifest", Data: []byte{4, 5, 6},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ack := readRealtimeMessage(t, connection); ack.Type != realtime.MessageUpdateAck {
+		t.Fatalf("unexpected legacy update ack: %#v", ack)
+	}
+
+	cookie := &http.Cookie{Name: sessionCookieName, Value: token, Path: "/api"}
+	rec := requestJSON(t, fixture.server, http.MethodDelete, "/api/assets/"+asset.ID, cookie, nil)
+	assertStatus(t, rec, http.StatusConflict)
+	assertErrorCode(t, rec, "asset_reference_index_stale")
+	if _, err := fixture.repo.GetAsset(asset.ID); err != nil {
+		t.Fatalf("stale reference index allowed asset deletion: %v", err)
+	}
+}
+
 func TestBoardWebSocketBroadcastsAwarenessRemovalOnDisconnect(t *testing.T) {
 	fixture := newWSFixture(t)
 	leaving, leavingStart := fixture.connect(fixture.editor)
@@ -412,4 +541,24 @@ func assertWebSocketClosed(t *testing.T, connection *websocket.Conn, timeout tim
 	if _, _, err := connection.ReadMessage(); err == nil {
 		t.Fatal("websocket remained open after authorization was revoked")
 	}
+}
+
+func saveWSAsset(t *testing.T, fixture *wsFixture, project domain.Project, suffix string) domain.Asset {
+	t.Helper()
+	asset, err := fixture.repo.SaveAsset(domain.Asset{
+		ID:          "ast_" + suffix,
+		ProjectID:   project.ID,
+		UploadedBy:  fixture.editor.ID,
+		FileName:    suffix + ".png",
+		ContentType: "image/png",
+		Size:        1,
+		StorageKey:  suffix + ".png",
+		SHA256:      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Width:       1,
+		Height:      1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return asset
 }

@@ -27,6 +27,12 @@ export function useBoardKeyboard(runtime: BoardRuntime) {
       if (modifier && event.key.toLowerCase() === 'y') {
         event.preventDefault(); runtime.commands.redo(); return;
       }
+      if (!modifier && !editing && event.key.toLowerCase() === 'v') {
+        state.setTool('select'); return;
+      }
+      if (!modifier && !editing && runtime.canEdit && event.key.toLowerCase() === 't') {
+        state.setTool('text'); return;
+      }
       if (editing || !runtime.canEdit) return;
       if ((event.key === 'Delete' || event.key === 'Backspace') && selected.length) {
         event.preventDefault(); runtime.commands.delete(selected); state.setSelection([]); return;
@@ -48,7 +54,7 @@ export function useBoardKeyboard(runtime: BoardRuntime) {
       if (modifier && event.key.toLowerCase() === 'v') {
         event.preventDefault();
         const text = await navigator.clipboard?.readText().catch(() => fallbackClipboard) ?? fallbackClipboard;
-        state.setSelection(runtime.commands.paste(importBlocks(text))); return;
+        state.setSelection(runtime.commands.paste(importBlocks(text, runtime.projectID))); return;
       }
       if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key) && selected.length) {
         event.preventDefault();
@@ -60,7 +66,7 @@ export function useBoardKeyboard(runtime: BoardRuntime) {
 
     async function copy(ids: string[]) {
       const blocks = useBoardStore.getState().document.blocks.filter((block) => ids.includes(block.id));
-      fallbackClipboard = exportBlocks(blocks);
+      fallbackClipboard = exportBlocks(blocks, runtime.projectID);
       await navigator.clipboard?.writeText(fallbackClipboard).catch(() => undefined);
     }
 

@@ -67,15 +67,27 @@ type BoardDocument struct {
 }
 
 type BoardUpdate struct {
-	BoardID        string     `json:"board_id"`
-	ServerSequence int64      `json:"server_sequence"`
-	UpdateID       string     `json:"update_id"`
-	ClientID       string     `json:"client_id"`
-	UserID         string     `json:"user_id"`
-	Update         []byte     `json:"update"`
-	UpdateHash     string     `json:"-"`
-	CompactedAt    *time.Time `json:"-"`
-	CreatedAt      time.Time  `json:"created_at"`
+	BoardID               string     `json:"board_id"`
+	ServerSequence        int64      `json:"server_sequence"`
+	UpdateID              string     `json:"update_id"`
+	ClientID              string     `json:"client_id"`
+	UserID                string     `json:"user_id"`
+	Update                []byte     `json:"update"`
+	ReferenceBaseSequence *int64     `json:"reference_base_sequence,omitempty"`
+	AssetIDs              []string   `json:"asset_ids,omitempty"`
+	AssetManifestTrusted  bool       `json:"-"`
+	UpdateHash            string     `json:"-"`
+	CompactedAt           *time.Time `json:"-"`
+	CreatedAt             time.Time  `json:"created_at"`
+}
+
+type BoardAssetReferenceState struct {
+	BoardID                string     `json:"board_id"`
+	IndexedThroughSequence int64      `json:"indexed_through_sequence"`
+	RefsHash               string     `json:"refs_hash"`
+	IndexedBy              string     `json:"indexed_by,omitempty"`
+	IndexedAt              *time.Time `json:"indexed_at,omitempty"`
+	Conflicted             bool       `json:"conflicted"`
 }
 
 type Asset struct {

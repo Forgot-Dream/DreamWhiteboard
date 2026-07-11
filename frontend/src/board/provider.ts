@@ -1,6 +1,7 @@
 import * as Y from 'yjs';
 import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate, removeAwarenessStates } from 'y-protocols/awareness';
-import { api, wsURL } from '../lib/api';
+import { APIError, api, wsURL } from '../lib/api';
+import { referencedAssetIDs } from './schema';
 import type { ConnectionState, RemotePresence, Viewport } from './store';
 
 interface WireMessage {
@@ -25,6 +26,14 @@ interface ProviderCallbacks {
   onPending: (count: number) => void;
   onError: (message: string) => void;
   onPresence: (presence: Record<number, RemotePresence>) => void;
+  onPermission: (canEdit: boolean) => void;
+  onResetRequired: () => void;
+}
+
+interface PendingUpdate {
+  data: Uint8Array;
+  referenceBaseSequence: number;
+  assetIDs: string[];
 }
 
 export class BoardProvider {
@@ -35,7 +44,13 @@ export class BoardProvider {
   private synced = false;
   private reconnectAttempt = 0;
   private reconnectTimer = 0;
-  private pending = new Map<string, Uint8Array>();
+  private referenceTimer = 0;
+  private referencesInFlight = false;
+  private referenceRetryAttempt = 0;
+  private sequenceFrontier = 0;
+  private latestKnownSequence = 0;
+  private seenSequences = new Set<number>();
+  private pending = new Map<string, PendingUpdate>();
   private remoteAwarenessIDs = new Map<string, Set<number>>();
   private authoritativeCanEdit: boolean;
 
@@ -43,6 +58,7 @@ export class BoardProvider {
     private readonly boardID: string,
     private readonly doc: Y.Doc,
     canEdit: boolean,
+    private canPublishAssetReferences: boolean,
     private readonly callbacks: ProviderCallbacks
   ) {
     this.authoritativeCanEdit = canEdit;
@@ -60,6 +76,7 @@ export class BoardProvider {
   stop() {
     this.stopped = true;
     window.clearTimeout(this.reconnectTimer);
+    window.clearTimeout(this.referenceTimer);
     this.awareness.setLocalState(null);
     this.socket?.close(1000, 'page closed');
     this.socket = null;
@@ -104,30 +121,63 @@ export class BoardProvider {
     try { message = JSON.parse(raw) as WireMessage; } catch { return; }
     switch (message.type) {
       case 'sync_start':
-        this.authoritativeCanEdit = message.can_edit === true;
+        this.setAuthoritativePermission(message.can_edit === true);
+        if (!this.authoritativeCanEdit && this.pending.size > 0) {
+          this.discardPendingAndReset();
+          return;
+        }
         this.callbacks.onConnection('syncing', message.server_sequence);
         break;
       case 'checkpoint':
       case 'update':
-        if (message.data) Y.applyUpdate(this.doc, fromBase64(message.data), this);
-        if (message.type === 'update' && message.server_sequence !== undefined) this.callbacks.onConnection(this.synced ? 'live' : 'syncing', message.server_sequence);
+        const applyError = message.data ? this.applyServerUpdate(message.data) : undefined;
+        if (applyError && message.type === 'checkpoint') {
+          this.callbacks.onError(`Stored board checkpoint is invalid: ${applyError}`);
+          this.stopped = true;
+          this.callbacks.onConnection('offline');
+          this.socket?.close(1003, 'invalid checkpoint');
+          return;
+        }
+        if (message.server_sequence !== undefined) {
+          if (message.type === 'checkpoint') this.applyCheckpointSequence(message.server_sequence);
+          else this.observeSequence(message.server_sequence);
+        }
+        if (message.type === 'update' && message.server_sequence !== undefined) {
+          this.callbacks.onConnection(this.synced ? 'live' : 'syncing', message.server_sequence);
+          this.scheduleReferenceSync();
+        }
+        if (applyError) this.callbacks.onError(`Ignored invalid document update at sequence ${message.server_sequence ?? 'unknown'}: ${applyError}`);
         break;
       case 'sync_complete':
+        if (message.server_sequence !== undefined && message.server_sequence < this.sequenceFrontier) {
+          this.callbacks.onError('The server document was restored to an earlier sequence; reloading authoritative state');
+          this.discardPendingAndReset();
+          return;
+        }
+        if (message.server_sequence !== undefined) this.latestKnownSequence = Math.max(this.latestKnownSequence, message.server_sequence);
+        if (message.server_sequence !== undefined && this.sequenceFrontier < message.server_sequence) {
+          this.callbacks.onError('Collaboration sync ended before all ordered updates were applied');
+          this.socket?.close(1011, 'incomplete ordered sync');
+          return;
+        }
         this.synced = true;
         this.callbacks.onConnection('live', message.server_sequence);
         this.sendPending();
         this.sendLocalAwareness();
+        this.scheduleReferenceSync();
         break;
       case 'update_ack':
         if (message.update_id) this.pending.delete(message.update_id);
+        if (message.server_sequence !== undefined) this.observeSequence(message.server_sequence);
         this.callbacks.onPending(this.pending.size);
         if (message.server_sequence !== undefined) this.callbacks.onConnection('live', message.server_sequence);
+        this.scheduleReferenceSync();
         break;
       case 'awareness':
         this.receiveAwareness(message);
         break;
       case 'checkpoint_request':
-        if (this.authoritativeCanEdit && message.request_id && message.through_sequence !== undefined) {
+        if (this.authoritativeCanEdit && this.canPublishAssetReferences && message.request_id && message.through_sequence !== undefined) {
           this.send({
             type: 'checkpoint', request_id: message.request_id, through_sequence: message.through_sequence,
             data: toBase64(Y.encodeStateAsUpdate(this.doc))
@@ -136,9 +186,13 @@ export class BoardProvider {
         break;
       case 'error':
         this.callbacks.onError(message.message ?? message.code ?? 'Collaboration error');
-        if (message.update_id && (message.code === 'forbidden' || message.code === 'invalid_update')) {
-          this.pending.delete(message.update_id);
-          this.callbacks.onPending(this.pending.size);
+        if (message.code === 'forbidden') {
+          this.setAuthoritativePermission(false);
+          this.discardPendingAndReset();
+          return;
+        }
+        if (message.update_id && ['invalid_update', 'invalid_asset_reference', 'update_id_conflict'].includes(message.code ?? '')) {
+          this.discardPendingAndReset();
         }
         break;
     }
@@ -164,9 +218,14 @@ export class BoardProvider {
   private handleDocumentUpdate = (update: Uint8Array, origin: unknown) => {
     if (origin === this || !this.authoritativeCanEdit) return;
     const updateID = `upd_${crypto.randomUUID()}`;
-    this.pending.set(updateID, update.slice());
+    const pending: PendingUpdate = {
+      data: update.slice(),
+      referenceBaseSequence: this.sequenceFrontier,
+      assetIDs: referencedAssetIDs(this.doc)
+    };
+    this.pending.set(updateID, pending);
     this.callbacks.onPending(this.pending.size);
-    if (this.synced) this.sendUpdate(updateID, update);
+    if (this.synced) this.sendUpdate(updateID, pending);
   };
 
   private handleAwarenessUpdate = ({ added, updated, removed }: { added: number[]; updated: number[]; removed: number[] }, origin: unknown) => {
@@ -198,13 +257,109 @@ export class BoardProvider {
     for (const [id, update] of this.pending) this.sendUpdate(id, update);
   }
 
-  private sendUpdate(id: string, update: Uint8Array) {
-    this.send({ type: 'update', update_id: id, data: toBase64(update) });
+  private sendUpdate(id: string, update: PendingUpdate) {
+    this.send({
+      type: 'update',
+      update_id: id,
+      data: toBase64(update.data),
+      reference_base_sequence: update.referenceBaseSequence,
+      asset_ids: update.assetIDs
+    });
   }
 
   private sendLocalAwareness() {
     if (this.awareness.getLocalState()) {
       this.send({ type: 'awareness', data: toBase64(encodeAwarenessUpdate(this.awareness, [this.awareness.clientID])) });
+    }
+  }
+
+  private setAuthoritativePermission(canEdit: boolean) {
+    if (this.authoritativeCanEdit === canEdit) return;
+    this.authoritativeCanEdit = canEdit;
+    this.callbacks.onPermission(canEdit);
+  }
+
+  private discardPendingAndReset() {
+    this.pending.clear();
+    this.callbacks.onPending(0);
+    this.socket?.close(1000, 'permission changed');
+    this.callbacks.onResetRequired();
+  }
+
+  private applyCheckpointSequence(sequence: number) {
+    if (!Number.isSafeInteger(sequence) || sequence < 0) return;
+    this.sequenceFrontier = Math.max(this.sequenceFrontier, sequence);
+    this.latestKnownSequence = Math.max(this.latestKnownSequence, sequence);
+    for (const seen of this.seenSequences) if (seen <= this.sequenceFrontier) this.seenSequences.delete(seen);
+    this.advanceContiguousFrontier();
+  }
+
+  private observeSequence(sequence: number) {
+    if (!Number.isSafeInteger(sequence) || sequence <= 0) return;
+    this.latestKnownSequence = Math.max(this.latestKnownSequence, sequence);
+    if (sequence > this.sequenceFrontier) this.seenSequences.add(sequence);
+    this.advanceContiguousFrontier();
+  }
+
+  private advanceContiguousFrontier() {
+    while (this.seenSequences.delete(this.sequenceFrontier + 1)) this.sequenceFrontier += 1;
+  }
+
+  private scheduleReferenceSync(delay = 50) {
+    if (
+      this.stopped || !this.synced || !this.authoritativeCanEdit || !this.canPublishAssetReferences || this.pending.size > 0 ||
+      this.sequenceFrontier !== this.latestKnownSequence
+    ) return;
+    window.clearTimeout(this.referenceTimer);
+    this.referenceTimer = window.setTimeout(() => void this.syncReferences(), delay);
+  }
+
+  private async syncReferences() {
+    if (
+      this.referencesInFlight || this.stopped || !this.synced || !this.authoritativeCanEdit || !this.canPublishAssetReferences || this.pending.size > 0 ||
+      this.sequenceFrontier !== this.latestKnownSequence
+    ) return;
+    this.referencesInFlight = true;
+    const sequence = this.sequenceFrontier;
+    const assetIDs = referencedAssetIDs(this.doc);
+    try {
+      await api(`/api/boards/${encodeURIComponent(this.boardID)}/asset-references`, {
+        method: 'PUT',
+        body: JSON.stringify({ through_sequence: sequence, asset_ids: assetIDs })
+      });
+      this.referenceRetryAttempt = 0;
+      this.callbacks.onError('');
+    } catch (error) {
+      if (!this.stopped) {
+        if (error instanceof APIError && error.status === 403) {
+          this.canPublishAssetReferences = false;
+        } else if (error instanceof APIError && error.code === 'asset_reference_index_stale') {
+          this.scheduleReferenceSync(500);
+        } else {
+          this.callbacks.onError(error instanceof Error ? error.message : 'Could not synchronize image references');
+          if (!(error instanceof APIError) || error.status >= 500) {
+            const delay = Math.min(15_000, 500 * 2 ** Math.min(this.referenceRetryAttempt, 5));
+            this.referenceRetryAttempt += 1;
+            this.scheduleReferenceSync(delay);
+          }
+        }
+      }
+    } finally {
+      this.referencesInFlight = false;
+      if (!this.stopped && (this.sequenceFrontier !== sequence || referencedAssetIDs(this.doc).join('\u0000') !== assetIDs.join('\u0000'))) {
+        this.scheduleReferenceSync();
+      }
+    }
+  }
+
+  private applyServerUpdate(encoded: string) {
+    try {
+      const update = fromBase64(encoded);
+      Y.decodeUpdate(update);
+      Y.applyUpdate(this.doc, update, this);
+      return undefined;
+    } catch (error) {
+      return error instanceof Error ? error.message : 'Yjs update could not be decoded';
     }
   }
 

@@ -131,6 +131,8 @@ textarea { resize: vertical; }
 .member-row select { width: 108px; padding: 6px 8px; }
 .member-row .row-error { grid-column: 1 / -1; font-size: 12px; }
 .user-row { grid-template-columns: 1fr 1fr auto auto; }
+.user-row .password-reset-form { grid-template-columns: minmax(180px, 1fr) auto auto; margin: 0; }
+.user-row .row-error { grid-column: 1 / -1; font-size: 12px; }
 .badge { width: max-content; padding: 4px 8px; border-radius: 999px; background: #f3e6d8; color: #7a4d23; font-size: 12px; }
 
 .editor-shell { height: 100vh; overflow: hidden; background: #dfe7e4; }

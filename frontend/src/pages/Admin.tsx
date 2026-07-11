@@ -49,18 +49,40 @@ export function Admin() {
 
 function UserRow({ user }: { user: User }) {
   const queryClient = useQueryClient();
-  const reset = useMutation({
-    mutationFn: async () => {
-      const next = window.prompt(`Set a one-time password for ${user.email} (12+ characters)`);
-      if (!next) return;
-      await api(`/api/admin/users/${encodeURIComponent(user.id)}/password`, { method: 'POST', body: JSON.stringify({ password: next }) });
-    },
+  const [resetting, setResetting] = useState(false);
+  const [password, setPassword] = useState('');
+  const update = useMutation({
+    mutationFn: (role: SystemRole) => api<User>(`/api/admin/users/${encodeURIComponent(user.id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ system_role: role })
+    }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: usersKey })
+  });
+  const reset = useMutation({
+    mutationFn: () => api(`/api/admin/users/${encodeURIComponent(user.id)}/password`, {
+      method: 'POST',
+      body: JSON.stringify({ password })
+    }),
+    onSuccess: async () => {
+      setPassword('');
+      setResetting(false);
+      await queryClient.invalidateQueries({ queryKey: usersKey });
+    }
   });
   return (
     <div className="table-row user-row">
-      <span>{user.email}</span><span>{user.name}</span><span className="badge">{user.system_role}</span>
-      <button className="small-btn" onClick={() => reset.mutate()} disabled={reset.isPending} title="Reset password"><KeyRound size={15} /></button>
+      <span>{user.email}</span><span>{user.name}</span>
+      <select aria-label={`System role for ${user.email}`} value={user.system_role} disabled={update.isPending} onChange={(event) => update.mutate(event.target.value as SystemRole)}>
+        <option value="user">user</option><option value="system_admin">system_admin</option>
+      </select>
+      {resetting ? (
+        <form className="inline-form password-reset-form" onSubmit={(event) => { event.preventDefault(); reset.mutate(); }}>
+          <input aria-label={`One-time password for ${user.email}`} type="password" minLength={12} value={password} onChange={(event) => setPassword(event.target.value)} required autoFocus />
+          <button className="small-btn" disabled={reset.isPending}>Save</button>
+          <button type="button" className="small-btn" onClick={() => { setPassword(''); setResetting(false); }}>Cancel</button>
+        </form>
+      ) : <button className="small-btn" onClick={() => setResetting(true)} title="Reset password"><KeyRound size={15} /></button>}
+      {(update.error || reset.error) && <span className="error row-error">{update.error?.message ?? reset.error?.message}</span>}
     </div>
   );
 }

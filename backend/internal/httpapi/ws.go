@@ -34,11 +34,13 @@ var boardWSUpgrader = websocket.Upgrader{
 }
 
 type wsClientMessage struct {
-	Type            string `json:"type"`
-	UpdateID        string `json:"update_id"`
-	RequestID       string `json:"request_id"`
-	ThroughSequence int64  `json:"through_sequence"`
-	Data            []byte `json:"data"`
+	Type                  string   `json:"type"`
+	UpdateID              string   `json:"update_id"`
+	RequestID             string   `json:"request_id"`
+	ThroughSequence       int64    `json:"through_sequence"`
+	ReferenceBaseSequence *int64   `json:"reference_base_sequence"`
+	AssetIDs              []string `json:"asset_ids"`
+	Data                  []byte   `json:"data"`
 }
 
 func (s *Server) handleBoardWS(w http.ResponseWriter, r *http.Request, user domain.User, board domain.Board) {
@@ -69,7 +71,14 @@ func (s *Server) handleBoardWS(w http.ResponseWriter, r *http.Request, user doma
 		_ = connection.Close()
 		return
 	}
+	canManage, err := s.canManageProject(user, board.ProjectID)
+	if err != nil {
+		_ = writeWSJSON(connection, realtime.Message{Type: realtime.MessageError, Code: "authorization_unavailable", Message: "could not verify board permission"})
+		_ = connection.Close()
+		return
+	}
 	client := realtime.NewClient(randomID("cli"), user.ID, board.ID, canEdit, wsSendBuffer)
+	client.CanCheckpoint = canManage
 	if err := s.hub.Join(client, func() (realtime.SyncState, error) {
 		return s.writeBoardSync(connection, user, board, client)
 	}); err != nil {
@@ -143,7 +152,7 @@ func (s *Server) monitorBoardWSAuthorization(client *realtime.Client, board doma
 		case <-client.Done:
 			return
 		case <-ticker.C:
-			if _, _, ok, err := s.refreshBoardWSAuthorization(client, board, sessionHash); err != nil {
+			if _, _, _, ok, err := s.refreshBoardWSAuthorization(client, board, sessionHash); err != nil {
 				s.sendWSError(client, "authorization_unavailable", "could not verify collaboration access", "")
 				s.hub.Leave(client)
 				return
@@ -155,34 +164,39 @@ func (s *Server) monitorBoardWSAuthorization(client *realtime.Client, board doma
 	}
 }
 
-func (s *Server) refreshBoardWSAuthorization(client *realtime.Client, board domain.Board, sessionHash string) (domain.User, bool, bool, error) {
+func (s *Server) refreshBoardWSAuthorization(client *realtime.Client, board domain.Board, sessionHash string) (domain.User, bool, bool, bool, error) {
 	session, err := s.repo.GetSession(sessionHash, s.config.Now().UTC())
 	if errors.Is(err, store.ErrNotFound) || (err == nil && session.UserID != client.UserID) {
-		return domain.User{}, false, false, nil
+		return domain.User{}, false, false, false, nil
 	}
 	if err != nil {
-		return domain.User{}, false, false, err
+		return domain.User{}, false, false, false, err
 	}
 	user, err := s.repo.GetUser(session.UserID)
 	if errors.Is(err, store.ErrNotFound) || (err == nil && user.MustChangePassword) {
-		return domain.User{}, false, false, nil
+		return domain.User{}, false, false, false, nil
 	}
 	if err != nil {
-		return domain.User{}, false, false, err
+		return domain.User{}, false, false, false, err
 	}
 	canView, err := s.canViewProject(user, board.ProjectID)
 	if err != nil {
-		return domain.User{}, false, false, err
+		return domain.User{}, false, false, false, err
 	}
 	if !canView {
-		return domain.User{}, false, false, nil
+		return domain.User{}, false, false, false, nil
 	}
 	canEdit, err := s.canEditProject(user, board.ProjectID)
 	if err != nil {
-		return domain.User{}, false, false, err
+		return domain.User{}, false, false, false, err
+	}
+	canManage, err := s.canManageProject(user, board.ProjectID)
+	if err != nil {
+		return domain.User{}, false, false, false, err
 	}
 	s.hub.SetCanEdit(client, canEdit)
-	return user, canEdit, true, nil
+	s.hub.SetCanCheckpoint(client, canManage)
+	return user, canEdit, canManage, true, nil
 }
 
 func (s *Server) websocketOriginAllowed(r *http.Request) bool {
@@ -269,7 +283,7 @@ func (s *Server) writeBoardSync(connection *websocket.Conn, user domain.User, bo
 }
 
 func (s *Server) handleBoardWSMessage(client *realtime.Client, board domain.Board, sessionHash string, message wsClientMessage) bool {
-	user, canEdit, authorized, err := s.refreshBoardWSAuthorization(client, board, sessionHash)
+	user, canEdit, canManage, authorized, err := s.refreshBoardWSAuthorization(client, board, sessionHash)
 	if err != nil {
 		s.sendWSError(client, "authorization_unavailable", "could not verify collaboration access", message.UpdateID)
 		return false
@@ -288,15 +302,21 @@ func (s *Server) handleBoardWSMessage(client *realtime.Client, board domain.Boar
 			return s.sendWSError(client, "invalid_update", err.Error(), message.UpdateID)
 		}
 		persisted, inserted, err := s.repo.AppendBoardUpdate(domain.BoardUpdate{
-			BoardID:  board.ID,
-			UpdateID: message.UpdateID,
-			ClientID: client.ID,
-			UserID:   user.ID,
-			Update:   message.Data,
+			BoardID:               board.ID,
+			UpdateID:              message.UpdateID,
+			ClientID:              client.ID,
+			UserID:                user.ID,
+			Update:                message.Data,
+			ReferenceBaseSequence: message.ReferenceBaseSequence,
+			AssetIDs:              message.AssetIDs,
+			AssetManifestTrusted:  canManage,
 		})
 		if err != nil {
 			if errors.Is(err, store.ErrUpdateIDConflict) {
 				return s.sendWSError(client, "update_id_conflict", "update_id was already used for different data", message.UpdateID)
+			}
+			if errors.Is(err, store.ErrInvalidAssetReference) {
+				return s.sendWSError(client, "invalid_asset_reference", "asset references must exist in the board project", message.UpdateID)
 			}
 			return s.sendWSError(client, "persistence_failed", "could not persist document update", message.UpdateID)
 		}
@@ -338,8 +358,8 @@ func (s *Server) handleBoardWSMessage(client *realtime.Client, board domain.Boar
 		return true
 
 	case realtime.MessageCheckpoint:
-		if !canEdit {
-			return s.sendWSError(client, "forbidden", "viewer cannot save a checkpoint", "")
+		if !canManage {
+			return s.sendWSError(client, "forbidden", "only a project manager can save a checkpoint", "")
 		}
 		if message.RequestID == "" || message.ThroughSequence <= 0 || len(message.Data) == 0 {
 			return s.sendWSError(client, "invalid_checkpoint", "checkpoint request_id, sequence, and data are required", "")
@@ -381,6 +401,13 @@ func validateDocumentUpdate(message wsClientMessage) error {
 	}
 	if len(message.Data) > wsMaxUpdateBytes {
 		return errors.New("document update exceeds 8 MiB")
+	}
+	manifestPresent := message.AssetIDs != nil
+	if manifestPresent != (message.ReferenceBaseSequence != nil) {
+		return errors.New("reference_base_sequence and asset_ids must be provided together")
+	}
+	if message.ReferenceBaseSequence != nil && *message.ReferenceBaseSequence < 0 {
+		return errors.New("reference_base_sequence must be non-negative")
 	}
 	return nil
 }

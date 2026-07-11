@@ -200,7 +200,7 @@ function MemberRow({ member, projectID, canManage: manageable, canManageOwners: 
     <div className="table-row member-row">
       <span>{member.user?.email ?? member.user_id}</span>
       {manageable ? <select value={member.role} disabled={member.role === 'owner' && !owners} onChange={(event) => update.mutate(event.target.value as ProjectRole)}>{owners && <option value="owner">owner</option>}<option value="admin">admin</option><option value="editor">editor</option><option value="viewer">viewer</option></select> : <span className="badge">{member.role}</span>}
-      {manageable && <button className="small-btn danger" title="Remove member" onClick={() => window.confirm('Remove this member?') && remove.mutate()}><Trash2 size={14} /></button>}
+      {manageable && <button className="small-btn danger" title="Remove member" disabled={member.role === 'owner' && !owners} onClick={() => window.confirm('Remove this member?') && remove.mutate()}><Trash2 size={14} /></button>}
       {(update.error || remove.error) && <span className="error row-error">{update.error?.message ?? remove.error?.message}</span>}
     </div>
   );

@@ -31,6 +31,7 @@ interface BoardState {
   presence: Record<number, RemotePresence>;
   reset: (boardID: string) => void;
   setBlocks: (blocks: WhiteboardBlock[]) => void;
+  applyBlockChanges: (changes: Array<{ id: string; block: WhiteboardBlock | null }>) => void;
   setSelection: (ids: string[]) => void;
   toggleSelection: (id: string) => void;
   setSelectionBox: (box: Rect | null) => void;
@@ -65,6 +66,35 @@ export const useBoardStore = create<BoardState>((set) => ({
     presence: {}
   }),
   setBlocks: (blocks) => set((state) => ({ document: { blocks, revision: state.document.revision + 1 } })),
+  applyBlockChanges: (changes) => set((state) => {
+    if (changes.length === 0) return state;
+    const replacements = new Map(changes.map((change) => [change.id, change.block]));
+    const existing = new Set<string>();
+    let orderChanged = false;
+    const blocks: WhiteboardBlock[] = [];
+    for (const current of state.document.blocks) {
+      existing.add(current.id);
+      if (!replacements.has(current.id)) {
+        blocks.push(current);
+        continue;
+      }
+      const replacement = replacements.get(current.id);
+      if (!replacement) {
+        orderChanged = true;
+        continue;
+      }
+      if (replacement.z !== current.z) orderChanged = true;
+      blocks.push(replacement);
+    }
+    for (const change of changes) {
+      if (change.block && !existing.has(change.id)) {
+        blocks.push(change.block);
+        orderChanged = true;
+      }
+    }
+    if (orderChanged) blocks.sort((a, b) => a.z - b.z || a.id.localeCompare(b.id));
+    return { document: { blocks, revision: state.document.revision + 1 } };
+  }),
   setSelection: (ids) => set({ selection: { ids: unique(ids), box: null } }),
   toggleSelection: (id) => set((state) => ({ selection: {
     ids: state.selection.ids.includes(id) ? state.selection.ids.filter((next) => next !== id) : [...state.selection.ids, id],
@@ -72,7 +102,7 @@ export const useBoardStore = create<BoardState>((set) => ({
   } })),
   setSelectionBox: (box) => set((state) => ({ selection: { ...state.selection, box } })),
   setViewport: (viewport) => set((state) => {
-    saveViewport(state.boardID, viewport);
+    scheduleViewportSave(state.boardID, viewport);
     return { viewport };
   }),
   setTool: (tool) => set({ tool }),
@@ -100,9 +130,18 @@ function loadViewport(boardID: string): Viewport {
   return { ...initialViewport };
 }
 
-function saveViewport(boardID: string, viewport: Viewport) {
+const viewportSaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function scheduleViewportSave(boardID: string, viewport: Viewport) {
   if (!boardID) return;
-  localStorage.setItem(`dw_viewport_${boardID}`, JSON.stringify(viewport));
+  const existing = viewportSaveTimers.get(boardID);
+  if (existing !== undefined) clearTimeout(existing);
+  viewportSaveTimers.set(boardID, setTimeout(() => {
+    viewportSaveTimers.delete(boardID);
+    try {
+      localStorage.setItem(`dw_viewport_${boardID}`, JSON.stringify(viewport));
+    } catch { /* storage can be unavailable or full */ }
+  }, 200));
 }
 
 function clamp(value: number, min: number, max: number) {

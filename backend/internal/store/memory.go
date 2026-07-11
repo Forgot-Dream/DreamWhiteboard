@@ -11,29 +11,36 @@ import (
 )
 
 type MemoryStore struct {
-	mu             sync.RWMutex
-	users          map[string]domain.User
-	userByMail     map[string]string
-	sessions       map[string]domain.Session
-	projects       map[string]domain.Project
-	members        map[string]map[string]domain.ProjectMember
-	boards         map[string]domain.Board
-	boardDocuments map[string]domain.BoardDocument
-	boardUpdates   map[string][]domain.BoardUpdate
-	assets         map[string]domain.Asset
+	mu                        sync.RWMutex
+	users                     map[string]domain.User
+	userByMail                map[string]string
+	sessions                  map[string]domain.Session
+	projects                  map[string]domain.Project
+	members                   map[string]map[string]domain.ProjectMember
+	boards                    map[string]domain.Board
+	boardDocuments            map[string]domain.BoardDocument
+	boardUpdates              map[string][]domain.BoardUpdate
+	boardAssetReferenceStates map[string]domain.BoardAssetReferenceState
+	boardAssetReferences      map[string]map[string]struct{}
+	assets                    map[string]domain.Asset
+	cleanupJobs               map[int64]StorageCleanupJob
+	nextCleanupID             int64
 }
 
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		users:          map[string]domain.User{},
-		userByMail:     map[string]string{},
-		sessions:       map[string]domain.Session{},
-		projects:       map[string]domain.Project{},
-		members:        map[string]map[string]domain.ProjectMember{},
-		boards:         map[string]domain.Board{},
-		boardDocuments: map[string]domain.BoardDocument{},
-		boardUpdates:   map[string][]domain.BoardUpdate{},
-		assets:         map[string]domain.Asset{},
+		users:                     map[string]domain.User{},
+		userByMail:                map[string]string{},
+		sessions:                  map[string]domain.Session{},
+		projects:                  map[string]domain.Project{},
+		members:                   map[string]map[string]domain.ProjectMember{},
+		boards:                    map[string]domain.Board{},
+		boardDocuments:            map[string]domain.BoardDocument{},
+		boardUpdates:              map[string][]domain.BoardUpdate{},
+		boardAssetReferenceStates: map[string]domain.BoardAssetReferenceState{},
+		boardAssetReferences:      map[string]map[string]struct{}{},
+		assets:                    map[string]domain.Asset{},
+		cleanupJobs:               map[int64]StorageCleanupJob{},
 	}
 }
 
@@ -339,6 +346,7 @@ func (s *MemoryStore) DeleteProject(id string) error {
 	if _, ok := s.projects[id]; !ok {
 		return ErrNotFound
 	}
+	s.enqueueStorageCleanupLocked(StorageCleanupProjectDir, id, "", time.Now().UTC())
 	delete(s.projects, id)
 	delete(s.members, id)
 	for boardID, board := range s.boards {
@@ -346,6 +354,8 @@ func (s *MemoryStore) DeleteProject(id string) error {
 			delete(s.boards, boardID)
 			delete(s.boardDocuments, boardID)
 			delete(s.boardUpdates, boardID)
+			delete(s.boardAssetReferenceStates, boardID)
+			delete(s.boardAssetReferences, boardID)
 		}
 	}
 	for assetID, asset := range s.assets {
@@ -458,6 +468,14 @@ func (s *MemoryStore) CreateBoard(projectID, name, createdBy string) (domain.Boa
 	}
 	s.boards[board.ID] = board
 	s.boardDocuments[board.ID] = domain.BoardDocument{BoardID: board.ID, UpdatedAt: now}
+	s.boardAssetReferenceStates[board.ID] = domain.BoardAssetReferenceState{
+		BoardID:                board.ID,
+		IndexedThroughSequence: 0,
+		RefsHash:               hashAssetReferences([]string{}),
+		IndexedBy:              createdBy,
+		IndexedAt:              &now,
+	}
+	s.boardAssetReferences[board.ID] = map[string]struct{}{}
 	return board, nil
 }
 
@@ -511,6 +529,8 @@ func (s *MemoryStore) DeleteBoard(id string) error {
 	delete(s.boards, id)
 	delete(s.boardDocuments, id)
 	delete(s.boardUpdates, id)
+	delete(s.boardAssetReferenceStates, id)
+	delete(s.boardAssetReferences, id)
 	return nil
 }
 
@@ -528,8 +548,7 @@ func (s *MemoryStore) LoadBoardDocument(boardID string) (domain.BoardDocument, [
 	updates := make([]domain.BoardUpdate, 0, len(s.boardUpdates[boardID]))
 	for _, update := range s.boardUpdates[boardID] {
 		if update.ServerSequence > document.CheckpointSequence {
-			update.Update = cloneBytes(update.Update)
-			updates = append(updates, update)
+			updates = append(updates, cloneBoardUpdate(update))
 		}
 	}
 	sort.Slice(updates, func(i, j int) bool { return updates[i].ServerSequence < updates[j].ServerSequence })
@@ -540,6 +559,19 @@ func (s *MemoryStore) AppendBoardUpdate(update domain.BoardUpdate) (domain.Board
 	if update.BoardID == "" || update.UpdateID == "" || update.ClientID == "" || update.UserID == "" || len(update.Update) == 0 {
 		return domain.BoardUpdate{}, false, ErrInvalidInput
 	}
+	hasReferenceBase := update.ReferenceBaseSequence != nil
+	hasAssetManifest := update.AssetIDs != nil
+	if hasReferenceBase != hasAssetManifest || hasReferenceBase && *update.ReferenceBaseSequence < 0 {
+		return domain.BoardUpdate{}, false, ErrInvalidInput
+	}
+	assetIDs, err := canonicalAssetIDs(update.AssetIDs)
+	if err != nil {
+		return domain.BoardUpdate{}, false, err
+	}
+	update.AssetIDs = assetIDs
+	update.ReferenceBaseSequence = cloneInt64(update.ReferenceBaseSequence)
+	update.UpdateHash = hashBoardUpdate(update.Update, update.ReferenceBaseSequence, update.AssetIDs)
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	board, ok := s.boards[update.BoardID]
@@ -549,33 +581,41 @@ func (s *MemoryStore) AppendBoardUpdate(update domain.BoardUpdate) (domain.Board
 	if _, ok := s.users[update.UserID]; !ok {
 		return domain.BoardUpdate{}, false, ErrNotFound
 	}
-	update.UpdateHash = hashUpdate(update.Update)
 	for _, existing := range s.boardUpdates[update.BoardID] {
 		if existing.UpdateID == update.UpdateID {
 			if existing.UpdateHash != update.UpdateHash {
 				return domain.BoardUpdate{}, false, ErrUpdateIDConflict
 			}
-			existing.Update = cloneBytes(existing.Update)
-			return existing, false, nil
+			return cloneBoardUpdate(existing), false, nil
 		}
 	}
 	document, ok := s.boardDocuments[update.BoardID]
 	if !ok {
 		return domain.BoardUpdate{}, false, ErrNotFound
 	}
-	sequence := document.CheckpointSequence
-	for _, existing := range s.boardUpdates[update.BoardID] {
-		if existing.ServerSequence > sequence {
-			sequence = existing.ServerSequence
+	latestSequence := s.latestBoardSequenceLocked(update.BoardID, document)
+	if hasAssetManifest && update.AssetManifestTrusted && *update.ReferenceBaseSequence == latestSequence {
+		if err := s.validateBoardAssetReferencesLocked(board.ProjectID, update.AssetIDs); err != nil {
+			return domain.BoardUpdate{}, false, err
 		}
 	}
-	update.ServerSequence = sequence + 1
+	update.ServerSequence = latestSequence + 1
 	update.Update = cloneBytes(update.Update)
+	update.AssetIDs = cloneStrings(update.AssetIDs)
 	update.CreatedAt = time.Now().UTC()
 	s.boardUpdates[update.BoardID] = append(s.boardUpdates[update.BoardID], update)
 	board.UpdatedAt = update.CreatedAt
 	s.boards[board.ID] = board
-	return update, true, nil
+	if hasAssetManifest && update.AssetManifestTrusted && *update.ReferenceBaseSequence == latestSequence {
+		s.replaceBoardAssetReferencesLocked(
+			update.BoardID,
+			update.ServerSequence,
+			update.UserID,
+			update.CreatedAt,
+			update.AssetIDs,
+		)
+	}
+	return cloneBoardUpdate(update), true, nil
 }
 
 func (s *MemoryStore) SaveBoardCheckpoint(boardID string, checkpoint []byte, throughSequence int64) (domain.BoardDocument, error) {
@@ -615,6 +655,58 @@ func (s *MemoryStore) SaveBoardCheckpoint(boardID string, checkpoint []byte, thr
 	s.boardUpdates[boardID] = updates
 	document.Checkpoint = cloneBytes(document.Checkpoint)
 	return document, nil
+}
+
+func (s *MemoryStore) SaveBoardAssetReferences(boardID, indexedBy string, throughSequence int64, assetIDs []string) (domain.BoardAssetReferenceState, error) {
+	if boardID == "" || indexedBy == "" || throughSequence < 0 || assetIDs == nil {
+		return domain.BoardAssetReferenceState{}, ErrInvalidInput
+	}
+	canonicalIDs, err := canonicalAssetIDs(assetIDs)
+	if err != nil {
+		return domain.BoardAssetReferenceState{}, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	board, ok := s.boards[boardID]
+	if !ok {
+		return domain.BoardAssetReferenceState{}, ErrNotFound
+	}
+	if _, ok := s.users[indexedBy]; !ok {
+		return domain.BoardAssetReferenceState{}, ErrNotFound
+	}
+	document, ok := s.boardDocuments[boardID]
+	if !ok {
+		return domain.BoardAssetReferenceState{}, ErrNotFound
+	}
+	latestSequence := s.latestBoardSequenceLocked(boardID, document)
+	if throughSequence != latestSequence {
+		return domain.BoardAssetReferenceState{}, ErrAssetReferenceIndexStale
+	}
+	if err := s.validateBoardAssetReferencesLocked(board.ProjectID, canonicalIDs); err != nil {
+		return domain.BoardAssetReferenceState{}, err
+	}
+
+	refsHash := hashAssetReferences(canonicalIDs)
+	current, ok := s.boardAssetReferenceStates[boardID]
+	if !ok {
+		return domain.BoardAssetReferenceState{}, ErrAssetReferenceIndexStale
+	}
+	if current.IndexedThroughSequence == throughSequence {
+		if current.RefsHash != "" && current.RefsHash != refsHash {
+			current.Conflicted = true
+			s.boardAssetReferenceStates[boardID] = current
+			return cloneBoardAssetReferenceState(current), ErrAssetReferenceConflict
+		}
+		if current.Conflicted {
+			return cloneBoardAssetReferenceState(current), ErrAssetReferenceConflict
+		}
+		return cloneBoardAssetReferenceState(current), nil
+	}
+
+	now := time.Now().UTC()
+	state := s.replaceBoardAssetReferencesLocked(boardID, throughSequence, indexedBy, now, canonicalIDs)
+	return cloneBoardAssetReferenceState(state), nil
 }
 
 func (s *MemoryStore) SaveAsset(asset domain.Asset) (domain.Asset, error) {
@@ -677,11 +769,78 @@ func (s *MemoryStore) ListAssetsByProject(projectID string) ([]domain.Asset, err
 func (s *MemoryStore) DeleteAsset(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.assets[id]; !ok {
+	asset, ok := s.assets[id]
+	if !ok {
 		return ErrNotFound
 	}
+	for boardID, board := range s.boards {
+		if board.ProjectID != asset.ProjectID {
+			continue
+		}
+		state, ok := s.boardAssetReferenceStates[boardID]
+		if ok && state.Conflicted {
+			return ErrAssetReferenceIndexStale
+		}
+	}
+	for boardID, board := range s.boards {
+		if board.ProjectID != asset.ProjectID {
+			continue
+		}
+		document, documentOK := s.boardDocuments[boardID]
+		state, stateOK := s.boardAssetReferenceStates[boardID]
+		if !documentOK || !stateOK || state.IndexedThroughSequence != s.latestBoardSequenceLocked(boardID, document) {
+			return ErrAssetReferenceIndexStale
+		}
+	}
+	for boardID, board := range s.boards {
+		if board.ProjectID != asset.ProjectID {
+			continue
+		}
+		if _, referenced := s.boardAssetReferences[boardID][id]; referenced {
+			return ErrAssetInUse
+		}
+	}
+	s.enqueueStorageCleanupLocked(StorageCleanupAssetFile, asset.ProjectID, asset.StorageKey, time.Now().UTC())
 	delete(s.assets, id)
 	return nil
+}
+
+func (s *MemoryStore) latestBoardSequenceLocked(boardID string, document domain.BoardDocument) int64 {
+	latest := document.CheckpointSequence
+	for _, update := range s.boardUpdates[boardID] {
+		if update.ServerSequence > latest {
+			latest = update.ServerSequence
+		}
+	}
+	return latest
+}
+
+func (s *MemoryStore) validateBoardAssetReferencesLocked(projectID string, assetIDs []string) error {
+	for _, assetID := range assetIDs {
+		asset, ok := s.assets[assetID]
+		if !ok || asset.ProjectID != projectID {
+			return ErrInvalidAssetReference
+		}
+	}
+	return nil
+}
+
+func (s *MemoryStore) replaceBoardAssetReferencesLocked(boardID string, throughSequence int64, indexedBy string, indexedAt time.Time, assetIDs []string) domain.BoardAssetReferenceState {
+	refs := make(map[string]struct{}, len(assetIDs))
+	for _, assetID := range assetIDs {
+		refs[assetID] = struct{}{}
+	}
+	s.boardAssetReferences[boardID] = refs
+	state := domain.BoardAssetReferenceState{
+		BoardID:                boardID,
+		IndexedThroughSequence: throughSequence,
+		RefsHash:               hashAssetReferences(assetIDs),
+		IndexedBy:              indexedBy,
+		IndexedAt:              &indexedAt,
+		Conflicted:             false,
+	}
+	s.boardAssetReferenceStates[boardID] = state
+	return state
 }
 
 func ownerCount(members map[string]domain.ProjectMember) int {
@@ -714,4 +873,34 @@ func cloneBytes(value []byte) []byte {
 		return nil
 	}
 	return append([]byte(nil), value...)
+}
+
+func cloneStrings(value []string) []string {
+	if value == nil {
+		return nil
+	}
+	return append([]string(nil), value...)
+}
+
+func cloneInt64(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneBoardUpdate(update domain.BoardUpdate) domain.BoardUpdate {
+	update.Update = cloneBytes(update.Update)
+	update.AssetIDs = cloneStrings(update.AssetIDs)
+	update.ReferenceBaseSequence = cloneInt64(update.ReferenceBaseSequence)
+	return update
+}
+
+func cloneBoardAssetReferenceState(state domain.BoardAssetReferenceState) domain.BoardAssetReferenceState {
+	if state.IndexedAt != nil {
+		indexedAt := *state.IndexedAt
+		state.IndexedAt = &indexedAt
+	}
+	return state
 }

@@ -12,7 +12,7 @@ import (
 	"github.com/lib/pq"
 )
 
-const LatestSchemaVersion = 2
+const LatestSchemaVersion = 4
 
 type PostgresStore struct {
 	db *sql.DB
@@ -50,12 +50,18 @@ func (s *PostgresStore) Ready(ctx context.Context) error {
 	if count != LatestSchemaVersion || minimum != 1 || maximum != LatestSchemaVersion || verified != LatestSchemaVersion {
 		return fmt.Errorf("database migration history is incomplete or incompatible: count=%d verified=%d min=%d max=%d required=1..%d", count, verified, minimum, maximum, LatestSchemaVersion)
 	}
-	var sessions, documents, updates sql.NullString
-	if err := s.db.QueryRowContext(ctx, `SELECT to_regclass('sessions'), to_regclass('board_documents'), to_regclass('board_updates')`).Scan(&sessions, &documents, &updates); err != nil {
+	var sessions, documents, updates, cleanupJobs, referenceState, references sql.NullString
+	if err := s.db.QueryRowContext(ctx, `SELECT
+		to_regclass('sessions'),
+		to_regclass('board_documents'),
+		to_regclass('board_updates'),
+		to_regclass('storage_cleanup_jobs'),
+		to_regclass('board_asset_reference_state'),
+		to_regclass('board_asset_references')`).Scan(&sessions, &documents, &updates, &cleanupJobs, &referenceState, &references); err != nil {
 		return fmt.Errorf("inspect required schema: %w", err)
 	}
-	if !sessions.Valid || !documents.Valid || !updates.Valid {
-		return fmt.Errorf("database schema is missing required v2 relations")
+	if !sessions.Valid || !documents.Valid || !updates.Valid || !cleanupJobs.Valid || !referenceState.Valid || !references.Valid {
+		return fmt.Errorf("database schema is missing required relations")
 	}
 	return nil
 }
@@ -405,8 +411,23 @@ func (s *PostgresStore) UpdateProject(id, name, description string) (domain.Proj
 }
 
 func (s *PostgresStore) DeleteProject(id string) error {
-	result, err := s.db.Exec(`DELETE FROM projects WHERE id=$1`, id)
-	return resultError(result, err)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var projectID string
+	if err := tx.QueryRow(`SELECT id FROM projects WHERE id=$1 FOR UPDATE`, id).Scan(&projectID); err != nil {
+		return mapSQLError(err)
+	}
+	if err := enqueueStorageCleanupTx(tx, StorageCleanupProjectDir, projectID, ""); err != nil {
+		return err
+	}
+	result, err := tx.Exec(`DELETE FROM projects WHERE id=$1`, projectID)
+	if err := resultError(result, err); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *PostgresStore) MemberRole(projectID, userID string) (string, error) {
@@ -566,6 +587,11 @@ func (s *PostgresStore) CreateBoard(projectID, name, createdBy string) (domain.B
 		VALUES ($1,$2,$3,$4)`, board.ID, []byte{}, 0, now); err != nil {
 		return domain.Board{}, mapSQLError(err)
 	}
+	if _, err := tx.Exec(`INSERT INTO board_asset_reference_state
+		(board_id, indexed_through_sequence, refs_hash, indexed_by, indexed_at, conflicted)
+		VALUES ($1,0,$2,$3,$4,FALSE)`, board.ID, hashAssetReferences([]string{}), createdBy, now); err != nil {
+		return domain.Board{}, mapSQLError(err)
+	}
 	return board, tx.Commit()
 }
 
@@ -675,16 +701,25 @@ func (s *PostgresStore) AppendBoardUpdate(update domain.BoardUpdate) (domain.Boa
 	if update.BoardID == "" || update.UpdateID == "" || update.ClientID == "" || update.UserID == "" || len(update.Update) == 0 {
 		return domain.BoardUpdate{}, false, ErrInvalidInput
 	}
+	manifestPresent := update.AssetIDs != nil
+	if manifestPresent != (update.ReferenceBaseSequence != nil) || (update.ReferenceBaseSequence != nil && *update.ReferenceBaseSequence < 0) {
+		return domain.BoardUpdate{}, false, ErrInvalidInput
+	}
+	canonical, err := canonicalAssetIDs(update.AssetIDs)
+	if err != nil {
+		return domain.BoardUpdate{}, false, err
+	}
+	update.AssetIDs = canonical
+	update.UpdateHash = hashBoardUpdate(update.Update, update.ReferenceBaseSequence, canonical)
 	tx, err := s.db.Begin()
 	if err != nil {
 		return domain.BoardUpdate{}, false, err
 	}
 	defer tx.Rollback()
-	var checkpointSequence int64
-	if err := tx.QueryRow(`SELECT checkpoint_sequence FROM board_documents WHERE board_id=$1 FOR UPDATE`, update.BoardID).Scan(&checkpointSequence); err != nil {
-		return domain.BoardUpdate{}, false, mapSQLError(err)
+	projectID, checkpointSequence, err := lockBoardDocumentTx(tx, update.BoardID)
+	if err != nil {
+		return domain.BoardUpdate{}, false, err
 	}
-	update.UpdateHash = hashUpdate(update.Update)
 	var existing domain.BoardUpdate
 	err = tx.QueryRow(`SELECT board_id, server_sequence, update_id, client_id, user_id, update_data, update_hash, compacted_at, created_at
 		FROM board_updates WHERE board_id=$1 AND update_id=$2`, update.BoardID, update.UpdateID).Scan(
@@ -710,10 +745,16 @@ func (s *PostgresStore) AppendBoardUpdate(update domain.BoardUpdate) (domain.Boa
 	if !errors.Is(err, sql.ErrNoRows) {
 		return domain.BoardUpdate{}, false, err
 	}
-	if err := tx.QueryRow(`SELECT GREATEST($2, COALESCE(MAX(server_sequence), 0)) + 1
-		FROM board_updates WHERE board_id=$1`, update.BoardID, checkpointSequence).Scan(&update.ServerSequence); err != nil {
+	latestSequence, err := latestBoardSequenceTx(tx, update.BoardID, checkpointSequence)
+	if err != nil {
 		return domain.BoardUpdate{}, false, err
 	}
+	if manifestPresent && update.AssetManifestTrusted && *update.ReferenceBaseSequence == latestSequence {
+		if err := validateProjectAssetReferencesTx(tx, projectID, canonical); err != nil {
+			return domain.BoardUpdate{}, false, err
+		}
+	}
+	update.ServerSequence = latestSequence + 1
 	update.CreatedAt = time.Now().UTC()
 	_, err = tx.Exec(`INSERT INTO board_updates
 		(board_id, server_sequence, update_id, client_id, user_id, update_data, update_hash, created_at)
@@ -732,6 +773,11 @@ func (s *PostgresStore) AppendBoardUpdate(update domain.BoardUpdate) (domain.Boa
 	}
 	if _, err := tx.Exec(`UPDATE boards SET updated_at=$2 WHERE id=$1`, update.BoardID, update.CreatedAt); err != nil {
 		return domain.BoardUpdate{}, false, mapSQLError(err)
+	}
+	if manifestPresent && update.AssetManifestTrusted && *update.ReferenceBaseSequence == latestSequence {
+		if _, err := replaceBoardAssetReferencesTx(tx, update.BoardID, projectID, update.UserID, update.ServerSequence, canonical); err != nil {
+			return domain.BoardUpdate{}, false, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return domain.BoardUpdate{}, false, err
@@ -850,8 +896,46 @@ func (s *PostgresStore) ListAssetsByProject(projectID string) ([]domain.Asset, e
 }
 
 func (s *PostgresStore) DeleteAsset(id string) error {
-	result, err := s.db.Exec(`DELETE FROM assets WHERE id=$1`, id)
-	return resultError(result, err)
+	var projectID string
+	if err := s.db.QueryRow(`SELECT project_id FROM assets WHERE id=$1`, id).Scan(&projectID); err != nil {
+		return mapSQLError(err)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var lockedProject string
+	if err := tx.QueryRow(`SELECT id FROM projects WHERE id=$1 FOR UPDATE`, projectID).Scan(&lockedProject); err != nil {
+		return mapSQLError(err)
+	}
+	if err := lockFreshProjectBoardReferencesTx(tx, projectID); err != nil {
+		return err
+	}
+	var lockedProjectID, storageKey string
+	if err := tx.QueryRow(`SELECT project_id, storage_key FROM assets WHERE id=$1 FOR UPDATE`, id).Scan(&lockedProjectID, &storageKey); err != nil {
+		return mapSQLError(err)
+	}
+	if lockedProjectID != projectID {
+		return ErrInvalidAssetReference
+	}
+	var referenced bool
+	if err := tx.QueryRow(`SELECT EXISTS (
+		SELECT 1 FROM board_asset_references WHERE project_id=$1 AND asset_id=$2
+	)`, projectID, id).Scan(&referenced); err != nil {
+		return err
+	}
+	if referenced {
+		return ErrAssetInUse
+	}
+	if err := enqueueStorageCleanupTx(tx, StorageCleanupAssetFile, projectID, storageKey); err != nil {
+		return err
+	}
+	result, err := tx.Exec(`DELETE FROM assets WHERE id=$1`, id)
+	if err := resultError(result, err); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 const userSelect = `SELECT id, email, name, system_role, password_hash, must_change_password, password_changed_at, created_at FROM users`

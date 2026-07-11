@@ -5,6 +5,7 @@ import {
   RotateCcw, Scan, SendToBack, Trash2, Type, Undo2, ZoomIn, ZoomOut
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
+import { useShallow } from 'zustand/react/shallow';
 import { uploadAsset, type Board, type Project } from '../lib/api';
 import type { BoardRuntime } from './runtime';
 import { blockBounds } from './schema';
@@ -17,8 +18,13 @@ export function BoardToolbar({ runtime, board, project, onBackProjectID }: { run
   const navigate = useNavigate();
   const input = useRef<HTMLInputElement>(null);
   const [upload, setUpload] = useState<{ file: File; progress: number; error: string; controller: AbortController } | null>(null);
-  const state = useBoardStore();
-  const selected = state.document.blocks.filter((block) => state.selection.ids.includes(block.id));
+  const selected = useBoardStore(useShallow((state) => {
+    const ids = new Set(state.selection.ids);
+    return state.document.blocks.filter((block) => ids.has(block.id));
+  }));
+  const tool = useBoardStore((state) => state.tool);
+  const scale = useBoardStore((state) => state.viewport.scale);
+  const connection = useBoardStore(useShallow((state) => state.connection));
   const selectedOne = selected.length === 1 ? selected[0] : undefined;
 
   async function chooseFile(file: File) {
@@ -41,7 +47,7 @@ export function BoardToolbar({ runtime, board, project, onBackProjectID }: { run
         naturalWidth: asset.width ?? dimensions.width, naturalHeight: asset.height ?? dimensions.height,
         width: size.width, height: size.height
       });
-      if (id) state.setSelection([id]);
+      if (id) useBoardStore.getState().setSelection([id]);
       setUpload(null);
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') { setUpload(null); return; }
@@ -51,49 +57,49 @@ export function BoardToolbar({ runtime, board, project, onBackProjectID }: { run
     }
   }
 
-  function fit(blocks = state.document.blocks) {
+  function fit(blocks = useBoardStore.getState().document.blocks) {
     const bounds = blockBounds(blocks);
     if (!bounds) return;
     const width = window.innerWidth;
     const height = window.innerHeight - 58;
     const scale = Math.min(2.5, Math.max(0.15, Math.min((width - 120) / Math.max(bounds.width, 1), (height - 120) / Math.max(bounds.height, 1))));
-    state.setViewport({ x: width / 2 - (bounds.x + bounds.width / 2) * scale, y: height / 2 - (bounds.y + bounds.height / 2) * scale, scale });
+    useBoardStore.getState().setViewport({ x: width / 2 - (bounds.x + bounds.width / 2) * scale, y: height / 2 - (bounds.y + bounds.height / 2) * scale, scale });
   }
 
   return (
     <header className="topbar">
       <button className="icon-btn" onClick={() => navigate(`/projects/${onBackProjectID}`)} title="Back"><ArrowLeft size={19} /></button>
-      <div className="title-block"><strong>{board.name}</strong><span>{project?.name ?? 'Project'} · {connectionLabel(state.connection.state, state.connection.pending, state.connection.lastSequence)}</span></div>
+      <div className="title-block"><strong>{board.name}</strong><span>{project?.name ?? 'Project'} · {connectionLabel(connection.state, connection.pending, connection.lastSequence)}</span></div>
       <div className="toolbar" role="toolbar" aria-label="Whiteboard tools">
-        <ToolButton active={state.tool === 'select'} label="Select (V)" onClick={() => state.setTool('select')}><MousePointer2 size={18} /></ToolButton>
-        <ToolButton active={state.tool === 'pan'} label="Pan" onClick={() => state.setTool('pan')}><Hand size={18} /></ToolButton>
-        <ToolButton active={state.tool === 'text'} disabled={!runtime.canEdit} label="Text" onClick={() => state.setTool('text')}><Type size={18} /></ToolButton>
+        <ToolButton active={tool === 'select'} label="Select (V)" onClick={() => useBoardStore.getState().setTool('select')}><MousePointer2 size={18} /></ToolButton>
+        <ToolButton active={tool === 'pan'} label="Pan" onClick={() => useBoardStore.getState().setTool('pan')}><Hand size={18} /></ToolButton>
+        <ToolButton active={tool === 'text'} disabled={!runtime.canEdit} label="Text" onClick={() => useBoardStore.getState().setTool('text')}><Type size={18} /></ToolButton>
         <button className="icon-btn" disabled={!runtime.canEdit || Boolean(upload && !upload.error)} title="Upload image" onClick={() => input.current?.click()}><FileImage size={18} /></button>
         <input ref={input} hidden type="file" accept="image/png,image/jpeg,image/gif" onChange={(event) => event.target.files?.[0] && chooseFile(event.target.files[0])} />
         <span className="toolbar-divider" />
         <button className="icon-btn" disabled={!runtime.canEdit} title="Undo" onClick={() => runtime.commands.undo()}><Undo2 size={18} /></button>
         <button className="icon-btn" disabled={!runtime.canEdit} title="Redo" onClick={() => runtime.commands.redo()}><Redo2 size={18} /></button>
-        <button className="icon-btn" disabled={!runtime.canEdit || !selected.length} title="Duplicate" onClick={() => state.setSelection(runtime.commands.duplicate(state.selection.ids))}><Copy size={18} /></button>
-        <button className="icon-btn" disabled={!runtime.canEdit || !selected.length} title="Bring to front" onClick={() => runtime.commands.reorder(state.selection.ids, 'front')}><BringToFront size={18} /></button>
-        <button className="icon-btn" disabled={!runtime.canEdit || !selected.length} title="Send to back" onClick={() => runtime.commands.reorder(state.selection.ids, 'back')}><SendToBack size={18} /></button>
-        <button className="icon-btn" disabled={!runtime.canEdit || !selected.length} title="Move forward" onClick={() => runtime.commands.reorder(state.selection.ids, 'forward')}><ChevronUp size={18} /></button>
-        <button className="icon-btn" disabled={!runtime.canEdit || !selected.length} title="Move backward" onClick={() => runtime.commands.reorder(state.selection.ids, 'backward')}><ChevronDown size={18} /></button>
-        <button className="icon-btn" disabled={!runtime.canEdit || selected.length < 2} title="Align horizontal centers" onClick={() => runtime.commands.align(state.selection.ids, 'horizontal')}><AlignHorizontalJustifyCenter size={18} /></button>
-        <button className="icon-btn" disabled={!runtime.canEdit || selected.length < 2} title="Align vertical centers" onClick={() => runtime.commands.align(state.selection.ids, 'vertical')}><AlignVerticalJustifyCenter size={18} /></button>
-        <button className="icon-btn" disabled={!runtime.canEdit || selected.length < 3} title="Distribute horizontally" onClick={() => runtime.commands.distribute(state.selection.ids, 'horizontal')}><BetweenHorizontalStart size={18} /></button>
-        <button className="icon-btn" disabled={!runtime.canEdit || selected.length < 3} title="Distribute vertically" onClick={() => runtime.commands.distribute(state.selection.ids, 'vertical')}><BetweenVerticalStart size={18} /></button>
+        <button className="icon-btn" disabled={!runtime.canEdit || !selected.length} title="Duplicate" onClick={() => { const state = useBoardStore.getState(); state.setSelection(runtime.commands.duplicate(state.selection.ids)); }}><Copy size={18} /></button>
+        <button className="icon-btn" disabled={!runtime.canEdit || !selected.length} title="Bring to front" onClick={() => runtime.commands.reorder(useBoardStore.getState().selection.ids, 'front')}><BringToFront size={18} /></button>
+        <button className="icon-btn" disabled={!runtime.canEdit || !selected.length} title="Send to back" onClick={() => runtime.commands.reorder(useBoardStore.getState().selection.ids, 'back')}><SendToBack size={18} /></button>
+        <button className="icon-btn" disabled={!runtime.canEdit || !selected.length} title="Move forward" onClick={() => runtime.commands.reorder(useBoardStore.getState().selection.ids, 'forward')}><ChevronUp size={18} /></button>
+        <button className="icon-btn" disabled={!runtime.canEdit || !selected.length} title="Move backward" onClick={() => runtime.commands.reorder(useBoardStore.getState().selection.ids, 'backward')}><ChevronDown size={18} /></button>
+        <button className="icon-btn" disabled={!runtime.canEdit || selected.length < 2} title="Align horizontal centers" onClick={() => runtime.commands.align(useBoardStore.getState().selection.ids, 'horizontal')}><AlignHorizontalJustifyCenter size={18} /></button>
+        <button className="icon-btn" disabled={!runtime.canEdit || selected.length < 2} title="Align vertical centers" onClick={() => runtime.commands.align(useBoardStore.getState().selection.ids, 'vertical')}><AlignVerticalJustifyCenter size={18} /></button>
+        <button className="icon-btn" disabled={!runtime.canEdit || selected.length < 3} title="Distribute horizontally" onClick={() => runtime.commands.distribute(useBoardStore.getState().selection.ids, 'horizontal')}><BetweenHorizontalStart size={18} /></button>
+        <button className="icon-btn" disabled={!runtime.canEdit || selected.length < 3} title="Distribute vertically" onClick={() => runtime.commands.distribute(useBoardStore.getState().selection.ids, 'vertical')}><BetweenVerticalStart size={18} /></button>
         {selectedOne && <StyleControls runtime={runtime} block={selectedOne} />}
         <span className="toolbar-divider" />
-        <button className="icon-btn" title="Zoom out" onClick={() => zoom(state.viewport.scale - 0.1)}><ZoomOut size={18} /></button>
-        <span className="zoom-readout">{Math.round(state.viewport.scale * 100)}%</span>
-        <button className="icon-btn" title="Zoom in" onClick={() => zoom(state.viewport.scale + 0.1)}><ZoomIn size={18} /></button>
+        <button className="icon-btn" title="Zoom out" onClick={() => zoom(scale - 0.1)}><ZoomOut size={18} /></button>
+        <span className="zoom-readout">{Math.round(scale * 100)}%</span>
+        <button className="icon-btn" title="Zoom in" onClick={() => zoom(scale + 0.1)}><ZoomIn size={18} /></button>
         <button className="icon-btn" title="Fit all" onClick={() => fit()}><Maximize2 size={18} /></button>
         <button className="icon-btn" disabled={!selected.length} title="Fit selection" onClick={() => fit(selected)}><Scan size={18} /></button>
-        <button className="icon-btn" title="Reset view" onClick={() => state.setViewport({ x: 80, y: 80, scale: 1 })}><RotateCcw size={18} /></button>
-        <button className="icon-btn danger" disabled={!runtime.canEdit || !selected.length} title="Delete" onClick={() => { runtime.commands.delete(state.selection.ids); state.setSelection([]); }}><Trash2 size={18} /></button>
+        <button className="icon-btn" title="Reset view" onClick={() => useBoardStore.getState().setViewport({ x: 80, y: 80, scale: 1 })}><RotateCcw size={18} /></button>
+        <button className="icon-btn danger" disabled={!runtime.canEdit || !selected.length} title="Delete" onClick={() => { const state = useBoardStore.getState(); runtime.commands.delete(state.selection.ids); state.setSelection([]); }}><Trash2 size={18} /></button>
       </div>
       {upload && <div className={`upload-status ${upload.error ? 'failed' : ''}`}><span>{upload.error || `Uploading ${upload.file.name}: ${upload.progress}%`}</span>{upload.error ? <button onClick={() => chooseFile(upload.file)}>Retry</button> : <button onClick={() => upload.controller.abort()}>Cancel</button>}</div>}
-      {state.connection.error && <div className="toast">{state.connection.error}</div>}
+      {connection.error && <div className="toast">{connection.error}</div>}
     </header>
   );
 
@@ -101,6 +107,7 @@ export function BoardToolbar({ runtime, board, project, onBackProjectID }: { run
     const scale = Math.min(4, Math.max(0.15, next));
     const cx = window.innerWidth / 2;
     const cy = (window.innerHeight - 58) / 2;
+    const state = useBoardStore.getState();
     const world = screenToWorld(cx, cy, state.viewport);
     state.setViewport({ x: cx - world.x * scale, y: cy - world.y * scale, scale });
   }

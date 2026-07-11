@@ -20,7 +20,7 @@ const (
 	MessageCheckpointAck     = "checkpoint_ack"
 	MessageError             = "error"
 
-	ProtocolVersion = 2
+	ProtocolVersion = 3
 
 	defaultCheckpointEvery    = int64(100)
 	defaultCheckpointInterval = 5 * time.Minute
@@ -56,12 +56,13 @@ type Message struct {
 // through Hub.Send or Hub.Broadcast so closing a slow client cannot race a
 // sender.
 type Client struct {
-	ID      string
-	UserID  string
-	BoardID string
-	CanEdit bool
-	Send    chan []byte
-	Done    chan struct{}
+	ID            string
+	UserID        string
+	BoardID       string
+	CanEdit       bool
+	CanCheckpoint bool
+	Send          chan []byte
+	Done          chan struct{}
 
 	closeOnce sync.Once
 
@@ -76,12 +77,13 @@ func NewClient(id, userID, boardID string, canEdit bool, sendBuffer int) *Client
 		sendBuffer = 1
 	}
 	return &Client{
-		ID:      id,
-		UserID:  userID,
-		BoardID: boardID,
-		CanEdit: canEdit,
-		Send:    make(chan []byte, sendBuffer),
-		Done:    make(chan struct{}),
+		ID:            id,
+		UserID:        userID,
+		BoardID:       boardID,
+		CanEdit:       canEdit,
+		CanCheckpoint: canEdit,
+		Send:          make(chan []byte, sendBuffer),
+		Done:          make(chan struct{}),
 	}
 }
 
@@ -422,6 +424,24 @@ func (h *Hub) SetCanEdit(client *Client, canEdit bool) {
 	}
 }
 
+// SetCanCheckpoint limits opaque checkpoint generation to project managers.
+// A downgraded selected writer is replaced without waiting for its timeout.
+func (h *Hub) SetCanCheckpoint(client *Client, canCheckpoint bool) {
+	r := h.getRoom(client.BoardID)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.clients[client]; !ok {
+		return
+	}
+	client.CanCheckpoint = canCheckpoint
+	if !canCheckpoint && r.pending != nil && r.pending.ClientID == client.ID {
+		r.pending = nil
+		if h.checkpointDueLocked(r) {
+			h.requestCheckpointLocked(client.BoardID, r, client.ID)
+		}
+	}
+}
+
 func (h *Hub) checkpointDueLocked(r *room) bool {
 	if r.published <= r.checked {
 		return false
@@ -435,7 +455,7 @@ func (h *Hub) requestCheckpointLocked(boardID string, r *room, excludeClientID s
 	var editor *Client
 	var fallback *Client
 	for client := range r.clients {
-		if !client.CanEdit {
+		if !client.CanEdit || !client.CanCheckpoint {
 			continue
 		}
 		if client.ID == excludeClientID {

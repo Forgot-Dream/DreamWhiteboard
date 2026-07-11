@@ -1,7 +1,7 @@
 import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useNavigate, useParams } from 'react-router-dom';
-import { api, canEdit as canUserEdit, type BoardAccess, type Project, type ProjectMember, type ProjectRole, type User } from '../lib/api';
+import { api, canEdit as canUserEdit, canManage as canUserManage, type BoardAccess, type Project, type ProjectMember, type ProjectRole, type User } from '../lib/api';
 import { BoardToolbar } from '../board/BoardToolbar';
 import { CanvasViewport } from '../board/CanvasViewport';
 import { useBoardKeyboard } from '../board/keyboard';
@@ -45,7 +45,8 @@ export function BoardEditor({ user }: { user: User }) {
 
 function BoardWorkspace({ access, project, role, user }: { access: BoardAccess; project?: Project; role?: ProjectRole; user: User }) {
   const editable = useMemo(() => canUserEdit(role, user, access.permission?.can_edit), [access.permission?.can_edit, role, user]);
-  const runtime = useBoardRuntime(access.board.id, user, editable);
+  const manageable = useMemo(() => access.permission?.can_manage ?? canUserManage(role, user), [access.permission?.can_manage, role, user]);
+  const runtime = useBoardRuntime(access.board.id, access.board.project_id, user, editable, manageable);
   useBoardKeyboard(runtime);
   return (
     <div className="editor-shell">

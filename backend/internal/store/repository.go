@@ -35,6 +35,7 @@ type Repository interface {
 	LoadBoardDocument(boardID string) (domain.BoardDocument, []domain.BoardUpdate, error)
 	AppendBoardUpdate(update domain.BoardUpdate) (domain.BoardUpdate, bool, error)
 	SaveBoardCheckpoint(boardID string, checkpoint []byte, throughSequence int64) (domain.BoardDocument, error)
+	SaveBoardAssetReferences(boardID, indexedBy string, throughSequence int64, assetIDs []string) (domain.BoardAssetReferenceState, error)
 	SaveAsset(asset domain.Asset) (domain.Asset, error)
 	GetAsset(id string) (domain.Asset, error)
 	ListAssetsByProject(projectID string) ([]domain.Asset, error)

@@ -152,6 +152,24 @@ func TestCheckpointPolicyChoosesEditorAndValidatesResponse(t *testing.T) {
 	}
 }
 
+func TestCheckpointPolicySkipsNonManagerEditors(t *testing.T) {
+	hub := NewHub(WithCheckpointPolicy(1, time.Hour))
+	nonManager := NewClient("editor", "user-editor", "board-1", true, 3)
+	nonManager.CanCheckpoint = false
+	manager := NewClient("manager", "user-manager", "board-1", true, 3)
+	joinForTest(t, hub, nonManager)
+	joinForTest(t, hub, manager)
+
+	hub.BroadcastUpdate("board-1", Message{Type: MessageUpdate, ServerSequence: 1}, nil)
+	_ = readMessage(t, nonManager.Send)
+	_ = readMessage(t, manager.Send)
+	request := readMessage(t, manager.Send)
+	if request.Type != MessageCheckpointRequest || request.ThroughSequence != 1 {
+		t.Fatalf("manager did not receive checkpoint request: %#v", request)
+	}
+	assertNoMessage(t, nonManager.Send)
+}
+
 func TestCheckpointTimePolicy(t *testing.T) {
 	now := time.Date(2026, 7, 11, 0, 0, 0, 0, time.UTC)
 	hub := NewHub(

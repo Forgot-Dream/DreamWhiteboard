@@ -8,8 +8,10 @@ DreamWhiteboard is a single-host, self-hosted collaborative whiteboard. The v2 a
 - Project roles (`owner`, `admin`, `editor`, `viewer`) with last-owner protection.
 - Versioned SQL migrations, health/readiness endpoints, structured request logs, request IDs, body limits, login throttling, security headers, and a CORS allowlist.
 - Yjs `Y.Map("blocks")` documents with `text` and `image` block schemas, durable ordered updates, stable update IDs, acknowledgements, automatic reconnect/replay, checkpoints, and Awareness presence.
+- Sequence-bound image reference manifests prevent deletion of assets that are still used by a board; stale or conflicting indexes fail closed.
 - A routed React UI using TanStack Query and Zustand, including multi-select, box select, undo/redo, copy/cut/paste, duplicate, z-ordering, align/distribute, keyboard movement, image upload progress/cancel/retry, and saved per-board viewports.
 - Same-origin Nginx proxying, private API/Postgres networks, container health checks, graceful shutdown, backup/restore verification scripts, CI, dependency updates, vulnerability scans, and tagged image publishing.
+- A transactional Postgres cleanup outbox retries asset-file and project-directory removal across filesystem errors and process restarts.
 
 The collaboration service is intentionally single-instance. There is no Redis fan-out and no refresh-persistent offline editing; unacknowledged edits survive reconnects only while the page remains open.
 
@@ -70,6 +72,24 @@ npm ci
 npm run dev
 ```
 
+Run the Postgres-backed integration tests by pointing them at a disposable database:
+
+```bash
+cd backend
+TEST_DATABASE_URL='postgres://dreamwhiteboard:test-password@localhost:5432/dreamwhiteboard_test?sslmode=disable' \
+go test ./internal/store ./cmd/server -count=1
+```
+
+For the browser suite, start the full Compose stack and then run:
+
+```bash
+cd frontend
+E2E_BASE_URL=http://127.0.0.1:8080 \
+E2E_ADMIN_EMAIL=admin@example.com \
+E2E_ADMIN_PASSWORD='your-bootstrap-password' \
+npm run e2e
+```
+
 ## Data model and migrations
 
 The API applies numbered files from `backend/migrations` before accepting traffic, and refuses readiness when the schema is behind. Each migration records its version in `schema_migrations`.
@@ -79,6 +99,11 @@ Version 2 is a breaking development upgrade. It removes the prototype `board_sna
 - `board_documents`: current Yjs checkpoint and covered server sequence.
 - `board_updates`: ordered opaque Yjs updates plus durable update-ID receipts for idempotent replay.
 - `sessions`: hashed browser sessions and expiration/last-access timestamps.
+
+Later migrations add:
+
+- `storage_cleanup_jobs`: leased, retryable filesystem deletion jobs written in the same transaction as metadata deletion.
+- `board_asset_reference_state` and `board_asset_references`: the last exact, server-sequence-bound asset manifest for each board.
 
 Prototype whiteboard content is not migrated. For a clean development upgrade:
 
@@ -102,7 +127,9 @@ Initial sync is ordered:
 3. Zero or more `update` messages ordered by `server_sequence`.
 4. `sync_complete`.
 
-An editor sends `{type:"update", update_id, data}`. The server persists it before replying with `update_ack` and broadcasting it. `(board_id, update_id)` is unique, so an ACK-lost update can be replayed without applying or broadcasting twice—even after checkpoint compaction.
+An editor sends `{type:"update", update_id, data, reference_base_sequence, asset_ids}`. The manifest is derived from the complete local Yjs document and is covered by the update's idempotency hash. The server persists the opaque update before replying with `update_ack`; a stale manifest never rejects an otherwise independent offline update. Editor declarations cannot authorize deletion by themselves.
+
+After reaching a contiguous server sequence with no pending updates, an owner/admin client reconciles the complete manifest through `PUT /api/boards/:id/asset-references`. A stale sequence is rejected; two different manifests for the same exact sequence mark the index conflicted. Asset deletion fails closed while any project board is stale/conflicted, and returns `asset_in_use` when referenced. Opaque checkpoints are likewise accepted only from project managers; malformed incremental updates are quarantined by clients instead of preventing the board from opening.
 
 Awareness messages carry participant, cursor, viewport, and selection state but are never persisted and do not mark a board as saved. On disconnect, the server immediately broadcasts a removal message. Viewers receive document and awareness traffic, but document updates and checkpoints are rejected.
 
@@ -114,6 +141,7 @@ REST owns authentication and metadata; it never modifies whiteboard content.
 - Projects: `GET/POST /api/projects`, `GET/PATCH/DELETE /api/projects/:id`.
 - Members: `GET/POST /api/projects/:id/members`, `PATCH/DELETE /api/projects/:id/members/:userID`.
 - Boards: `GET/POST /api/projects/:id/boards`, `GET/PATCH/DELETE /api/boards/:id`.
+- Board asset index: `PUT /api/boards/:id/asset-references`.
 - Assets: `POST /api/projects/:id/assets`, `GET/DELETE /api/assets/:id`.
 - Administrators: `GET/POST /api/admin/users`, `PATCH /api/admin/users/:id`, `POST /api/admin/users/:id/password`.
 
@@ -155,6 +183,8 @@ Create a consistent database dump and upload archive:
 deploy/scripts/backup.sh
 ```
 
+The backup command briefly stops the frontend and API so the database dump and upload archive describe the same application state, then restarts both services. Scripts use `deploy/.env` by default; set `DREAMWHITEBOARD_ENV_FILE` to select another Compose environment file.
+
 Verify checksums, archive readability, and an isolated Postgres restore without replacing the live database:
 
 ```bash
@@ -168,6 +198,26 @@ deploy/scripts/restore.sh --confirm deploy/backups/20260101T000000Z
 ```
 
 Keep backups outside the application host and test restoration regularly.
+
+CI performs the same backup, an isolated database verification, a destructive restore into the disposable CI stack, and a browser check that the restored account, Yjs document, and image are usable.
+
+## Versioned images and upgrades
+
+Tags matching `v*` publish `dreamwhiteboard-api` and `dreamwhiteboard-frontend` images to GHCR only after backend, frontend, Postgres, browser, backup/restore, vulnerability, and container gates pass. Pin both services to the same release in `deploy/.env`:
+
+```dotenv
+API_IMAGE=ghcr.io/OWNER/dreamwhiteboard-api:v2.0.0
+FRONTEND_IMAGE=ghcr.io/OWNER/dreamwhiteboard-frontend:v2.0.0
+```
+
+Then deploy without rebuilding source:
+
+```bash
+docker compose -f deploy/docker-compose.yml --env-file deploy/.env pull
+docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d --no-build
+```
+
+Before an upgrade, create and verify a backup. Database migrations are forward-only and run before the API accepts traffic. Rollback therefore means restoring the pre-upgrade backup and pinning the previous pair of image tags; changing only the image tag after a migration is not a safe database rollback.
 
 ## Configuration
 

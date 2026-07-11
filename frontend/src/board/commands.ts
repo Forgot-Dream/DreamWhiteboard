@@ -201,15 +201,17 @@ export class BoardCommands {
   }
 }
 
-export function exportBlocks(blocks: WhiteboardBlock[]) {
-  return JSON.stringify({ type: 'dreamwhiteboard/blocks', version: 1, blocks });
+export function exportBlocks(blocks: WhiteboardBlock[], projectID?: string) {
+  return JSON.stringify({ type: 'dreamwhiteboard/blocks', version: 1, project_id: projectID, blocks });
 }
 
-export function importBlocks(value: string): WhiteboardBlock[] {
+export function importBlocks(value: string, targetProjectID?: string): WhiteboardBlock[] {
   try {
-    const parsed = JSON.parse(value) as { type?: string; version?: number; blocks?: WhiteboardBlock[] };
+    const parsed = JSON.parse(value) as { type?: string; version?: number; project_id?: string; blocks?: WhiteboardBlock[] };
     if (parsed.type !== 'dreamwhiteboard/blocks' || parsed.version !== 1 || !Array.isArray(parsed.blocks)) return [];
-    return parsed.blocks.filter(validBlock);
+    return parsed.blocks.filter((block) => validBlock(block) && (
+      block.type !== 'image' || !targetProjectID || parsed.project_id === targetProjectID
+    ));
   } catch {
     return [];
   }

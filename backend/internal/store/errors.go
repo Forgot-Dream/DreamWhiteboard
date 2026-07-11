@@ -12,4 +12,8 @@ var (
 	ErrLastSystemAdmin           = errors.New("cannot demote the last system administrator")
 	ErrInvalidCheckpointSequence = errors.New("invalid checkpoint sequence")
 	ErrUpdateIDConflict          = errors.New("update id was already used for different content")
+	ErrInvalidAssetReference     = errors.New("asset reference is invalid for this board")
+	ErrAssetReferenceIndexStale  = errors.New("asset reference index is stale")
+	ErrAssetReferenceConflict    = errors.New("asset reference index is conflicted")
+	ErrAssetInUse                = errors.New("asset is referenced by a board")
 )

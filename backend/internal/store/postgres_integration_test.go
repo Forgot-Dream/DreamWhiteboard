@@ -34,10 +34,27 @@ func TestPostgresMigrationsAndReadinessIntegration(t *testing.T) {
 	}
 	if err := legacy.Ready(context.Background()); err == nil || !strings.Contains(err.Error(), "incomplete or incompatible") {
 		_ = legacy.Close()
-		t.Fatalf("schema version 1 should not be ready for v2, got %v", err)
+		t.Fatalf("schema version 1 should not be ready for the latest server, got %v", err)
 	}
 	if err := legacy.Close(); err != nil {
 		t.Fatalf("close legacy store: %v", err)
+	}
+
+	applyPostgresTestMigrations(t, databaseURL, LatestSchemaVersion-1)
+	preReferenceDB, err := sql.Open("postgres", databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := preReferenceDB.Exec(`
+		INSERT INTO users (id,email,name,system_role,password_hash) VALUES ('legacy-user','legacy@example.test','Legacy','user','hash');
+		INSERT INTO projects (id,name,description,created_by) VALUES ('legacy-project','Legacy','', 'legacy-user');
+		INSERT INTO boards (id,project_id,name,created_by) VALUES ('legacy-board','legacy-project','Legacy board','legacy-user');
+		INSERT INTO board_documents (board_id) VALUES ('legacy-board')`); err != nil {
+		_ = preReferenceDB.Close()
+		t.Fatalf("seed pre-reference board: %v", err)
+	}
+	if err := preReferenceDB.Close(); err != nil {
+		t.Fatal(err)
 	}
 
 	applyPostgresTestMigrations(t, databaseURL, LatestSchemaVersion)
@@ -64,8 +81,18 @@ func TestPostgresMigrationsAndReadinessIntegration(t *testing.T) {
 	assertPostgresRelationExists(t, repo.db, schema, "sessions", true)
 	assertPostgresRelationExists(t, repo.db, schema, "board_documents", true)
 	assertPostgresRelationExists(t, repo.db, schema, "board_updates", true)
+	assertPostgresRelationExists(t, repo.db, schema, "storage_cleanup_jobs", true)
+	assertPostgresRelationExists(t, repo.db, schema, "board_asset_reference_state", true)
+	assertPostgresRelationExists(t, repo.db, schema, "board_asset_references", true)
 	assertPostgresRelationExists(t, repo.db, schema, "board_operations", false)
 	assertPostgresRelationExists(t, repo.db, schema, "board_snapshots", false)
+	var legacyIndexedThrough int64
+	if err := repo.db.QueryRow(`SELECT indexed_through_sequence FROM board_asset_reference_state WHERE board_id='legacy-board'`).Scan(&legacyIndexedThrough); err != nil {
+		t.Fatalf("read migrated legacy board reference state: %v", err)
+	}
+	if legacyIndexedThrough != -1 {
+		t.Fatalf("legacy board indexed_through_sequence = %d, want -1", legacyIndexedThrough)
+	}
 	if _, err := repo.db.Exec(`UPDATE schema_migrations SET checksum='tampered' WHERE version=$1`, LatestSchemaVersion); err != nil {
 		t.Fatalf("tamper migration checksum: %v", err)
 	}
@@ -407,6 +434,120 @@ func TestPostgresAssetMetadataAndProjectCascadeIntegration(t *testing.T) {
 	}
 	if _, err := repo.GetUser(user.ID); err != nil {
 		t.Fatal("project deletion should not delete its creator")
+	}
+}
+
+func TestPostgresStorageCleanupOutboxIntegration(t *testing.T) {
+	repo, _ := newMigratedPostgresTestStore(t)
+	user := createPostgresTestUser(t, repo, "cleanup-outbox")
+	project, err := repo.CreateProject("Cleanup outbox", "", user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	asset, err := repo.SaveAsset(domain.Asset{
+		ProjectID:   project.ID,
+		UploadedBy:  user.ID,
+		FileName:    "outbox.png",
+		ContentType: "image/png",
+		StorageKey:  "outbox.png",
+		SHA256:      strings.Repeat("b", 64),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := repo.db.Exec(`ALTER TABLE storage_cleanup_jobs
+		ADD CONSTRAINT storage_cleanup_jobs_reject_test CHECK (id < 0) NOT VALID`); err != nil {
+		t.Fatalf("install cleanup enqueue failure: %v", err)
+	}
+	if err := repo.DeleteAsset(asset.ID); err == nil {
+		t.Fatal("asset deletion succeeded even though cleanup intent could not be persisted")
+	}
+	if _, err := repo.GetAsset(asset.ID); err != nil {
+		t.Fatalf("failed cleanup enqueue should roll back metadata deletion: %v", err)
+	}
+	if _, err := repo.db.Exec(`ALTER TABLE storage_cleanup_jobs DROP CONSTRAINT storage_cleanup_jobs_reject_test`); err != nil {
+		t.Fatalf("remove cleanup enqueue failure: %v", err)
+	}
+
+	if err := repo.DeleteAsset(asset.ID); err != nil {
+		t.Fatalf("delete asset with cleanup outbox: %v", err)
+	}
+	if _, err := repo.GetAsset(asset.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("asset metadata survived committed deletion: %v", err)
+	}
+	var kind StorageCleanupKind
+	var queuedProject, targetKey string
+	if err := repo.db.QueryRow(`SELECT kind, project_id, target_key
+		FROM storage_cleanup_jobs WHERE project_id=$1`, project.ID).Scan(&kind, &queuedProject, &targetKey); err != nil {
+		t.Fatalf("read asset cleanup intent: %v", err)
+	}
+	if kind != StorageCleanupAssetFile || queuedProject != project.ID || targetKey != asset.StorageKey {
+		t.Fatalf("unexpected asset cleanup intent: kind=%q project=%q target=%q", kind, queuedProject, targetKey)
+	}
+
+	now := time.Now().UTC().Add(time.Second)
+	leaseUntil := now.Add(time.Minute)
+	claimed, err := repo.ClaimStorageCleanupJobs(context.Background(), "postgres-lease-one", now, leaseUntil, 10)
+	if err != nil || len(claimed) != 1 || claimed[0].AttemptCount != 1 {
+		t.Fatalf("claim asset cleanup intent: jobs=%#v err=%v", claimed, err)
+	}
+	if duplicate, err := repo.ClaimStorageCleanupJobs(context.Background(), "postgres-other-worker", now, leaseUntil, 10); err != nil || len(duplicate) != 0 {
+		t.Fatalf("active PostgreSQL lease was claimed twice: jobs=%#v err=%v", duplicate, err)
+	}
+	reclaimAt := leaseUntil.Add(time.Second)
+	reclaimed, err := repo.ClaimStorageCleanupJobs(context.Background(), "postgres-lease-two", reclaimAt, reclaimAt.Add(time.Minute), 10)
+	if err != nil || len(reclaimed) != 1 || reclaimed[0].AttemptCount != 2 {
+		t.Fatalf("reclaim expired PostgreSQL lease: jobs=%#v err=%v", reclaimed, err)
+	}
+	if completed, err := repo.CompleteStorageCleanupJob(context.Background(), claimed[0].ID, "postgres-lease-one"); err != nil || completed {
+		t.Fatalf("stale PostgreSQL lease completed job: completed=%v err=%v", completed, err)
+	}
+	retryAt := reclaimAt.Add(10 * time.Minute)
+	if retried, err := repo.RetryStorageCleanupJob(context.Background(), reclaimed[0].ID, "postgres-lease-two", retryAt, "permission denied"); err != nil || !retried {
+		t.Fatalf("retry reclaimed PostgreSQL job: retried=%v err=%v", retried, err)
+	}
+	if early, err := repo.ClaimStorageCleanupJobs(context.Background(), "postgres-lease-three", retryAt.Add(-time.Second), retryAt.Add(time.Minute), 10); err != nil || len(early) != 0 {
+		t.Fatalf("PostgreSQL job was available before retry time: jobs=%#v err=%v", early, err)
+	}
+	finalClaim, err := repo.ClaimStorageCleanupJobs(context.Background(), "postgres-lease-three", retryAt, retryAt.Add(time.Minute), 10)
+	if err != nil || len(finalClaim) != 1 || finalClaim[0].AttemptCount != 3 || finalClaim[0].LastError != "permission denied" {
+		t.Fatalf("claim retried PostgreSQL job: jobs=%#v err=%v", finalClaim, err)
+	}
+	if completed, err := repo.CompleteStorageCleanupJob(context.Background(), finalClaim[0].ID, "postgres-lease-three"); err != nil || !completed {
+		t.Fatalf("complete reclaimed PostgreSQL job: completed=%v err=%v", completed, err)
+	}
+
+	projectWithAssets, err := repo.CreateProject("Project cleanup", "", user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectAsset, err := repo.SaveAsset(domain.Asset{
+		ProjectID:   projectWithAssets.ID,
+		UploadedBy:  user.ID,
+		FileName:    "nested.png",
+		ContentType: "image/png",
+		StorageKey:  "nested.png",
+		SHA256:      strings.Repeat("c", 64),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.DeleteProject(projectWithAssets.ID); err != nil {
+		t.Fatalf("delete project with cleanup outbox: %v", err)
+	}
+	if _, err := repo.GetAsset(projectAsset.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("project asset metadata survived cascade: %v", err)
+	}
+	var directoryJobs, fileJobs int
+	if err := repo.db.QueryRow(`SELECT
+		COUNT(*) FILTER (WHERE kind='project_dir'),
+		COUNT(*) FILTER (WHERE kind='asset_file')
+		FROM storage_cleanup_jobs WHERE project_id=$1`, projectWithAssets.ID).Scan(&directoryJobs, &fileJobs); err != nil {
+		t.Fatalf("inspect project cleanup intents: %v", err)
+	}
+	if directoryJobs != 1 || fileJobs != 0 {
+		t.Fatalf("project deletion queued directory=%d file=%d jobs, want 1 and 0", directoryJobs, fileJobs)
 	}
 }
 

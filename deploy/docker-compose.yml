@@ -19,6 +19,7 @@ services:
     networks: [backend]
 
   api:
+    image: ${API_IMAGE:-dreamwhiteboard-api}
     build:
       context: ../backend
     environment:
@@ -55,6 +56,7 @@ services:
     networks: [backend]
 
   frontend:
+    image: ${FRONTEND_IMAGE:-dreamwhiteboard-frontend}
     build:
       context: ../frontend
     ports:

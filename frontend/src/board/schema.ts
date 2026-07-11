@@ -151,6 +151,17 @@ export function readBlocks(doc: Y.Doc) {
   return result.sort((a, b) => a.z - b.z || a.id.localeCompare(b.id));
 }
 
+export function referencedAssetIDs(doc: Y.Doc) {
+  const references = new Set<string>();
+  blocksMap(doc).forEach((value) => {
+    if (!(value instanceof Y.Map) || value.get('type') !== 'image') return;
+    const image = value.get('image');
+    const assetID = image instanceof Y.Map ? image.get('asset_id') : undefined;
+    if (typeof assetID === 'string' && assetID) references.add(assetID);
+  });
+  return Array.from(references).sort();
+}
+
 export function blockBounds(blocks: WhiteboardBlock[]): Rect | null {
   if (blocks.length === 0) return null;
   const left = Math.min(...blocks.map((block) => block.x));

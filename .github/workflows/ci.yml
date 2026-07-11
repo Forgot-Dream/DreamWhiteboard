@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [master, "codex/**"]
+    tags: ["v*"]
   pull_request:
 
 permissions:
@@ -111,6 +112,28 @@ jobs:
           E2E_BASE_URL: http://127.0.0.1:8080
           E2E_ADMIN_EMAIL: admin@example.com
           E2E_ADMIN_PASSWORD: replace-with-a-unique-12+-character-password
+      - name: Verify backup and isolated restore
+        env:
+          DREAMWHITEBOARD_ENV_FILE: ${{ github.workspace }}/deploy/.env.example
+        run: |
+          backup_dir="${RUNNER_TEMP}/dreamwhiteboard-backup"
+          deploy/scripts/backup.sh "$backup_dir"
+          deploy/scripts/verify-backup.sh "$backup_dir"
+          compose() {
+            docker compose -f deploy/docker-compose.yml --env-file deploy/.env.example "$@"
+          }
+          compose stop frontend api
+          compose exec -T postgres sh -c 'psql --set=ON_ERROR_STOP=1 --username="$POSTGRES_USER" --dbname="$POSTGRES_DB" --command="DROP SCHEMA public CASCADE; CREATE SCHEMA public;"'
+          compose run --rm --no-deps -T api sh -c 'find /app/uploads -mindepth 1 -delete'
+          deploy/scripts/restore.sh --confirm "$backup_dir"
+      - name: Verify application state after restore
+        run: npx playwright test recovery.spec.ts
+        working-directory: frontend
+        env:
+          E2E_BASE_URL: http://127.0.0.1:8080
+          E2E_ADMIN_EMAIL: admin@example.com
+          E2E_ADMIN_PASSWORD: Admin-private-password-2026!
+          E2E_RECOVERY: "1"
       - name: Collect service logs
         if: failure()
         run: docker compose -f deploy/docker-compose.yml --env-file deploy/.env.example logs --no-color
@@ -140,3 +163,124 @@ jobs:
           cache-dependency-path: backend/go.sum
       - run: go install golang.org/x/vuln/cmd/govulncheck@latest
       - run: govulncheck ./...
+
+  release-candidates:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [backend, frontend, containers, e2e, go-vulnerability-scan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: api
+            context: backend
+          - name: frontend
+            context: frontend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/dreamwhiteboard-${{ matrix.name }}
+          tags: |
+            type=ref,event=tag
+            type=sha
+      - id: candidate
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/dreamwhiteboard-${{ matrix.name }}
+          tags: type=raw,value=candidate-${{ github.run_id }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: true
+          tags: ${{ steps.candidate.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+      - name: Scan exact release candidate
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ steps.candidate.outputs.tags }}@${{ steps.build.outputs.digest }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: 1
+      - name: Record scanned candidate digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p release-digests
+          printf '%s\n' "$DIGEST" > "release-digests/${{ matrix.name }}.txt"
+      - name: Upload scanned candidate digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-digest-${{ matrix.name }}
+          path: release-digests/${{ matrix.name }}.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  release-images:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [release-candidates]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download scanned candidate digests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-digest-*
+          path: release-digests
+          merge-multiple: true
+      - id: api-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/dreamwhiteboard-api
+          tags: |
+            type=ref,event=tag
+            type=sha
+      - id: frontend-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/dreamwhiteboard-frontend
+          tags: |
+            type=ref,event=tag
+            type=sha
+      - name: Promote both scanned digests to release tags
+        env:
+          API_TAGS: ${{ steps.api-meta.outputs.tags }}
+          FRONTEND_TAGS: ${{ steps.frontend-meta.outputs.tags }}
+        run: |
+          promote() {
+            digest_file=$1
+            final_tags=$2
+            digest=$(tr -d '\r\n' < "$digest_file")
+            first_tag=$(printf '%s\n' "$final_tags" | sed -n '1p')
+            repository=${first_tag%:*}
+            test -n "$digest"
+            test -n "$repository"
+            for tag in $final_tags; do
+              docker buildx imagetools create --tag "$tag" "$repository@$digest"
+            done
+          }
+
+          promote release-digests/api.txt "$API_TAGS"
+          promote release-digests/frontend.txt "$FRONTEND_TAGS"
