@@ -65,7 +65,7 @@ services:
       api:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost/frontend-healthz"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/frontend-healthz"]
       interval: 10s
       timeout: 3s
       retries: 10

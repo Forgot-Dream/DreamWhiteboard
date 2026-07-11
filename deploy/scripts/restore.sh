@@ -41,7 +41,7 @@ compose run --rm --no-deps -T api sh -c '
 compose up -d api frontend
 
 attempt=0
-until compose exec -T frontend wget -qO- http://localhost/readyz >/dev/null 2>&1; do
+until compose exec -T frontend wget -qO- http://127.0.0.1/readyz >/dev/null 2>&1; do
   attempt=$((attempt + 1))
   if [ "$attempt" -ge 30 ]; then
     echo "Restore completed, but readiness did not recover in time." >&2
