@@ -47,8 +47,10 @@ test('admin setup, dual-session collaboration, reconnect, viewer permissions, an
   await editor.locator('.board-open', { hasText: boardName }).click();
   await expect(editor.locator('.title-block')).toContainText('synced');
   await editor.getByTitle('Text').click();
+  await expect(editor.getByTitle('Text')).toHaveClass(/selected/);
   await editor.locator('.canvas').click({ position: { x: 420, y: 260 } });
   const editorText = editor.locator('.block-text textarea').first();
+  await expect(editorText).toBeVisible({ timeout: 10_000 });
   await editorText.fill('shared seed');
   await editor.keyboard.press('Escape');
   await expect(editor.locator('.title-block')).toContainText('synced');

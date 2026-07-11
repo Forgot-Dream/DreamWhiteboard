@@ -28,10 +28,10 @@ jobs:
     env:
       TEST_DATABASE_URL: postgres://dreamwhiteboard:test-password-only@localhost:5432/dreamwhiteboard_test?sslmode=disable
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
-          go-version-file: backend/go.mod
+          go-version: 1.26.5
           cache-dependency-path: backend/go.sum
       - run: test -z "$(gofmt -l .)"
       - run: go vet ./...
@@ -44,8 +44,8 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -60,20 +60,20 @@ jobs:
     runs-on: ubuntu-latest
     needs: [backend, frontend]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Validate Compose
         run: docker compose -f deploy/docker-compose.yml --env-file deploy/.env.example config >/dev/null
       - name: Build images
         run: docker compose -f deploy/docker-compose.yml --env-file deploy/.env.example build
       - name: Scan backend image
-        uses: aquasecurity/trivy-action@0.30.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: dreamwhiteboard-api
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: 1
       - name: Scan frontend image
-        uses: aquasecurity/trivy-action@0.30.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: dreamwhiteboard-frontend
           severity: HIGH,CRITICAL
@@ -84,8 +84,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [backend, frontend]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -114,6 +114,15 @@ jobs:
       - name: Collect service logs
         if: failure()
         run: docker compose -f deploy/docker-compose.yml --env-file deploy/.env.example logs --no-color
+      - name: Upload Playwright diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-diagnostics
+          path: |
+            frontend/test-results
+            frontend/playwright-report
+          if-no-files-found: ignore
       - name: Stop stack
         if: always()
         run: docker compose -f deploy/docker-compose.yml --env-file deploy/.env.example down -v
@@ -124,10 +133,10 @@ jobs:
       run:
         working-directory: backend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
         with:
-          go-version-file: backend/go.mod
+          go-version: 1.26.5
           cache-dependency-path: backend/go.sum
       - run: go install golang.org/x/vuln/cmd/govulncheck@latest
       - run: govulncheck ./...

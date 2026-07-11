@@ -51,6 +51,10 @@ export function CanvasViewport({ runtime }: { runtime: BoardRuntime }) {
 
   function pointerDownCanvas(event: ReactPointerEvent<HTMLDivElement>) {
     if (event.button !== 0 && event.button !== 1) return;
+    // Creating an auto-focused textarea during pointerdown must suppress the
+    // browser's later background-focus default, otherwise the new empty block
+    // immediately blurs and is removed before the user can type.
+    event.preventDefault();
     const screen = localPoint(event);
     const world = toWorld(screen, viewport);
     if (event.button === 1 || tool === 'pan') {
