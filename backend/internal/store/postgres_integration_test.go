@@ -103,6 +103,16 @@ func TestPostgresMigrationsAndReadinessIntegration(t *testing.T) {
 	assertPostgresRelationExists(t, repo.db, schema, "asset_gc_candidates", true)
 	assertPostgresRelationExists(t, repo.db, schema, "asset_gc_candidates_due_idx", true)
 	assertPostgresRelationExists(t, repo.db, schema, "asset_gc_candidates_project_idx", true)
+	assertPostgresRelationExists(t, repo.db, schema, "board_updates_compacted_receipts_expiry_idx", true)
+	var receiptIndexDefinition string
+	if err := repo.db.QueryRow(`SELECT indexdef FROM pg_indexes
+		WHERE schemaname=$1 AND indexname='board_updates_compacted_receipts_expiry_idx'`, schema).Scan(&receiptIndexDefinition); err != nil {
+		t.Fatalf("inspect compacted receipt expiry index: %v", err)
+	}
+	if !strings.Contains(receiptIndexDefinition, "(compacted_at, board_id, server_sequence)") ||
+		!strings.Contains(receiptIndexDefinition, "WHERE (compacted_at IS NOT NULL)") {
+		t.Fatalf("unexpected compacted receipt expiry index: %s", receiptIndexDefinition)
+	}
 	assertPostgresRelationExists(t, repo.db, schema, "boards_project_id_idx", true)
 	assertPostgresRelationExists(t, repo.db, schema, "board_operations", false)
 	assertPostgresRelationExists(t, repo.db, schema, "board_snapshots", false)

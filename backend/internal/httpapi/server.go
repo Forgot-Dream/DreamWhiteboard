@@ -61,6 +61,7 @@ type Server struct {
 	config      Config
 	logger      *slog.Logger
 	login       *loginLimiter
+	awareness   *awarenessRegistry
 	startupErr  error
 	wsHandlers  sync.WaitGroup
 	wsLifecycle sync.Mutex
@@ -82,6 +83,7 @@ func NewServerWithConfig(repo store.Repository, cfg Config) *Server {
 		config:    cfg,
 		logger:    cfg.Logger,
 		login:     newLoginLimiter(cfg.LoginLimit, cfg.LoginWindow),
+		awareness: newAwarenessRegistry(),
 	}
 	if err := os.MkdirAll(cfg.UploadDir, 0o750); err != nil {
 		s.startupErr = err
@@ -277,6 +279,20 @@ func (s *Server) canViewProject(user domain.User, projectID string) (bool, error
 		return false, nil
 	}
 	return err == nil, err
+}
+
+func (s *Server) projectPermissions(user domain.User, projectID string) (bool, bool, bool, error) {
+	if user.SystemRole == domain.SystemAdmin {
+		return true, true, true, nil
+	}
+	role, err := s.repo.MemberRole(projectID, user.ID)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, false, false, nil
+	}
+	if err != nil {
+		return false, false, false, err
+	}
+	return true, domain.CanEdit(role), domain.CanManageMembers(role), nil
 }
 
 func (s *Server) canEditProject(user domain.User, projectID string) (bool, error) {

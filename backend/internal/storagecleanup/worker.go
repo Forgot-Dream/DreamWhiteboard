@@ -16,45 +16,52 @@ import (
 )
 
 type Config struct {
-	UploadDir        string
-	Interval         time.Duration
-	Lease            time.Duration
-	MinBackoff       time.Duration
-	MaxBackoff       time.Duration
-	BatchSize        int
-	AssetGCInterval  time.Duration
-	AssetGCGrace     time.Duration
-	AssetGCBatchSize int
-	Logger           *slog.Logger
-	Now              func() time.Time
-	RemoveFile       func(string) error
-	RemoveAll        func(string) error
-	NewLeaseToken    func() (string, error)
+	UploadDir              string
+	Interval               time.Duration
+	Lease                  time.Duration
+	MinBackoff             time.Duration
+	MaxBackoff             time.Duration
+	BatchSize              int
+	AssetGCInterval        time.Duration
+	AssetGCGrace           time.Duration
+	AssetGCBatchSize       int
+	UpdateReceiptRetention time.Duration
+	UpdateReceiptInterval  time.Duration
+	UpdateReceiptBatchSize int
+	Logger                 *slog.Logger
+	Now                    func() time.Time
+	RemoveFile             func(string) error
+	RemoveAll              func(string) error
+	NewLeaseToken          func() (string, error)
 }
 
 func DefaultConfig(uploadDir string) Config {
 	return Config{
-		UploadDir:        uploadDir,
-		Interval:         5 * time.Second,
-		Lease:            2 * time.Minute,
-		MinBackoff:       5 * time.Second,
-		MaxBackoff:       time.Hour,
-		BatchSize:        32,
-		AssetGCInterval:  10 * time.Minute,
-		AssetGCGrace:     7 * 24 * time.Hour,
-		AssetGCBatchSize: 100,
-		Logger:           slog.Default(),
-		Now:              time.Now,
-		RemoveFile:       os.Remove,
-		RemoveAll:        os.RemoveAll,
-		NewLeaseToken:    randomToken,
+		UploadDir:              uploadDir,
+		Interval:               5 * time.Second,
+		Lease:                  2 * time.Minute,
+		MinBackoff:             5 * time.Second,
+		MaxBackoff:             time.Hour,
+		BatchSize:              32,
+		AssetGCInterval:        10 * time.Minute,
+		AssetGCGrace:           7 * 24 * time.Hour,
+		AssetGCBatchSize:       100,
+		UpdateReceiptRetention: 30 * 24 * time.Hour,
+		UpdateReceiptInterval:  time.Hour,
+		UpdateReceiptBatchSize: 1000,
+		Logger:                 slog.Default(),
+		Now:                    time.Now,
+		RemoveFile:             os.Remove,
+		RemoveAll:              os.RemoveAll,
+		NewLeaseToken:          randomToken,
 	}
 }
 
 type Worker struct {
-	repository       store.StorageMaintenance
-	config           Config
-	nextAssetGCSweep time.Time
+	repository             store.StorageMaintenance
+	config                 Config
+	nextAssetGCSweep       time.Time
+	nextUpdateReceiptPrune time.Time
 }
 
 func New(repository store.StorageMaintenance, cfg Config) (*Worker, error) {
@@ -91,6 +98,18 @@ func New(repository store.StorageMaintenance, cfg Config) (*Worker, error) {
 	}
 	if cfg.AssetGCBatchSize <= 0 {
 		cfg.AssetGCBatchSize = defaults.AssetGCBatchSize
+	}
+	if cfg.UpdateReceiptRetention <= 0 {
+		cfg.UpdateReceiptRetention = defaults.UpdateReceiptRetention
+	}
+	if cfg.UpdateReceiptInterval <= 0 {
+		cfg.UpdateReceiptInterval = defaults.UpdateReceiptInterval
+	}
+	if cfg.UpdateReceiptBatchSize <= 0 {
+		cfg.UpdateReceiptBatchSize = defaults.UpdateReceiptBatchSize
+	}
+	if cfg.UpdateReceiptBatchSize > store.MaxBoardUpdateReceiptPruneBatchSize {
+		cfg.UpdateReceiptBatchSize = store.MaxBoardUpdateReceiptPruneBatchSize
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = defaults.Logger
@@ -137,11 +156,11 @@ func (w *Worker) processAndLog(ctx context.Context) {
 
 func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 	now := w.config.Now().UTC()
-	var sweepErr error
+	var maintenanceErr error
 	if w.nextAssetGCSweep.IsZero() || !now.Before(w.nextAssetGCSweep) {
 		deleted, err := w.repository.SweepOrphanedAssets(ctx, now, w.config.AssetGCGrace, w.config.AssetGCBatchSize)
 		if err != nil {
-			sweepErr = fmt.Errorf("sweep orphaned assets: %w", err)
+			maintenanceErr = errors.Join(maintenanceErr, fmt.Errorf("sweep orphaned assets: %w", err))
 		} else {
 			w.nextAssetGCSweep = now.Add(w.config.AssetGCInterval)
 			if deleted > 0 {
@@ -149,24 +168,45 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 			}
 		}
 	}
+	if w.nextUpdateReceiptPrune.IsZero() || !now.Before(w.nextUpdateReceiptPrune) {
+		pruned, err := w.repository.PruneCompactedBoardUpdateReceipts(
+			ctx,
+			now.Add(-w.config.UpdateReceiptRetention),
+			w.config.UpdateReceiptBatchSize,
+		)
+		if err != nil {
+			maintenanceErr = errors.Join(maintenanceErr, fmt.Errorf("prune compacted board update receipts: %w", err))
+		} else {
+			if pruned >= w.config.UpdateReceiptBatchSize {
+				// Drain an overdue backlog in bounded transactions on subsequent
+				// worker ticks instead of waiting another full interval.
+				w.nextUpdateReceiptPrune = now
+			} else {
+				w.nextUpdateReceiptPrune = now.Add(w.config.UpdateReceiptInterval)
+			}
+			if pruned > 0 {
+				w.config.Logger.Info("pruned compacted board update receipts", "count", pruned)
+			}
+		}
+	}
 	token, err := w.config.NewLeaseToken()
 	if err != nil {
-		return 0, errors.Join(sweepErr, fmt.Errorf("create cleanup lease token: %w", err))
+		return 0, errors.Join(maintenanceErr, fmt.Errorf("create cleanup lease token: %w", err))
 	}
 	jobs, err := w.repository.ClaimStorageCleanupJobs(ctx, token, now, now.Add(w.config.Lease), w.config.BatchSize)
 	if err != nil {
-		return 0, errors.Join(sweepErr, fmt.Errorf("claim cleanup jobs: %w", err))
+		return 0, errors.Join(maintenanceErr, fmt.Errorf("claim cleanup jobs: %w", err))
 	}
 	processed := 0
 	for _, job := range jobs {
 		if err := ctx.Err(); err != nil {
-			return processed, errors.Join(sweepErr, err)
+			return processed, errors.Join(maintenanceErr, err)
 		}
 		removeErr := w.remove(job)
 		if removeErr == nil || errors.Is(removeErr, os.ErrNotExist) {
 			completed, err := w.repository.CompleteStorageCleanupJob(ctx, job.ID, token)
 			if err != nil {
-				return processed, errors.Join(sweepErr, fmt.Errorf("complete cleanup job %d: %w", job.ID, err))
+				return processed, errors.Join(maintenanceErr, fmt.Errorf("complete cleanup job %d: %w", job.ID, err))
 			}
 			if completed {
 				processed++
@@ -179,7 +219,7 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 		nextAttempt := w.config.Now().UTC().Add(w.backoff(job.AttemptCount))
 		retried, err := w.repository.RetryStorageCleanupJob(ctx, job.ID, token, nextAttempt, removeErr.Error())
 		if err != nil {
-			return processed, errors.Join(sweepErr, fmt.Errorf("retry cleanup job %d: %w", job.ID, err))
+			return processed, errors.Join(maintenanceErr, fmt.Errorf("retry cleanup job %d: %w", job.ID, err))
 		}
 		if retried {
 			processed++
@@ -195,7 +235,7 @@ func (w *Worker) RunOnce(ctx context.Context) (int, error) {
 			w.config.Logger.Warn("storage cleanup lease was lost before retry", "job_id", job.ID)
 		}
 	}
-	return processed, sweepErr
+	return processed, maintenanceErr
 }
 
 func (w *Worker) remove(job store.StorageCleanupJob) error {

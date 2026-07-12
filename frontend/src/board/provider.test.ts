@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
+import { Awareness, encodeAwarenessUpdate } from 'y-protocols/awareness';
 import { BoardCommands } from './commands';
 import { BoardProvider, COLLABORATION_PROTOCOL_VERSION } from './provider';
 
@@ -33,10 +34,10 @@ class FakeWebSocket {
 
   send(value: string) { this.sent.push(value); }
 
-  close() {
+  close(code = 1000, reason = '') {
     if (this.readyState === FakeWebSocket.CLOSED) return;
     this.readyState = FakeWebSocket.CLOSED;
-    this.onclose?.(new CloseEvent('close'));
+    this.onclose?.(new CloseEvent('close', { code, reason }));
   }
 }
 
@@ -91,21 +92,153 @@ describe('BoardProvider', () => {
     provider.stop();
   });
 
-  it('requires the collaboration protocol v4 handshake', () => {
+  it('backs off connections that close before sync and resets the delay after a successful sync', async () => {
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+    const provider = createProvider(new Y.Doc(), true, () => undefined);
+    provider.start();
+    const first = FakeWebSocket.instances[0];
+    first.open();
+    first.close();
+
+    await vi.advanceTimersByTimeAsync(499);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    const second = FakeWebSocket.instances[1];
+    second.open();
+    second.close();
+
+    await vi.advanceTimersByTimeAsync(999);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(1);
+    const third = FakeWebSocket.instances[2];
+    third.open();
+    sendSyncStart(third, true);
+    third.receive({ type: 'sync_complete', server_sequence: 0 });
+    third.close();
+
+    await vi.advanceTimersByTimeAsync(499);
+    expect(FakeWebSocket.instances).toHaveLength(3);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(FakeWebSocket.instances).toHaveLength(4);
+    provider.stop();
+    random.mockRestore();
+  });
+
+  it.each([
+    { status: 401, expectedError: 'access to this board was revoked' },
+    { status: 403, expectedError: 'access to this board was revoked' },
+    { status: 404, expectedError: 'deleted or is no longer available' }
+  ])('terminates reconnects when the board probe returns $status', async ({ status, expectedError }) => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+      error: { code: status === 404 ? 'not_found' : 'forbidden', message: 'probe rejected' }
+    }), {
+      status,
+      headers: { 'Content-Type': 'application/json' }
+    }));
     const errors: string[] = [];
-    const permissions: boolean[] = [];
+    const provider = createProvider(new Y.Doc(), true, () => undefined, {
+      onError: (message) => errors.push(message)
+    });
+    provider.start();
+    FakeWebSocket.instances[0].close();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(fetch).toHaveBeenCalledWith('/api/boards/board-1', expect.objectContaining({ credentials: 'include' }));
+    expect(errors[errors.length - 1]).toContain(expectedError);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    provider.stop();
+  });
+
+  it.each(['network', 'server', 'rate-limit'])('reconnects after a transient %s board-probe failure', async (failure) => {
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+    if (failure === 'network') {
+      vi.mocked(fetch).mockRejectedValueOnce(new TypeError('offline'));
+    } else {
+      const status = failure === 'rate-limit' ? 429 : 503;
+      vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+        error: { code: failure === 'rate-limit' ? 'rate_limited' : 'service_unavailable', message: 'try again' }
+      }), {
+        status,
+        headers: { 'Content-Type': 'application/json' }
+      }));
+    }
+    const provider = createProvider(new Y.Doc(), true, () => undefined);
+    provider.start();
+    FakeWebSocket.instances[0].close();
+    await vi.advanceTimersByTimeAsync(0);
+
+    await vi.advanceTimersByTimeAsync(499);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    provider.stop();
+    random.mockRestore();
+  });
+
+  it('times out a stalled board probe and resumes reconnect backoff', async () => {
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+    vi.mocked(fetch).mockImplementationOnce((_input, init) => new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal;
+      const abort = () => reject(new DOMException('probe timed out', 'AbortError'));
+      if (signal?.aborted) abort();
+      else signal?.addEventListener('abort', abort, { once: true });
+    }));
+    const provider = createProvider(new Y.Doc(), true, () => undefined);
+    provider.start();
+    FakeWebSocket.instances[0].close();
+
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(499);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    provider.stop();
+    random.mockRestore();
+  });
+
+  it('ignores a delayed board-probe result after a newer socket starts', async () => {
+    let resolveProbe: ((response: Response) => void) | undefined;
+    vi.mocked(fetch).mockImplementationOnce(() => new Promise<Response>((resolve) => { resolveProbe = resolve; }));
+    const errors: string[] = [];
+    const provider = createProvider(new Y.Doc(), true, () => undefined, {
+      onError: (message) => errors.push(message)
+    });
+    provider.start();
+    FakeWebSocket.instances[0].close();
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    provider.start();
+    const current = FakeWebSocket.instances[1];
+    current.open();
+    resolveProbe?.(new Response(JSON.stringify({ error: { code: 'forbidden', message: 'stale' } }), {
+      status: 403,
+      headers: { 'Content-Type': 'application/json' }
+    }));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(current.readyState).toBe(FakeWebSocket.OPEN);
+    expect(errors).toEqual([]);
+    provider.stop();
+  });
+
+  it('requires the collaboration protocol v5 handshake', () => {
+    const errors: string[] = [];
+    const permissions: Array<{ canEdit: boolean; canManage: boolean }> = [];
     const provider = createProvider(new Y.Doc(), true, () => undefined, {
       onError: (message) => errors.push(message),
-      onPermission: (allowed) => permissions.push(allowed)
+      onPermission: (allowed, manageable) => permissions.push({ canEdit: allowed, canManage: manageable })
     });
     provider.start();
     const socket = FakeWebSocket.instances[0];
     socket.open();
-    socket.receive({ type: 'sync_start', protocol: 3, can_edit: true });
+    socket.receive({ type: 'sync_start', protocol: 4, can_edit: true });
 
-    expect(COLLABORATION_PROTOCOL_VERSION).toBe(4);
-    expect(errors[errors.length - 1]).toContain('expected v4');
-    expect(permissions).toEqual([false]);
+    expect(COLLABORATION_PROTOCOL_VERSION).toBe(5);
+    expect(errors[errors.length - 1]).toContain('expected v5');
+    expect(permissions).toEqual([{ canEdit: false, canManage: false }]);
     expect(socket.readyState).toBe(FakeWebSocket.CLOSED);
     provider.stop();
   });
@@ -187,13 +320,388 @@ describe('BoardProvider', () => {
     provider.stop();
   });
 
+  it('applies live edit and manager permission changes atomically', async () => {
+    const doc = new Y.Doc();
+    let permission = { canEdit: true, canManage: false };
+    const permissions: typeof permission[] = [];
+    const commands = new BoardCommands(doc, () => permission.canEdit);
+    const provider = createProvider(doc, true, () => undefined, {
+      onPermission: (canEdit, canManage) => {
+        permission = { canEdit, canManage };
+        permissions.push(permission);
+      }
+    }, false);
+    provider.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    sendSyncStart(socket, true, false);
+    socket.receive({ type: 'sync_complete', server_sequence: 0 });
+
+    socket.receive({ type: 'permission', can_edit: false, can_manage: false });
+    expect(permission).toEqual({ canEdit: false, canManage: false });
+    expect(commands.createText(0, 0)).toBe('');
+
+    socket.receive({ type: 'permission', can_edit: true, can_manage: false });
+    const blockID = commands.createText(10, 20);
+    expect(blockID).not.toBe('');
+    const update = latestSent(socket, 'update');
+    socket.receive({ type: 'update_ack', update_id: update.update_id, server_sequence: 1 });
+    vi.mocked(fetch).mockClear();
+
+    socket.receive({ type: 'permission', can_edit: true, can_manage: true });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(fetch).toHaveBeenCalledWith('/api/boards/board-1/asset-references', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({ through_sequence: 1, asset_ids: [] })
+    }));
+    socket.receive({ type: 'checkpoint_request', request_id: 'checkpoint-1', through_sequence: 1 });
+    expect(latestSent(socket, 'checkpoint')).toMatchObject({ request_id: 'checkpoint-1', through_sequence: 1 });
+    expect(permissions).toEqual([
+      { canEdit: false, canManage: false },
+      { canEdit: true, canManage: false },
+      { canEdit: true, canManage: true }
+    ]);
+    commands.destroy();
+    provider.stop();
+  });
+
+  it('keeps edit access when a manager downgrade rejects an in-flight checkpoint response', () => {
+    const doc = new Y.Doc();
+    let permission = { canEdit: true, canManage: true };
+    const permissions: typeof permission[] = [];
+    let resets = 0;
+    const commands = new BoardCommands(doc, () => permission.canEdit);
+    const provider = createProvider(doc, true, () => undefined, {
+      onPermission: (canEdit, canManage) => {
+        permission = { canEdit, canManage };
+        permissions.push(permission);
+      },
+      onResetRequired: () => { resets += 1; }
+    });
+    provider.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    sendSyncStart(socket, true, true);
+    socket.receive({ type: 'sync_complete', server_sequence: 0 });
+    socket.receive({ type: 'checkpoint_request', request_id: 'checkpoint-race', through_sequence: 1 });
+    expect(latestSent(socket, 'checkpoint')).toMatchObject({ request_id: 'checkpoint-race' });
+
+    socket.receive({ type: 'permission', can_edit: true, can_manage: false });
+    socket.receive({
+      type: 'error', request_id: 'checkpoint-race', code: 'forbidden', message: 'only a project manager can save a checkpoint'
+    });
+
+    expect(permission).toEqual({ canEdit: true, canManage: false });
+    expect(permissions).toEqual([{ canEdit: true, canManage: false }]);
+    expect(resets).toBe(0);
+    expect(commands.createText(0, 0)).not.toBe('');
+    commands.destroy();
+    provider.stop();
+  });
+
+  it('keeps viewer access when a manager-to-viewer downgrade rejects an in-flight checkpoint response', () => {
+    const permissions: Array<{ canEdit: boolean; canManage: boolean }> = [];
+    let resets = 0;
+    const provider = createProvider(new Y.Doc(), true, () => undefined, {
+      onPermission: (canEdit, canManage) => permissions.push({ canEdit, canManage }),
+      onResetRequired: () => { resets += 1; }
+    });
+    provider.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    sendSyncStart(socket, true, true);
+    socket.receive({ type: 'sync_complete', server_sequence: 0 });
+    socket.receive({ type: 'checkpoint_request', request_id: 'checkpoint-viewer-race', through_sequence: 1 });
+
+    socket.receive({ type: 'permission', can_edit: false, can_manage: false });
+    socket.receive({
+      type: 'error', request_id: 'checkpoint-viewer-race', code: 'forbidden', message: 'only a project manager can save a checkpoint'
+    });
+
+    expect(permissions).toEqual([{ canEdit: false, canManage: false }]);
+    expect(resets).toBe(0);
+    expect(socket.readyState).toBe(FakeWebSocket.OPEN);
+    provider.stop();
+  });
+
+  it('does not let an old checkpoint error clear the current request association', () => {
+    const errors: string[] = [];
+    const provider = createProvider(new Y.Doc(), true, () => undefined, {
+      onError: (message) => errors.push(message)
+    });
+    provider.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    sendSyncStart(socket, true, true);
+    socket.receive({ type: 'sync_complete', server_sequence: 0 });
+    socket.receive({ type: 'checkpoint_request', request_id: 'checkpoint-old', through_sequence: 1 });
+    socket.receive({ type: 'checkpoint_request', request_id: 'checkpoint-current', through_sequence: 1 });
+
+    socket.receive({
+      type: 'error', request_id: 'checkpoint-old', code: 'invalid_checkpoint', message: 'old checkpoint failed'
+    });
+    socket.receive({ type: 'permission', can_edit: true, can_manage: false });
+    socket.receive({
+      type: 'error', request_id: 'checkpoint-current', code: 'forbidden', message: 'only a project manager can save a checkpoint'
+    });
+
+    expect(errors).toEqual(['old checkpoint failed']);
+    expect(socket.readyState).toBe(FakeWebSocket.OPEN);
+    provider.stop();
+  });
+
+  it('discards pending updates when a live permission message removes edit access', () => {
+    const doc = new Y.Doc();
+    const pending: number[] = [];
+    let resets = 0;
+    const provider = createProvider(doc, true, (count) => pending.push(count), {
+      onResetRequired: () => { resets += 1; }
+    }, false);
+    provider.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    sendSyncStart(socket, true, false);
+    socket.receive({ type: 'sync_complete', server_sequence: 0 });
+    doc.getMap('blocks').set('pending', 'value');
+    expect(pending[pending.length - 1]).toBe(1);
+
+    socket.receive({ type: 'permission', can_edit: false, can_manage: false });
+    expect(pending[pending.length - 1]).toBe(0);
+    expect(resets).toBe(1);
+    provider.stop();
+  });
+
+  it.each([
+    ['board_deleted', 'deleted or is no longer available'],
+    ['forbidden', 'access to this board was revoked']
+  ])('treats the %s close reason as terminal', async (reason, expectedError) => {
+    const pending: number[] = [];
+    const errors: string[] = [];
+    const connections: string[] = [];
+    const presence: Array<Record<number, unknown>> = [];
+    const doc = new Y.Doc();
+    const provider = createProvider(doc, true, (count) => pending.push(count), {
+      onError: (message) => errors.push(message),
+      onConnection: (state) => connections.push(state),
+      onPresence: (value) => presence.push(value)
+    });
+    provider.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    sendSyncStart(socket, true, true);
+    socket.receive({ type: 'sync_complete', server_sequence: 0 });
+    doc.getMap('blocks').set('pending', 'value');
+
+    const remoteDoc = new Y.Doc();
+    const remote = new Awareness(remoteDoc);
+    remote.setLocalState({ user: { color: '#123456' } });
+    socket.receive({
+      type: 'awareness', client_id: 'cli_remote', user_id: 'usr_remote', user_name: 'Remote',
+      awareness_ids: [remote.clientID], data: base64(encodeAwarenessUpdate(remote, [remote.clientID]))
+    });
+    expect(Object.keys(presence[presence.length - 1])).toHaveLength(1);
+
+    socket.close(1000, reason);
+    expect(pending[pending.length - 1]).toBe(0);
+    expect(presence[presence.length - 1]).toEqual({});
+    expect(errors[errors.length - 1]).toContain(expectedError);
+    expect(connections[connections.length - 1]).toBe('offline');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    remote.destroy();
+    remoteDoc.destroy();
+    provider.stop();
+  });
+
+  it('does not let an in-flight asset sync clear a terminal close error', async () => {
+    let resolveFetch: ((response: Response) => void) | undefined;
+    vi.mocked(fetch).mockImplementation(() => new Promise<Response>((resolve) => { resolveFetch = resolve; }));
+    const errors: string[] = [];
+    const provider = createProvider(new Y.Doc(), true, () => undefined, {
+      onError: (message) => errors.push(message)
+    });
+    provider.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    sendSyncStart(socket, true, true);
+    socket.receive({ type: 'sync_complete', server_sequence: 0 });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    socket.close(1000, 'forbidden');
+    expect(errors[errors.length - 1]).toContain('access to this board was revoked');
+    resolveFetch?.(new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' }
+    }));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(errors[errors.length - 1]).toContain('access to this board was revoked');
+    provider.stop();
+  });
+
+  it('ignores delayed socket messages after the provider has stopped', () => {
+    const permissions: Array<{ canEdit: boolean; canManage: boolean }> = [];
+    const provider = createProvider(new Y.Doc(), true, () => undefined, {
+      onPermission: (canEdit, canManage) => permissions.push({ canEdit, canManage })
+    });
+    provider.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    sendSyncStart(socket, true, true);
+    socket.receive({ type: 'sync_complete', server_sequence: 0 });
+    provider.stop();
+
+    socket.receive({ type: 'permission', can_edit: false, can_manage: false });
+    expect(permissions).toEqual([]);
+  });
+
+  it('uses the authenticated awareness envelope instead of client-supplied identity fields', () => {
+    const presence: Array<Record<number, { userID: string; name: string; color: string }>> = [];
+    const errors: string[] = [];
+    const provider = createProvider(new Y.Doc(), true, () => undefined, {
+      onPresence: (value) => presence.push(value),
+      onError: (message) => errors.push(message)
+    });
+    provider.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    sendSyncStart(socket, true);
+    socket.receive({ type: 'sync_complete', server_sequence: 0 });
+
+    const remoteDoc = new Y.Doc();
+    const remote = new Awareness(remoteDoc);
+    remote.setLocalState({
+      user: { id: 'forged-user', name: 'Forged Name', color: '#123456' },
+      cursor: { x: 12, y: 34 },
+      selection: ['block-1']
+    });
+    const update = encodeAwarenessUpdate(remote, [remote.clientID]);
+    socket.receive({
+      type: 'awareness',
+      client_id: 'cli_remote',
+      user_id: 'usr_trusted',
+      user_name: 'Trusted User',
+      awareness_ids: [remote.clientID],
+      data: base64(update)
+    });
+
+    expect(presence[presence.length - 1][remote.clientID]).toMatchObject({
+      userID: 'usr_trusted',
+      name: 'Trusted User',
+      color: '#123456'
+    });
+
+    socket.receive({
+      type: 'awareness',
+      client_id: 'cli_attacker',
+      user_id: 'usr_attacker',
+      user_name: 'Attacker',
+      awareness_ids: [remote.clientID],
+      data: base64(update)
+    });
+    expect(errors[errors.length - 1]).toContain('owned by another connection');
+    expect(presence[presence.length - 1][remote.clientID]).toMatchObject({
+      userID: 'usr_trusted',
+      name: 'Trusted User'
+    });
+
+    socket.receive({
+      type: 'awareness',
+      client_id: 'cli_broken',
+      user_id: 'usr_broken',
+      user_name: 'Broken',
+      awareness_ids: [999],
+      data: base64(new Uint8Array([1]))
+    });
+    expect(errors[errors.length - 1]).toContain('malformed awareness');
+
+    const secondDoc = new Y.Doc();
+    const second = new Awareness(secondDoc);
+    second.states.set(999, { user: { id: 'another-forged-user', name: 'Another Forgery', color: '#654321' } });
+    second.meta.set(999, { clock: 1, lastUpdated: 0 });
+    socket.receive({
+      type: 'awareness',
+      client_id: 'cli_second',
+      user_id: 'usr_second',
+      user_name: 'Second Trusted User',
+      awareness_ids: [999],
+      data: base64(encodeAwarenessUpdate(second, [999]))
+    });
+    expect(presence[presence.length - 1][999]).toMatchObject({
+      userID: 'usr_second',
+      name: 'Second Trusted User',
+      color: '#654321'
+    });
+
+    socket.close();
+    expect(presence[presence.length - 1]).toEqual({});
+    second.destroy();
+    secondDoc.destroy();
+    remote.destroy();
+    remoteDoc.destroy();
+    provider.stop();
+  });
+
+  it('releases tombstoned awareness ownership so a lower-clock connection can reclaim the ID', () => {
+    const presence: Array<Record<number, { userID: string }>> = [];
+    const errors: string[] = [];
+    const provider = createProvider(new Y.Doc(), true, () => undefined, {
+      onPresence: (value) => presence.push(value),
+      onError: (message) => errors.push(message)
+    });
+    provider.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    sendSyncStart(socket, true);
+    socket.receive({ type: 'sync_complete', server_sequence: 0 });
+
+    const remoteDoc = new Y.Doc();
+    const remote = new Awareness(remoteDoc);
+    remote.setLocalState({ user: { color: '#123456' } });
+    const stateClock = remote.meta.get(remote.clientID)?.clock ?? 0;
+    const data = base64(encodeAwarenessUpdate(remote, [remote.clientID]));
+    socket.receive({
+      type: 'awareness', client_id: 'cli_old', user_id: 'usr_remote', user_name: 'Remote',
+      awareness_ids: [remote.clientID], data
+    });
+    expect(presence[presence.length - 1][remote.clientID]?.userID).toBe('usr_remote');
+
+    remote.setLocalState(null);
+    expect(remote.meta.get(remote.clientID)?.clock ?? 0).toBeGreaterThan(stateClock);
+    socket.receive({
+      type: 'awareness', client_id: 'cli_old', user_id: 'usr_remote', user_name: 'Remote',
+      awareness_ids: [remote.clientID], data: base64(encodeAwarenessUpdate(remote, [remote.clientID]))
+    });
+    expect(presence[presence.length - 1]).toEqual({});
+
+    socket.receive({
+      type: 'awareness', client_id: 'cli_new', user_id: 'usr_remote', user_name: 'Remote',
+      awareness_ids: [remote.clientID], data
+    });
+    expect(errors[errors.length - 1]).toContain('owned by another connection');
+    expect(presence[presence.length - 1]).toEqual({});
+
+    socket.receive({ type: 'awareness', client_id: 'cli_old', removed: true });
+    expect(presence[presence.length - 1]).toEqual({});
+    socket.receive({
+      type: 'awareness', client_id: 'cli_new', user_id: 'usr_remote', user_name: 'Remote',
+      awareness_ids: [remote.clientID], data
+    });
+    expect(presence[presence.length - 1][remote.clientID]?.userID).toBe('usr_remote');
+
+    remote.destroy();
+    remoteDoc.destroy();
+    provider.stop();
+  });
+
   it('drops rejected local updates, switches to read-only, and requests a clean resync', () => {
     const doc = new Y.Doc();
-    const permissions: boolean[] = [];
+    const permissions: Array<{ canEdit: boolean; canManage: boolean }> = [];
     let resets = 0;
     const pending: number[] = [];
     const provider = createProvider(doc, true, (count) => pending.push(count), {
-      onPermission: (allowed) => permissions.push(allowed),
+      onPermission: (allowed, manageable) => permissions.push({ canEdit: allowed, canManage: manageable }),
       onResetRequired: () => { resets += 1; }
     });
     provider.start();
@@ -206,9 +714,36 @@ describe('BoardProvider', () => {
     const update = sent(socket, 'update')[0];
     socket.receive({ type: 'error', code: 'forbidden', update_id: update.update_id, message: 'viewer cannot update the document' });
 
-    expect(permissions).toEqual([false]);
+    expect(permissions).toEqual([{ canEdit: false, canManage: false }]);
     expect(pending[pending.length - 1]).toBe(0);
     expect(resets).toBe(1);
+    provider.stop();
+  });
+
+  it('treats a forbidden error without an update ID as revoked board access', async () => {
+    const pending: number[] = [];
+    const permissions: Array<{ canEdit: boolean; canManage: boolean }> = [];
+    let resets = 0;
+    const doc = new Y.Doc();
+    const provider = createProvider(doc, true, (count) => pending.push(count), {
+      onPermission: (canEdit, canManage) => permissions.push({ canEdit, canManage }),
+      onResetRequired: () => { resets += 1; }
+    });
+    provider.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    sendSyncStart(socket, true, true);
+    socket.receive({ type: 'sync_complete', server_sequence: 0 });
+    doc.getMap('blocks').set('pending', 'value');
+
+    socket.receive({ type: 'error', code: 'forbidden', message: 'board access was revoked' });
+
+    expect(permissions).toEqual([{ canEdit: false, canManage: false }]);
+    expect(pending[pending.length - 1]).toBe(0);
+    expect(resets).toBe(0);
+    expect(socket.readyState).toBe(FakeWebSocket.CLOSED);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(FakeWebSocket.instances).toHaveLength(1);
     provider.stop();
   });
 
@@ -315,7 +850,7 @@ describe('BoardProvider', () => {
     provider.start();
     const socket = FakeWebSocket.instances[0];
     socket.open();
-    sendSyncStart(socket, true);
+    sendSyncStart(socket, true, false);
     socket.receive({ type: 'sync_complete', server_sequence: 0 });
     await vi.advanceTimersByTimeAsync(100);
     expect(fetch).not.toHaveBeenCalled();
@@ -344,9 +879,9 @@ function createProvider(
   canEdit: boolean,
   onPending: (count: number) => void,
   overrides: Partial<ConstructorParameters<typeof BoardProvider>[4]> = {},
-  canPublishAssetReferences = true
+  canManage = canEdit
 ) {
-  return new BoardProvider('board-1', doc, canEdit, canPublishAssetReferences, {
+  return new BoardProvider('board-1', doc, canEdit, canManage, {
     onConnection: () => undefined,
     onPending,
     onError: () => undefined,
@@ -368,8 +903,8 @@ function latestSent(socket: FakeWebSocket, type: string) {
   return message;
 }
 
-function sendSyncStart(socket: FakeWebSocket, canEdit: boolean) {
-  socket.receive({ type: 'sync_start', protocol: COLLABORATION_PROTOCOL_VERSION, can_edit: canEdit });
+function sendSyncStart(socket: FakeWebSocket, canEdit: boolean, canManage = canEdit) {
+  socket.receive({ type: 'sync_start', protocol: COLLABORATION_PROTOCOL_VERSION, can_edit: canEdit, can_manage: canManage });
 }
 
 function imageBlock(assetID: string) {

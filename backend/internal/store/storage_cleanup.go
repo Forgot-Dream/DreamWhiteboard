@@ -5,6 +5,10 @@ import (
 	"time"
 )
 
+// MaxBoardUpdateReceiptPruneBatchSize bounds a single receipt-deletion
+// transaction so an overdue backlog is drained incrementally.
+const MaxBoardUpdateReceiptPruneBatchSize = 10_000
+
 type StorageCleanupKind string
 
 const (
@@ -43,9 +47,17 @@ type AssetGarbageCollector interface {
 	SweepOrphanedAssets(ctx context.Context, now time.Time, grace time.Duration, limit int) (int, error)
 }
 
+// BoardUpdateReceiptPruner bounds the lifetime of update-ID receipts whose
+// Yjs payloads are already covered by a checkpoint. Uncompacted updates must
+// never be removed by this maintenance operation.
+type BoardUpdateReceiptPruner interface {
+	PruneCompactedBoardUpdateReceipts(ctx context.Context, cutoff time.Time, limit int) (int, error)
+}
+
 type StorageMaintenance interface {
 	StorageCleanupQueue
 	AssetGarbageCollector
+	BoardUpdateReceiptPruner
 }
 
 var (

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -39,6 +40,10 @@ type wsFixture struct {
 }
 
 func newWSFixture(t *testing.T) *wsFixture {
+	return newWSFixtureWithAuthInterval(t, 20*time.Millisecond)
+}
+
+func newWSFixtureWithAuthInterval(t *testing.T, authInterval time.Duration) *wsFixture {
 	t.Helper()
 	repo := &wsTestRepository{MemoryStore: store.NewMemoryStore()}
 	editor, err := repo.CreateUser("editor@example.com", "Editor", "editor-password", domain.SystemUser)
@@ -55,7 +60,7 @@ func newWSFixture(t *testing.T) *wsFixture {
 	}
 	config := DefaultConfig(t.TempDir())
 	config.CookieSecure = false
-	config.WSAuthInterval = 20 * time.Millisecond
+	config.WSAuthInterval = authInterval
 	config.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	server := NewServerWithConfig(repo, config)
 	httpServer := httptest.NewServer(server)
@@ -276,6 +281,10 @@ func TestBoardWebSocketRoleDowngradeTakesEffectOnNextMessage(t *testing.T) {
 	if _, err := fixture.repo.UpsertMember(fixture.project.ID, editor.ID, domain.RoleViewer); err != nil {
 		t.Fatal(err)
 	}
+	permission := readRealtimeMessage(t, connection)
+	if permission.Type != realtime.MessagePermission || permission.CanEdit == nil || *permission.CanEdit {
+		t.Fatalf("unexpected permission downgrade: %#v", permission)
+	}
 	if err := connection.WriteJSON(wsClientMessage{
 		Type: realtime.MessageUpdate, UpdateID: "after-downgrade", Data: []byte{1},
 	}); err != nil {
@@ -316,9 +325,9 @@ func TestBoardWebSocketRejectsUpdateIDReuseWithDifferentData(t *testing.T) {
 	}
 }
 
-func TestBoardWebSocketAdvertisesAssetReferenceProtocolV4(t *testing.T) {
-	if realtime.ProtocolVersion != 4 {
-		t.Fatalf("realtime protocol constant = %d, want 4", realtime.ProtocolVersion)
+func TestBoardWebSocketAdvertisesAssetReferenceProtocolV5(t *testing.T) {
+	if realtime.ProtocolVersion != 5 {
+		t.Fatalf("realtime protocol constant = %d, want 5", realtime.ProtocolVersion)
 	}
 	fixture := newWSFixture(t)
 	connection := fixture.dial(fixture.editor)
@@ -331,7 +340,7 @@ func TestBoardWebSocketAdvertisesAssetReferenceProtocolV4(t *testing.T) {
 	}
 }
 
-func TestBoardWebSocketProtocolV4RejectsMissingAssetClaims(t *testing.T) {
+func TestBoardWebSocketProtocolV5RejectsMissingAssetClaims(t *testing.T) {
 	fixture := newWSFixture(t)
 	connection, _ := fixture.connect(fixture.editor)
 	if err := connection.WriteJSON(map[string]any{
@@ -342,7 +351,8 @@ func TestBoardWebSocketProtocolV4RejectsMissingAssetClaims(t *testing.T) {
 		t.Fatal(err)
 	}
 	message := readRealtimeMessage(t, connection)
-	if message.Type != realtime.MessageError || message.Code != "asset_claims_required" || message.UpdateID != "missing-claims" {
+	if message.Type != realtime.MessageError || message.Code != "asset_claims_required" || message.UpdateID != "missing-claims" ||
+		message.Message != "introduced_asset_ids is required by collaboration protocol v5" {
 		t.Fatalf("unexpected missing claims response: %#v", message)
 	}
 	_, updates, err := fixture.repo.LoadBoardDocument(fixture.board.ID)
@@ -454,8 +464,8 @@ func TestClaimsOnlyWebSocketUpdateMakesAssetDeletionStale(t *testing.T) {
 		t.Fatalf("unexpected sync completion: %#v", complete)
 	}
 
-	// A claims-only v4 update is accepted, but without a trusted full manifest
-	// the server can no longer prove that the current document omits an asset.
+	// Claims have been required since protocol v4. Without a trusted full
+	// manifest, the server still cannot prove that the document omits an asset.
 	if err := connection.WriteJSON(wsClientMessage{
 		Type: realtime.MessageUpdate, UpdateID: "claims-without-manifest", Data: []byte{4, 5, 6}, IntroducedAssetIDs: []string{},
 	}); err != nil {
@@ -477,7 +487,18 @@ func TestClaimsOnlyWebSocketUpdateMakesAssetDeletionStale(t *testing.T) {
 func TestBoardWebSocketBroadcastsAwarenessRemovalOnDisconnect(t *testing.T) {
 	fixture := newWSFixture(t)
 	leaving, leavingStart := fixture.connect(fixture.editor)
-	peer, _ := fixture.connect(fixture.editor)
+	peer, peerStart := fixture.connect(fixture.editor)
+	awareness := encodeTestAwareness(t, testAwarenessEntry{
+		ID: 301, Clock: 1,
+		State: map[string]any{"user": map[string]any{"id": "forged", "name": "Forged"}},
+	})
+	if err := leaving.WriteJSON(wsClientMessage{Type: realtime.MessageAwareness, Data: awareness}); err != nil {
+		t.Fatal(err)
+	}
+	announced := readRealtimeMessage(t, peer)
+	if announced.Type != realtime.MessageAwareness || len(announced.AwarenessIDs) != 1 || announced.AwarenessIDs[0] != 301 {
+		t.Fatalf("unexpected awareness announcement: %#v", announced)
+	}
 	if err := leaving.WriteControl(
 		websocket.CloseMessage,
 		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
@@ -490,6 +511,66 @@ func TestBoardWebSocketBroadcastsAwarenessRemovalOnDisconnect(t *testing.T) {
 	removed := readRealtimeMessage(t, peer)
 	if removed.Type != realtime.MessageAwareness || !removed.Removed || removed.ClientID != leavingStart.ClientID || removed.UserID != fixture.editor.ID {
 		t.Fatalf("unexpected awareness removal: %#v", removed)
+	}
+	waitForAwarenessOwner(t, fixture.server.awareness, fixture.board.ID, 301, "")
+	if err := peer.WriteJSON(wsClientMessage{Type: realtime.MessageAwareness, Data: encodeTestAwareness(t, testAwarenessEntry{
+		ID: 301, Clock: 2, State: map[string]any{"user": map[string]any{"id": "second-forgery"}},
+	})}); err != nil {
+		t.Fatal(err)
+	}
+	waitForAwarenessOwner(t, fixture.server.awareness, fixture.board.ID, 301, peerStart.ClientID)
+}
+
+func TestBoardWebSocketBindsAwarenessIdentityAndRejectsCrossConnectionID(t *testing.T) {
+	fixture := newWSFixture(t)
+	viewer, err := fixture.repo.CreateUser("awareness-viewer@example.com", "Trusted Viewer", "viewer-password", domain.SystemUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.repo.UpsertMember(fixture.project.ID, viewer.ID, domain.RoleViewer); err != nil {
+		t.Fatal(err)
+	}
+	editorConnection, editorStart := fixture.connect(fixture.editor)
+	viewerConnection, viewerStart := fixture.connect(viewer)
+
+	editorAwareness := encodeTestAwareness(t, testAwarenessEntry{
+		ID: 401, Clock: 1,
+		State: map[string]any{"user": map[string]any{"id": viewer.ID, "name": "Forged Viewer", "color": "#123456"}},
+	})
+	if err := editorConnection.WriteJSON(wsClientMessage{Type: realtime.MessageAwareness, Data: editorAwareness}); err != nil {
+		t.Fatal(err)
+	}
+	fromEditor := readRealtimeMessage(t, viewerConnection)
+	if fromEditor.Type != realtime.MessageAwareness || fromEditor.ClientID != editorStart.ClientID ||
+		fromEditor.UserID != fixture.editor.ID || fromEditor.UserName != fixture.editor.Name ||
+		len(fromEditor.AwarenessIDs) != 1 || fromEditor.AwarenessIDs[0] != 401 {
+		t.Fatalf("editor awareness was not bound to its authenticated identity: %#v", fromEditor)
+	}
+
+	viewerAwareness := encodeTestAwareness(t, testAwarenessEntry{
+		ID: 402, Clock: 1,
+		State: map[string]any{"user": map[string]any{"id": fixture.editor.ID, "name": "Forged Editor"}},
+	})
+	if err := viewerConnection.WriteJSON(wsClientMessage{Type: realtime.MessageAwareness, Data: viewerAwareness}); err != nil {
+		t.Fatal(err)
+	}
+	fromViewer := readRealtimeMessage(t, editorConnection)
+	if fromViewer.Type != realtime.MessageAwareness || fromViewer.ClientID != viewerStart.ClientID ||
+		fromViewer.UserID != viewer.ID || fromViewer.UserName != viewer.Name ||
+		len(fromViewer.AwarenessIDs) != 1 || fromViewer.AwarenessIDs[0] != 402 {
+		t.Fatalf("viewer awareness was not bound to its authenticated identity: %#v", fromViewer)
+	}
+
+	stolenID := encodeTestAwareness(t, testAwarenessEntry{
+		ID: 401, Clock: 2,
+		State: map[string]any{"user": map[string]any{"id": fixture.editor.ID, "name": "Impersonated Editor"}},
+	})
+	if err := viewerConnection.WriteJSON(wsClientMessage{Type: realtime.MessageAwareness, Data: stolenID}); err != nil {
+		t.Fatal(err)
+	}
+	rejected := readRealtimeMessage(t, viewerConnection)
+	if rejected.Type != realtime.MessageError || rejected.Code != "awareness_id_conflict" {
+		t.Fatalf("cross-connection awareness ID was not rejected: %#v", rejected)
 	}
 }
 
@@ -590,4 +671,51 @@ func saveWSAsset(t *testing.T, fixture *wsFixture, project domain.Project, suffi
 		t.Fatal(err)
 	}
 	return asset
+}
+
+type testAwarenessEntry struct {
+	ID    uint64
+	Clock uint64
+	State any
+}
+
+func encodeTestAwareness(t *testing.T, entries ...testAwarenessEntry) []byte {
+	t.Helper()
+	encoded := appendTestVarUint(nil, uint64(len(entries)))
+	for _, entry := range entries {
+		state, err := json.Marshal(entry.State)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded = appendTestVarUint(encoded, entry.ID)
+		encoded = appendTestVarUint(encoded, entry.Clock)
+		encoded = appendTestVarUint(encoded, uint64(len(state)))
+		encoded = append(encoded, state...)
+	}
+	return encoded
+}
+
+func appendTestVarUint(target []byte, value uint64) []byte {
+	for value > 0x7f {
+		target = append(target, byte(value&0x7f)|0x80)
+		value /= 128
+	}
+	return append(target, byte(value))
+}
+
+func waitForAwarenessOwner(t *testing.T, registry *awarenessRegistry, boardID string, awarenessID uint64, expected string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		registry.mu.Lock()
+		owner := registry.owners[awarenessOwnerKey{boardID: boardID, awarenessID: awarenessID}]
+		registry.mu.Unlock()
+		if owner == expected {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("awareness owner=%q, want %q", owner, expected)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }

@@ -15,38 +15,67 @@ export interface BoardRuntime {
   canManage: boolean;
 }
 
+interface RuntimePermission {
+  canEdit: boolean;
+  canManage: boolean;
+}
+
+interface ScopedRuntimePermission extends RuntimePermission {
+  scope: string;
+}
+
 export function useBoardRuntime(boardID: string, projectID: string, user: User, canEdit: boolean, canManage: boolean) {
-  const permission = useRef(canEdit);
-  const restPermission = useRef(canEdit);
-  const [authoritativeCanEdit, setAuthoritativeCanEdit] = useState(canEdit);
+  const scope = `${boardID}\u0000${projectID}`;
+  const scopeRef = useRef(scope);
+  const permission = useRef<RuntimePermission>({ canEdit, canManage });
+  const restPermission = useRef<ScopedRuntimePermission>({ scope, canEdit, canManage });
+  const [authoritativePermission, setAuthoritativePermission] = useState<ScopedRuntimePermission>({ scope, canEdit, canManage });
   const [generation, setGeneration] = useState(0);
 
-  useEffect(() => {
-    if (restPermission.current === canEdit) return;
-    restPermission.current = canEdit;
-    permission.current = canEdit;
-    setAuthoritativeCanEdit(canEdit);
-    setGeneration((current) => current + 1);
-  }, [canEdit]);
+  if (scopeRef.current !== scope) {
+    scopeRef.current = scope;
+    permission.current = { canEdit, canManage };
+    restPermission.current = { scope, canEdit, canManage };
+  }
 
-  const runtime = useMemo<Omit<BoardRuntime, 'canEdit'>>(() => {
+  useEffect(() => {
+    if (scopeRef.current !== scope) return;
+    if (
+      restPermission.current.scope === scope &&
+      restPermission.current.canEdit === canEdit && restPermission.current.canManage === canManage
+    ) {
+      setAuthoritativePermission((current) => current.scope === scope ? current : { scope, canEdit, canManage });
+      return;
+    }
+    const next = { canEdit, canManage };
+    restPermission.current = { scope, ...next };
+    permission.current = next;
+    setAuthoritativePermission({ scope, ...next });
+    setGeneration((current) => current + 1);
+  }, [canEdit, canManage, scope]);
+
+  const runtime = useMemo<Omit<BoardRuntime, 'canEdit' | 'canManage'>>(() => {
+    const runtimeScope = scope;
     const doc = new Y.Doc();
-    const editable = () => permission.current;
+    const active = () => scopeRef.current === runtimeScope;
+    const editable = () => active() && permission.current.canEdit;
     const commands = new BoardCommands(doc, editable);
     const store = useBoardStore.getState;
-    const provider = new BoardProvider(boardID, doc, permission.current, canManage, {
-      onConnection: (state, sequence) => store().setConnection(state, sequence),
-      onPending: (pending) => store().setPending(pending),
-      onError: (error) => store().setConnectionError(error),
-      onPresence: (presence) => store().setPresence(presence),
-      onPermission: (allowed) => {
-        permission.current = allowed;
-        setAuthoritativeCanEdit(allowed);
+    const provider = new BoardProvider(boardID, doc, permission.current.canEdit, permission.current.canManage, {
+      onConnection: (state, sequence) => { if (active()) store().setConnection(state, sequence); },
+      onPending: (pending) => { if (active()) store().setPending(pending); },
+      onError: (error) => { if (active()) store().setConnectionError(error); },
+      onPresence: (presence) => { if (active()) store().setPresence(presence); },
+      onPermission: (allowed, manageable) => {
+        if (!active()) return;
+        const next = { canEdit: allowed, canManage: manageable };
+        permission.current = next;
+        setAuthoritativePermission({ scope: runtimeScope, ...next });
       },
-      onResetRequired: () => setGeneration((current) => current + 1)
+      onResetRequired: () => { if (active()) setGeneration((current) => current + 1); }
     });
-    return { doc, commands, provider, projectID, canManage };
-  }, [boardID, canManage, generation, projectID]);
+    return { doc, commands, provider, projectID };
+  }, [boardID, generation, projectID, scope, user.email, user.id, user.name]);
 
   useEffect(() => {
     const store = useBoardStore.getState();
@@ -87,7 +116,13 @@ export function useBoardRuntime(boardID: string, projectID: string, user: User, 
     };
   }, [boardID, runtime, user.email, user.id, user.name]);
 
-  return useMemo(() => ({ ...runtime, canEdit: authoritativeCanEdit }), [authoritativeCanEdit, runtime]);
+  const authoritativeCanEdit = authoritativePermission.scope === scope ? authoritativePermission.canEdit : canEdit;
+  const authoritativeCanManage = authoritativePermission.scope === scope ? authoritativePermission.canManage : canManage;
+  return useMemo(() => ({
+    ...runtime,
+    canEdit: authoritativeCanEdit,
+    canManage: authoritativeCanManage
+  }), [authoritativeCanEdit, authoritativeCanManage, runtime]);
 }
 
 function collaboratorColor(seed: string) {

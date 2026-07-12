@@ -127,9 +127,17 @@ func (s *Server) handleProject(w http.ResponseWriter, r *http.Request, user doma
 		if !s.requirePermission(w, r, allowed, permissionErr, "project_admin_required", "project administrator access required") {
 			return
 		}
+		boards, err := s.repo.ListBoards(projectID)
+		if err != nil {
+			writeResult(w, r, nil, err)
+			return
+		}
 		if err := s.repo.DeleteProject(projectID); err != nil {
 			writeResult(w, r, nil, err)
 			return
+		}
+		for _, board := range boards {
+			s.hub.CloseBoard(board.ID)
 		}
 		s.cleanupProjectFiles(projectID, r)
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
@@ -374,6 +382,7 @@ func (s *Server) handleBoardSubroutes(w http.ResponseWriter, r *http.Request, us
 			writeResult(w, r, nil, err)
 			return
 		}
+		s.hub.CloseBoard(boardID)
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	default:
 		methodNotAllowed(w, r, http.MethodGet, http.MethodPatch, http.MethodDelete)

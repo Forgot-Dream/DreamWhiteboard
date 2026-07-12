@@ -8,6 +8,7 @@ DreamWhiteboard is a single-host, self-hosted collaborative whiteboard. The v2 a
 - Project roles (`owner`, `admin`, `editor`, `viewer`) with last-owner protection.
 - Versioned SQL migrations, health/readiness endpoints, structured request logs, request IDs, body limits, login throttling, security headers, and a CORS allowlist.
 - Yjs `Y.Map("blocks")` documents with `text` and `image` block schemas, durable ordered updates, stable update IDs, acknowledgements, automatic reconnect/replay, checkpoints, and Awareness presence.
+- Checkpoint-compacted update-ID receipts have a configurable 30-day retention window instead of growing without bound.
 - Sequence-bound image reference manifests prevent deletion of assets that are still used by a board; stale or conflicting indexes fail closed.
 - Automatic orphan-upload collection keeps newly unreferenced assets for a configurable seven-day grace period and removes files through the durable cleanup outbox.
 - A routed React UI using TanStack Query and Zustand, including multi-select, box select, undo/redo, copy/cut/paste, duplicate, z-ordering, align/distribute, keyboard movement, image upload progress/cancel/retry, and saved per-board viewports.
@@ -106,8 +107,11 @@ Later migrations add:
 - `storage_cleanup_jobs`: leased, retryable filesystem deletion jobs written in the same transaction as metadata deletion.
 - `board_asset_reference_state` and `board_asset_references`: the last exact, server-sequence-bound asset manifest for each board.
 - `board_updates.introduced_asset_ids` and `asset_gc_candidates`: protocol-v4 asset-introduction claims and delayed orphan-asset collection.
+- `board_updates_compacted_receipts_expiry_idx`: a partial index used to prune expired receipts without scanning live, uncompacted updates.
 
-Schema version 5 and collaboration protocol 4 are deployed as one compatibility boundary: upgrade the API and frontend together. Persisted protocol-v2/v3 update receipts remain readable because `introduced_asset_ids` is nullable for existing rows, but every new protocol-v4 update must send the field, including an empty array when it introduces no image asset. Before this upgrade, let active boards finish saving and have collaborators reload or close existing tabs; a protocol-v3 page cannot replay page-lifetime unacknowledged edits to a protocol-v4 API.
+Schema version 5 originally introduced collaboration protocol 4 as one compatibility boundary. Persisted protocol-v2/v3 update receipts remain readable because `introduced_asset_ids` is nullable for existing rows, but every new protocol-v4-or-later update must send the field, including an empty array when it introduces no image asset.
+
+This release pairs schema version 6 with collaboration protocol 5. The schema change adds only the compacted-receipt expiry index; protocol 5 adds dynamic management permission, authenticated Awareness identity envelopes, and terminal close reasons. Upgrade the API and frontend together: protocol-4 pages are rejected at `sync_start` so they cannot keep trusting client-supplied presence identities or miss live permission changes. The maintenance worker begins enforcing the configured retention window after the upgrade. Existing receipts already older than the configured cutoff are eligible on the first maintenance pass, so raise `BOARD_UPDATE_RECEIPT_RETENTION` before upgrading if operations require a longer historical deduplication window.
 
 Prototype whiteboard content is not migrated. For a clean development upgrade:
 
@@ -126,18 +130,22 @@ Messages are WebSocket text frames containing JSON. Binary Yjs data uses standar
 
 Initial sync is ordered:
 
-1. `sync_start` with `protocol: 4`, the authoritative client/user IDs, and `can_edit` permission.
+1. `sync_start` with `protocol: 5`, the authoritative client/user IDs, and both `can_edit` and `can_manage` permissions.
 2. An optional `checkpoint`.
 3. Zero or more `update` messages ordered by `server_sequence`.
 4. `sync_complete`.
 
+Role changes on an open connection are pushed as `permission` messages containing the current `can_edit` and `can_manage` values and take effect immediately. Deleting the board or project closes affected sockets with reason `board_deleted`; revoked project access or an expired session closes them with `forbidden`. Browsers treat both reasons as terminal, clear page-lifetime collaboration state, and do not reconnect automatically.
+
 An editor sends `{type:"update", update_id, data, reference_base_sequence, asset_ids, introduced_asset_ids}`. The complete `asset_ids` manifest and the per-update `introduced_asset_ids` claim are covered by the idempotency hash. The introduced list must be present, may be empty, must be a subset of the manifest, and is validated against assets in the board's project even when the full manifest is stale. The server persists the opaque update before replying with `update_ack`; a stale manifest never rejects an otherwise independent offline update. Editor declarations cannot authorize deletion by themselves.
 
-After reaching a contiguous server sequence with no pending updates, an owner/admin client reconciles the complete manifest through `PUT /api/boards/:id/asset-references`. A stale sequence is rejected; two different manifests for the same exact sequence mark the index conflicted. Asset deletion fails closed while any project board is stale/conflicted, and returns `asset_in_use` when referenced. Opaque checkpoints are likewise accepted only from project managers; malformed incremental updates are quarantined by clients instead of preventing the board from opening.
+When a checkpoint covers an update, its Yjs payload is removed but its `update_id` and hash remain as a compacted receipt. Within `BOARD_UPDATE_RECEIPT_RETENTION` (default `720h`, 30 days), an ACK-lost replay is still recognized and acknowledged without receiving a new server sequence. Maintenance runs hourly when caught up and drains an overdue backlog in bounded transactions on subsequent worker ticks. It deletes only receipts with non-null `compacted_at` older than the cutoff; live updates are never pruned. After that window the server no longer remembers the ID: an extremely late replay may be accepted with a new sequence, and deliberate reuse for different data is no longer detected as a conflict. Applying an identical Yjs update remains content-idempotent, but it can be broadcast again and must still pass current asset validation. Set the retention longer than the maximum replay interval your clients and operations need.
+
+After reaching a contiguous server sequence with no pending updates, an owner/admin client reconciles the complete manifest through `PUT /api/boards/:id/asset-references`. A stale sequence is rejected; two different manifests for the same exact sequence mark the index conflicted. Asset deletion fails closed while any project board is stale/conflicted, and returns `asset_in_use` when referenced. Opaque checkpoints are likewise accepted only from project managers; malformed incremental updates are quarantined by clients instead of preventing the board from opening. Checkpoint requests use both update-count and elapsed-time thresholds, so an otherwise quiet room is still checkpointed; if the selected manager does not answer before the request timeout, the server reissues the request to another eligible manager.
 
 Automatic garbage collection also fails closed unless every board reference index in the project is fresh and non-conflicting. An unreferenced asset is first recorded as a candidate, then retained for `ASSET_GC_GRACE` (default `168h`, seven days). Re-referencing it or any uncertain collaboration state clears the candidate and restarts the safety window; a project that never remains continuously eligible for a full grace period intentionally defers collection. After the grace period, metadata deletion and file cleanup use the same transactional outbox as explicit deletion. Set the grace period longer than the longest reconnect/recovery interval you intend to support: once an asset has been collected, a late offline update that introduces it is rejected. This window is not a substitute for tested backups.
 
-Awareness messages carry participant, cursor, viewport, and selection state but are never persisted and do not mark a board as saved. On disconnect, the server immediately broadcasts a removal message. Viewers receive document and awareness traffic, but document updates and checkpoints are rejected.
+Awareness messages carry participant, cursor, viewport, and selection state but are never persisted and do not mark a board as saved. The server strictly parses the Awareness envelope and supplies authoritative `user_id`, `user_name`, and `awareness_ids` values from the authenticated connection and decoded envelope; identity fields claimed inside client-provided Awareness state are not trusted. On disconnect, the server immediately broadcasts a removal message. Viewers receive document and awareness traffic, but document updates and checkpoints are rejected.
 
 ## REST API
 
@@ -244,6 +252,9 @@ Important API settings:
 | `ASSET_GC_GRACE` | `168h` | Recovery window before a freshly detected unreferenced asset becomes eligible for deletion. |
 | `ASSET_GC_INTERVAL` | `10m` | Interval between orphan-asset discovery sweeps. |
 | `ASSET_GC_BATCH_SIZE` | `100` | Maximum assets considered by one discovery sweep (server-capped at 1,000). |
+| `BOARD_UPDATE_RECEIPT_RETENTION` | `720h` | Server-side idempotency window for checkpoint-compacted update IDs. |
+| `BOARD_UPDATE_RECEIPT_CLEANUP_INTERVAL` | `1h` | Interval between compacted-receipt expiry passes once the backlog is below one batch. |
+| `BOARD_UPDATE_RECEIPT_CLEANUP_BATCH_SIZE` | `1000` | Maximum expired receipts deleted per transaction (server-capped at 10,000). |
 | `UPLOAD_DIR` | `./uploads` | Local asset root. |
 | `LOG_LEVEL` | `info` | JSON log level (`debug`, `info`, `warn`, `error`). |
 

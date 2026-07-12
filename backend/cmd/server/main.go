@@ -91,6 +91,9 @@ func main() {
 	cleanupConfig.AssetGCGrace = durationEnv(logger, "ASSET_GC_GRACE", cleanupConfig.AssetGCGrace)
 	cleanupConfig.AssetGCInterval = durationEnv(logger, "ASSET_GC_INTERVAL", cleanupConfig.AssetGCInterval)
 	cleanupConfig.AssetGCBatchSize = intEnv(logger, "ASSET_GC_BATCH_SIZE", cleanupConfig.AssetGCBatchSize)
+	cleanupConfig.UpdateReceiptRetention = durationEnv(logger, "BOARD_UPDATE_RECEIPT_RETENTION", cleanupConfig.UpdateReceiptRetention)
+	cleanupConfig.UpdateReceiptInterval = durationEnv(logger, "BOARD_UPDATE_RECEIPT_CLEANUP_INTERVAL", cleanupConfig.UpdateReceiptInterval)
+	cleanupConfig.UpdateReceiptBatchSize = intEnv(logger, "BOARD_UPDATE_RECEIPT_CLEANUP_BATCH_SIZE", cleanupConfig.UpdateReceiptBatchSize)
 	cleanupConfig.Logger = logger
 	cleanupWorker, err := storagecleanup.New(repo, cleanupConfig)
 	if err != nil {

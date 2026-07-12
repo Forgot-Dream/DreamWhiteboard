@@ -208,6 +208,83 @@ func TestWorkerContinuesCleanupWhenAssetSweepFails(t *testing.T) {
 	}
 }
 
+func TestWorkerContinuesReceiptPruningWhenAssetSweepFails(t *testing.T) {
+	repo, project, asset := cleanupFixture(t, "receipt-sweep-failure.png")
+	board, err := repo.CreateBoard(project.ID, "Receipt board", asset.UploadedBy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := domain.BoardUpdate{
+		BoardID: board.ID, UpdateID: "expired-receipt", ClientID: "receipt-client", UserID: asset.UploadedBy,
+		Update: []byte{1}, IntroducedAssetIDs: []string{},
+	}
+	if _, inserted, err := repo.AppendBoardUpdate(input); err != nil || !inserted {
+		t.Fatalf("append receipt update: inserted=%v err=%v", inserted, err)
+	}
+	if _, err := repo.SaveBoardCheckpoint(board.ID, []byte{1}, 1); err != nil {
+		t.Fatalf("compact receipt update: %v", err)
+	}
+
+	now := time.Now().UTC().Add(31 * 24 * time.Hour)
+	repository := &failingSweepStore{MemoryStore: repo, err: errors.New("asset GC unavailable")}
+	cfg := testWorkerConfig(t.TempDir(), &now)
+	cfg.UpdateReceiptRetention = 30 * 24 * time.Hour
+	worker, err := New(repository, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	processed, runErr := worker.RunOnce(context.Background())
+	if processed != 0 || runErr == nil || !strings.Contains(runErr.Error(), "asset GC unavailable") {
+		t.Fatalf("receipt prune with failed sweep: processed=%d err=%v", processed, runErr)
+	}
+	replayed, inserted, err := repo.AppendBoardUpdate(input)
+	if err != nil || !inserted || replayed.ServerSequence != 2 {
+		t.Fatalf("asset GC failure blocked receipt pruning: update=%#v inserted=%v err=%v", replayed, inserted, err)
+	}
+}
+
+func TestWorkerSchedulesReceiptPruningAndDrainsFullBatches(t *testing.T) {
+	now := time.Date(2026, 7, 12, 8, 0, 0, 0, time.UTC)
+	repository := &countingReceiptStore{MemoryStore: store.NewMemoryStore(), results: []int{2, 0, 0}}
+	cfg := testWorkerConfig(t.TempDir(), &now)
+	cfg.UpdateReceiptInterval = time.Hour
+	cfg.UpdateReceiptBatchSize = 2
+	worker, err := New(repository, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.RunOnce(context.Background()); err != nil || repository.calls != 1 {
+		t.Fatalf("initial receipt prune: calls=%d err=%v", repository.calls, err)
+	}
+	now = now.Add(time.Minute)
+	if _, err := worker.RunOnce(context.Background()); err != nil || repository.calls != 2 {
+		t.Fatalf("full batch was not drained on next tick: calls=%d err=%v", repository.calls, err)
+	}
+	now = now.Add(30 * time.Minute)
+	if _, err := worker.RunOnce(context.Background()); err != nil || repository.calls != 2 {
+		t.Fatalf("receipt prune ran before interval: calls=%d err=%v", repository.calls, err)
+	}
+	now = now.Add(30 * time.Minute)
+	if _, err := worker.RunOnce(context.Background()); err != nil || repository.calls != 3 {
+		t.Fatalf("receipt prune did not resume after interval: calls=%d err=%v", repository.calls, err)
+	}
+}
+
+func TestDefaultConfigRetainsCompactedReceiptsForThirtyDays(t *testing.T) {
+	cfg := DefaultConfig(t.TempDir())
+	if cfg.UpdateReceiptRetention != 30*24*time.Hour || cfg.UpdateReceiptInterval != time.Hour || cfg.UpdateReceiptBatchSize != 1000 {
+		t.Fatalf("receipt defaults = retention %v interval %v batch %d", cfg.UpdateReceiptRetention, cfg.UpdateReceiptInterval, cfg.UpdateReceiptBatchSize)
+	}
+	cfg.UpdateReceiptBatchSize = store.MaxBoardUpdateReceiptPruneBatchSize + 1
+	worker, err := New(store.NewMemoryStore(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if worker.config.UpdateReceiptBatchSize != store.MaxBoardUpdateReceiptPruneBatchSize {
+		t.Fatalf("receipt batch cap = %d, want %d", worker.config.UpdateReceiptBatchSize, store.MaxBoardUpdateReceiptPruneBatchSize)
+	}
+}
+
 type failingSweepStore struct {
 	*store.MemoryStore
 	err error
@@ -215,6 +292,21 @@ type failingSweepStore struct {
 
 func (s *failingSweepStore) SweepOrphanedAssets(context.Context, time.Time, time.Duration, int) (int, error) {
 	return 0, s.err
+}
+
+type countingReceiptStore struct {
+	*store.MemoryStore
+	results []int
+	calls   int
+}
+
+func (s *countingReceiptStore) PruneCompactedBoardUpdateReceipts(context.Context, time.Time, int) (int, error) {
+	result := 0
+	if s.calls < len(s.results) {
+		result = s.results[s.calls]
+	}
+	s.calls++
+	return result, nil
 }
 
 func cleanupFixture(t *testing.T, storageKey string) (*store.MemoryStore, domain.Project, domain.Asset) {

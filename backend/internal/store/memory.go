@@ -669,7 +669,7 @@ func (s *MemoryStore) SaveBoardCheckpoint(boardID string, checkpoint []byte, thr
 	s.boardDocuments[boardID] = document
 	updates := s.boardUpdates[boardID]
 	for i := range updates {
-		if updates[i].ServerSequence <= throughSequence {
+		if updates[i].ServerSequence <= throughSequence && updates[i].Update != nil {
 			updates[i].Update = nil
 			compactedAt := document.UpdatedAt
 			updates[i].CompactedAt = &compactedAt

@@ -12,7 +12,7 @@ import (
 	"github.com/lib/pq"
 )
 
-const LatestSchemaVersion = 5
+const LatestSchemaVersion = 6
 
 type PostgresStore struct {
 	db *sql.DB

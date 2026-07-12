@@ -20,7 +20,7 @@ const (
 	MessageCheckpointAck     = "checkpoint_ack"
 	MessageError             = "error"
 
-	ProtocolVersion = 4
+	ProtocolVersion = 5
 
 	defaultCheckpointEvery    = int64(100)
 	defaultCheckpointInterval = 5 * time.Minute
@@ -35,21 +35,24 @@ var (
 // Message is the JSON envelope used by the realtime protocol. Data contains an
 // opaque Yjs update and is encoded as base64 by encoding/json.
 type Message struct {
-	Type            string `json:"type"`
-	Protocol        int    `json:"protocol,omitempty"`
-	BoardID         string `json:"board_id,omitempty"`
-	ClientID        string `json:"client_id,omitempty"`
-	UserID          string `json:"user_id,omitempty"`
-	CanEdit         *bool  `json:"can_edit,omitempty"`
-	UpdateID        string `json:"update_id,omitempty"`
-	ServerSequence  int64  `json:"server_sequence,omitempty"`
-	ThroughSequence int64  `json:"through_sequence,omitempty"`
-	RequestID       string `json:"request_id,omitempty"`
-	Duplicate       bool   `json:"duplicate,omitempty"`
-	Data            []byte `json:"data,omitempty"`
-	Removed         bool   `json:"removed,omitempty"`
-	Code            string `json:"code,omitempty"`
-	Message         string `json:"message,omitempty"`
+	Type            string   `json:"type"`
+	Protocol        int      `json:"protocol,omitempty"`
+	BoardID         string   `json:"board_id,omitempty"`
+	ClientID        string   `json:"client_id,omitempty"`
+	UserID          string   `json:"user_id,omitempty"`
+	UserName        string   `json:"user_name,omitempty"`
+	AwarenessIDs    []uint64 `json:"awareness_ids,omitempty"`
+	CanEdit         *bool    `json:"can_edit,omitempty"`
+	CanManage       *bool    `json:"can_manage,omitempty"`
+	UpdateID        string   `json:"update_id,omitempty"`
+	ServerSequence  int64    `json:"server_sequence,omitempty"`
+	ThroughSequence int64    `json:"through_sequence,omitempty"`
+	RequestID       string   `json:"request_id,omitempty"`
+	Duplicate       bool     `json:"duplicate,omitempty"`
+	Data            []byte   `json:"data,omitempty"`
+	Removed         bool     `json:"removed,omitempty"`
+	Code            string   `json:"code,omitempty"`
+	Message         string   `json:"message,omitempty"`
 }
 
 // Client represents one websocket connection. All application writes must go
@@ -61,10 +64,12 @@ type Client struct {
 	BoardID       string
 	CanEdit       bool
 	CanCheckpoint bool
+	CloseReason   string
 	Send          chan []byte
 	Done          chan struct{}
 
-	closeOnce sync.Once
+	closeOnce       sync.Once
+	authorizationMu sync.Mutex
 
 	// syncedThrough is guarded by the owning room mutex. It prevents an update
 	// that committed immediately before the initial database read from being
@@ -88,7 +93,12 @@ func NewClient(id, userID, boardID string, canEdit bool, sendBuffer int) *Client
 }
 
 func (c *Client) close() {
+	c.closeWithReason("")
+}
+
+func (c *Client) closeWithReason(reason string) {
 	c.closeOnce.Do(func() {
+		c.CloseReason = reason
 		close(c.Done)
 		close(c.Send)
 	})
@@ -111,16 +121,25 @@ type queuedUpdate struct {
 	except  *Client
 }
 
+type checkpointTimer interface {
+	Stop() bool
+}
+
+type checkpointTimerFactory func(time.Duration, func()) checkpointTimer
+
 type room struct {
-	mu        sync.Mutex
-	clients   map[*Client]struct{}
-	closed    bool
-	latest    int64
-	published int64
-	updates   map[int64]queuedUpdate
-	checked   int64
-	checkedAt time.Time
-	pending   *checkpointRequest
+	mu              sync.Mutex
+	clients         map[*Client]struct{}
+	closed          bool
+	latest          int64
+	published       int64
+	updates         map[int64]queuedUpdate
+	checked         int64
+	checkedAt       time.Time
+	pending         *checkpointRequest
+	checkpointTimer checkpointTimer
+	checkpointAt    time.Time
+	timerGeneration uint64
 }
 
 type Hub struct {
@@ -131,6 +150,7 @@ type Hub struct {
 	checkpointEvery    int64
 	checkpointInterval time.Duration
 	now                func() time.Time
+	newTimer           checkpointTimerFactory
 }
 
 type Option func(*Hub)
@@ -153,12 +173,25 @@ func WithClock(now func() time.Time) Option {
 	}
 }
 
+// withCheckpointTimerFactory lets package tests drive checkpoint deadlines
+// without sleeping. Production always uses time.AfterFunc.
+func withCheckpointTimerFactory(factory checkpointTimerFactory) Option {
+	return func(h *Hub) {
+		if factory != nil {
+			h.newTimer = factory
+		}
+	}
+}
+
 func NewHub(options ...Option) *Hub {
 	h := &Hub{
 		rooms:              make(map[string]*room),
 		checkpointEvery:    defaultCheckpointEvery,
 		checkpointInterval: defaultCheckpointInterval,
 		now:                time.Now,
+		newTimer: func(delay time.Duration, callback func()) checkpointTimer {
+			return time.AfterFunc(delay, callback)
+		},
 	}
 	for _, option := range options {
 		option(h)
@@ -174,6 +207,7 @@ func (h *Hub) getRoom(boardID string) *room {
 			clients:   make(map[*Client]struct{}),
 			updates:   make(map[int64]queuedUpdate),
 			checkedAt: h.now(),
+			closed:    h.closed,
 		}
 	}
 	return h.rooms[boardID]
@@ -229,10 +263,7 @@ func (h *Hub) Join(client *Client, synchronize func() (SyncState, error)) error 
 		r.checkedAt = h.now()
 	}
 	r.clients[client] = struct{}{}
-	exclude := h.expireCheckpointLocked(r)
-	if r.pending == nil && h.checkpointDueLocked(r) {
-		h.requestCheckpointLocked(client.BoardID, r, exclude)
-	}
+	h.maintainCheckpointLocked(client.BoardID, r, "")
 	return nil
 }
 
@@ -254,6 +285,7 @@ func (h *Hub) Close() {
 	for _, r := range rooms {
 		r.mu.Lock()
 		r.closed = true
+		h.stopCheckpointTimerLocked(r)
 		for client := range r.clients {
 			delete(r.clients, client)
 			client.close()
@@ -272,7 +304,7 @@ func (h *Hub) Leave(client *Client) {
 		return
 	}
 	h.announceRemovedLocked(r, []*Client{client})
-	h.retryCheckpointLocked(client.BoardID, r)
+	h.maintainCheckpointLocked(client.BoardID, r, client.ID)
 }
 
 func (h *Hub) Send(client *Client, msg Message) bool {
@@ -289,7 +321,7 @@ func (h *Hub) Send(client *Client, msg Message) bool {
 	default:
 		h.removeLocked(r, client)
 		h.announceRemovedLocked(r, []*Client{client})
-		h.retryCheckpointLocked(client.BoardID, r)
+		h.maintainCheckpointLocked(client.BoardID, r, client.ID)
 		return false
 	}
 }
@@ -299,9 +331,12 @@ func (h *Hub) Broadcast(boardID string, msg Message, except *Client) {
 	data := Encode(msg)
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.closed {
+		return
+	}
 	evicted := h.broadcastLocked(r, data, except, nil)
 	h.announceRemovedLocked(r, evicted)
-	h.retryCheckpointLocked(boardID, r)
+	h.maintainCheckpointLocked(boardID, r, "")
 }
 
 // BroadcastUpdate publishes persisted updates in contiguous server-sequence
@@ -313,6 +348,9 @@ func (h *Hub) BroadcastUpdate(boardID string, msg Message, except *Client) {
 	r := h.getRoom(boardID)
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.closed {
+		return
+	}
 	if msg.ServerSequence > r.latest {
 		r.latest = msg.ServerSequence
 	}
@@ -336,11 +374,7 @@ func (h *Hub) BroadcastUpdate(boardID string, msg Message, except *Client) {
 		r.published = next
 		h.announceRemovedLocked(r, evicted)
 	}
-	exclude := h.expireCheckpointLocked(r)
-	if r.pending == nil && h.checkpointDueLocked(r) {
-		h.requestCheckpointLocked(boardID, r, exclude)
-	}
-	h.retryCheckpointLocked(boardID, r)
+	h.maintainCheckpointLocked(boardID, r, "")
 }
 
 // ObserveUpdate records a committed sequence and checks the checkpoint policy.
@@ -350,14 +384,13 @@ func (h *Hub) ObserveUpdate(boardID string, sequence int64) {
 	r := h.getRoom(boardID)
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.closed {
+		return
+	}
 	if sequence > r.latest {
 		r.latest = sequence
 	}
-	exclude := h.expireCheckpointLocked(r)
-	if r.pending != nil || !h.checkpointDueLocked(r) {
-		return
-	}
-	h.requestCheckpointLocked(boardID, r, exclude)
+	h.maintainCheckpointLocked(boardID, r, "")
 }
 
 // ValidateCheckpoint ensures a response came from the editor selected by the
@@ -366,11 +399,8 @@ func (h *Hub) ValidateCheckpoint(client *Client, requestID string, throughSequen
 	r := h.getRoom(client.BoardID)
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	exclude := h.expireCheckpointLocked(r)
+	h.maintainCheckpointLocked(client.BoardID, r, "")
 	if r.pending == nil {
-		if h.checkpointDueLocked(r) {
-			h.requestCheckpointLocked(client.BoardID, r, exclude)
-		}
 		return false
 	}
 	return r.pending != nil &&
@@ -379,24 +409,42 @@ func (h *Hub) ValidateCheckpoint(client *Client, requestID string, throughSequen
 		r.pending.ThroughSequence == throughSequence
 }
 
-// CompleteCheckpoint advances compaction state after the repository has
-// atomically saved the checkpoint and removed covered updates.
-func (h *Hub) CompleteCheckpoint(client *Client, requestID string, throughSequence int64) bool {
+// CompleteCheckpointAndAck advances compaction state after the repository has
+// saved the checkpoint, queues its acknowledgement, and only then rechecks the
+// checkpoint policy while still holding the room lock. This guarantees that a
+// follow-up checkpoint request cannot overtake the acknowledgement.
+func (h *Hub) CompleteCheckpointAndAck(client *Client, requestID string, throughSequence int64) (bool, bool) {
 	r := h.getRoom(client.BoardID)
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.pending == nil ||
+	if _, present := r.clients[client]; !present || r.pending == nil ||
 		r.pending.ID != requestID ||
 		r.pending.ClientID != client.ID ||
 		r.pending.ThroughSequence != throughSequence {
-		return false
+		return false, false
 	}
 	r.pending = nil
 	if throughSequence > r.checked {
 		r.checked = throughSequence
 	}
 	r.checkedAt = h.now()
-	return true
+	acknowledgement := Encode(Message{
+		Type:            MessageCheckpointAck,
+		BoardID:         client.BoardID,
+		RequestID:       requestID,
+		ThroughSequence: throughSequence,
+	})
+	acknowledged := true
+	select {
+	case client.Send <- acknowledgement:
+	default:
+		acknowledged = false
+		h.removeLocked(r, client)
+		h.announceRemovedLocked(r, []*Client{client})
+	}
+	h.maintainCheckpointLocked(client.BoardID, r, client.ID)
+	_, stillPresent := r.clients[client]
+	return true, acknowledged && stillPresent
 }
 
 func (h *Hub) ClientCount(boardID string) int {
@@ -416,12 +464,11 @@ func (h *Hub) SetCanEdit(client *Client, canEdit bool) {
 		return
 	}
 	client.CanEdit = canEdit
-	if !canEdit && r.pending != nil && r.pending.ClientID == client.ID {
-		r.pending = nil
-		if h.checkpointDueLocked(r) {
-			h.requestCheckpointLocked(client.BoardID, r, client.ID)
-		}
+	exclude := ""
+	if !canEdit {
+		exclude = client.ID
 	}
+	h.maintainCheckpointLocked(client.BoardID, r, exclude)
 }
 
 // SetCanCheckpoint limits opaque checkpoint generation to project managers.
@@ -434,12 +481,11 @@ func (h *Hub) SetCanCheckpoint(client *Client, canCheckpoint bool) {
 		return
 	}
 	client.CanCheckpoint = canCheckpoint
-	if !canCheckpoint && r.pending != nil && r.pending.ClientID == client.ID {
-		r.pending = nil
-		if h.checkpointDueLocked(r) {
-			h.requestCheckpointLocked(client.BoardID, r, client.ID)
-		}
+	exclude := ""
+	if !canCheckpoint {
+		exclude = client.ID
 	}
+	h.maintainCheckpointLocked(client.BoardID, r, exclude)
 }
 
 func (h *Hub) checkpointDueLocked(r *room) bool {
@@ -495,26 +541,89 @@ func (h *Hub) requestCheckpointLocked(boardID string, r *room, excludeClientID s
 	}
 }
 
-func (h *Hub) retryCheckpointLocked(boardID string, r *room) {
-	if r.pending == nil {
+func (h *Hub) maintainCheckpointLocked(boardID string, r *room, excludeClientID string) {
+	if r.closed || len(r.clients) == 0 {
+		r.pending = nil
+		h.stopCheckpointTimerLocked(r)
 		return
 	}
-	if _, present := h.clientByIDLocked(r, r.pending.ClientID); present {
-		return
+	if r.pending != nil {
+		selected, present := h.clientByIDLocked(r, r.pending.ClientID)
+		if !present || !selected.CanEdit || !selected.CanCheckpoint || !h.now().Before(r.pending.ExpiresAt) {
+			excludeClientID = r.pending.ClientID
+			r.pending = nil
+		}
 	}
-	r.pending = nil
-	if h.checkpointDueLocked(r) {
-		h.requestCheckpointLocked(boardID, r, "")
+	if r.pending == nil && h.checkpointDueLocked(r) {
+		h.requestCheckpointLocked(boardID, r, excludeClientID)
 	}
+	h.scheduleCheckpointTimerLocked(boardID, r)
 }
 
-func (h *Hub) expireCheckpointLocked(r *room) string {
-	if r.pending == nil || h.now().Before(r.pending.ExpiresAt) {
-		return ""
+func (h *Hub) scheduleCheckpointTimerLocked(boardID string, r *room) {
+	if r.closed || len(r.clients) == 0 || r.published <= r.checked {
+		h.stopCheckpointTimerLocked(r)
+		return
 	}
-	exclude := r.pending.ClientID
-	r.pending = nil
-	return exclude
+	var deadline time.Time
+	if r.pending != nil {
+		deadline = r.pending.ExpiresAt
+	} else if h.checkpointInterval > 0 && h.hasCheckpointWriterLocked(r) {
+		deadline = r.checkedAt.Add(h.checkpointInterval)
+	}
+	if deadline.IsZero() {
+		h.stopCheckpointTimerLocked(r)
+		return
+	}
+	if r.checkpointTimer != nil && r.checkpointAt.Equal(deadline) {
+		return
+	}
+	h.stopCheckpointTimerLocked(r)
+	delay := deadline.Sub(h.now())
+	if delay < 0 {
+		delay = 0
+	}
+	generation := r.timerGeneration
+	r.checkpointAt = deadline
+	r.checkpointTimer = h.newTimer(delay, func() {
+		h.checkpointTimerFired(boardID, r, generation)
+	})
+}
+
+func (h *Hub) checkpointTimerFired(boardID string, r *room, generation uint64) {
+	h.mu.Lock()
+	current := h.rooms[boardID]
+	closed := h.closed
+	h.mu.Unlock()
+	if closed || current != r {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || r.timerGeneration != generation {
+		return
+	}
+	r.checkpointTimer = nil
+	r.checkpointAt = time.Time{}
+	h.maintainCheckpointLocked(boardID, r, "")
+}
+
+func (h *Hub) stopCheckpointTimerLocked(r *room) {
+	r.timerGeneration++
+	if r.checkpointTimer != nil {
+		r.checkpointTimer.Stop()
+		r.checkpointTimer = nil
+	}
+	r.checkpointAt = time.Time{}
+}
+
+func (h *Hub) hasCheckpointWriterLocked(r *room) bool {
+	for client := range r.clients {
+		if client.CanEdit && client.CanCheckpoint {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Hub) clientByIDLocked(r *room, id string) (*Client, bool) {
