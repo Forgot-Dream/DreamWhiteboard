@@ -38,6 +38,7 @@ services:
       MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-26214400}
       MAX_IMAGE_PIXELS: ${MAX_IMAGE_PIXELS:-40000000}
       LOGIN_RATE_LIMIT: ${LOGIN_RATE_LIMIT:-5}
+      LOGIN_IP_RATE_LIMIT: ${LOGIN_IP_RATE_LIMIT:-50}
       LOGIN_RATE_WINDOW: ${LOGIN_RATE_WINDOW:-5m}
       WS_AUTH_CHECK_INTERVAL: ${WS_AUTH_CHECK_INTERVAL:-10s}
       ASSET_GC_GRACE: ${ASSET_GC_GRACE:-168h}
@@ -67,6 +68,8 @@ services:
     image: ${FRONTEND_IMAGE:-dreamwhiteboard-frontend}
     build:
       context: ../frontend
+    environment:
+      TRUSTED_PROXY_CIDR: ${FRONTEND_TRUSTED_PROXY_CIDR:-127.255.255.255/32}
     ports:
       - "${APP_BIND:-127.0.0.1}:${APP_PORT:-8080}:80"
     depends_on:

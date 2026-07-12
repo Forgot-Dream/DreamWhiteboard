@@ -108,6 +108,28 @@ func TestPersistentCookieAuthenticationAndForcedPasswordChange(t *testing.T) {
 	assertStatus(t, rec, http.StatusUnauthorized)
 }
 
+func TestPasswordChangeClearsAccountLoginLimit(t *testing.T) {
+	repo := store.NewMemoryStore()
+	if _, err := repo.EnsureSystemAdmin("admin@example.com", initialAdminPassword); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultConfig(t.TempDir())
+	cfg.LoginLimit = 2
+	handler := NewServerWithConfig(repo, cfg)
+	cookie, _ := loginCookie(t, handler, "admin@example.com", initialAdminPassword, http.StatusOK)
+
+	for attempt := 0; attempt < 2; attempt++ {
+		_, _ = loginCookie(t, handler, "admin@example.com", "WrongPassword123!", http.StatusUnauthorized)
+	}
+	_, _ = loginCookie(t, handler, "admin@example.com", initialAdminPassword, http.StatusTooManyRequests)
+
+	cookie = changePassword(t, handler, cookie, initialAdminPassword, changedAdminPassword)
+	if cookie.Value == "" {
+		t.Fatal("password change did not renew the session")
+	}
+	_, _ = loginCookie(t, handler, "admin@example.com", changedAdminPassword, http.StatusOK)
+}
+
 func TestSessionExpirationAndLoginRateLimit(t *testing.T) {
 	repo := store.NewMemoryStore()
 	if _, err := repo.EnsureSystemAdmin("admin@example.com", initialAdminPassword); err != nil {
@@ -137,6 +159,19 @@ func TestSessionExpirationAndLoginRateLimit(t *testing.T) {
 	now = now.Add(2 * time.Hour)
 	rec = requestJSON(t, handler, http.MethodGet, "/api/me", cookie, nil)
 	assertStatus(t, rec, http.StatusUnauthorized)
+}
+
+func TestIndependentLoginIPRateLimit(t *testing.T) {
+	repo := store.NewMemoryStore()
+	cfg := DefaultConfig(t.TempDir())
+	cfg.LoginLimit = 10
+	cfg.LoginIPLimit = 2
+	handler := NewServerWithConfig(repo, cfg)
+
+	for _, email := range []string{"first@example.com", "second@example.com"} {
+		_, _ = loginCookie(t, handler, email, "WrongPassword123!", http.StatusUnauthorized)
+	}
+	_, _ = loginCookie(t, handler, "third@example.com", "WrongPassword123!", http.StatusTooManyRequests)
 }
 
 func TestRepositoryOutagesAreNotReportedAsAuthOrPermissionFailures(t *testing.T) {
@@ -239,6 +274,40 @@ func TestAdminPasswordResetRevokesSessionsAndForcesChange(t *testing.T) {
 	rec = requestJSON(t, handler, http.MethodGet, "/api/projects", replacement, nil)
 	assertStatus(t, rec, http.StatusForbidden)
 	assertErrorCode(t, rec, "password_change_required")
+}
+
+func TestAdminPasswordResetClearsAccountLoginLimit(t *testing.T) {
+	_, handler, _, adminCookie := setupAdmin(t)
+	user := createUser(t, handler, adminCookie, "locked-reset@example.com", "Locked Reset", "InitialResetPass123!", domain.SystemUser)
+
+	for attempt := 0; attempt < 5; attempt++ {
+		_, _ = loginCookie(t, handler, user.Email, "WrongResetPass123!", http.StatusUnauthorized)
+	}
+	_, _ = loginCookie(t, handler, user.Email, "InitialResetPass123!", http.StatusTooManyRequests)
+
+	rec := requestJSON(t, handler, http.MethodPost, "/api/admin/users/"+user.ID+"/password", adminCookie, map[string]any{
+		"password": "AdministratorReset123!",
+	})
+	assertStatus(t, rec, http.StatusOK)
+	replacement, _ := loginCookie(t, handler, user.Email, "AdministratorReset123!", http.StatusOK)
+	rec = requestJSON(t, handler, http.MethodGet, "/api/projects", replacement, nil)
+	assertStatus(t, rec, http.StatusForbidden)
+	assertErrorCode(t, rec, "password_change_required")
+}
+
+func TestLoginFailuresDoNotLockOtherAccountsAtSameIP(t *testing.T) {
+	_, handler, _, adminCookie := setupAdmin(t)
+	const primedEmail = "primed-before-create@example.com"
+
+	for attempt := 0; attempt < 5; attempt++ {
+		_, _ = loginCookie(t, handler, primedEmail, "WrongPrimedPass123!", http.StatusUnauthorized)
+	}
+	_, _ = loginCookie(t, handler, primedEmail, "WrongPrimedPass123!", http.StatusTooManyRequests)
+
+	primed := createUser(t, handler, adminCookie, primedEmail, "Primed User", "InitialPrimedPass123!", domain.SystemUser)
+	fresh := createUser(t, handler, adminCookie, "fresh-after-failures@example.com", "Fresh User", "InitialFreshPass123!", domain.SystemUser)
+	_, _ = loginCookie(t, handler, fresh.Email, "InitialFreshPass123!", http.StatusOK)
+	_, _ = loginCookie(t, handler, primed.Email, "InitialPrimedPass123!", http.StatusOK)
 }
 
 func TestLastSystemAdministratorCannotBeDemoted(t *testing.T) {
@@ -381,7 +450,7 @@ func TestLoginLimiterReservesConcurrentAttempts(t *testing.T) {
 		go func() {
 			defer group.Done()
 			<-start
-			if ok, _ := limiter.allow("account:target@example.com", now); ok {
+			if _, ok, _ := limiter.allow("account:target@example.com", now); ok {
 				allowed.Add(1)
 			}
 		}()
@@ -390,6 +459,49 @@ func TestLoginLimiterReservesConcurrentAttempts(t *testing.T) {
 	group.Wait()
 	if got := allowed.Load(); got != 3 {
 		t.Fatalf("concurrent limiter admitted %d attempts, want 3", got)
+	}
+}
+
+func TestLoginLimiterDoesNotReleaseAcrossWindows(t *testing.T) {
+	limiter := newLoginLimiter(2, time.Second)
+	key := "account:target@example.com"
+	start := time.Now().UTC()
+	oldReservation, ok, _ := limiter.allow(key, start)
+	if !ok {
+		t.Fatal("first window did not accept a reservation")
+	}
+	if _, ok, _ := limiter.allow(key, start.Add(2*time.Second)); !ok {
+		t.Fatal("new window did not accept a reservation")
+	}
+
+	limiter.release(oldReservation)
+	if _, ok, _ := limiter.allow(key, start.Add(2*time.Second)); !ok {
+		t.Fatal("old release unexpectedly consumed the second new-window slot")
+	}
+	if _, ok, _ := limiter.allow(key, start.Add(2*time.Second)); ok {
+		t.Fatal("old release incorrectly reduced the new-window attempt count")
+	}
+}
+
+func TestLoginLimiterDoesNotReleaseAfterResetAtSameTime(t *testing.T) {
+	limiter := newLoginLimiter(2, time.Minute)
+	key := "account:target@example.com"
+	now := time.Now().UTC()
+	oldReservation, ok, _ := limiter.allow(key, now)
+	if !ok {
+		t.Fatal("initial reservation was rejected")
+	}
+	limiter.reset(key)
+	if _, ok, _ := limiter.allow(key, now); !ok {
+		t.Fatal("post-reset reservation was rejected")
+	}
+
+	limiter.release(oldReservation)
+	if _, ok, _ := limiter.allow(key, now); !ok {
+		t.Fatal("old release unexpectedly consumed the second post-reset slot")
+	}
+	if _, ok, _ := limiter.allow(key, now); ok {
+		t.Fatal("old release incorrectly reduced the post-reset attempt count")
 	}
 }
 

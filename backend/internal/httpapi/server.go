@@ -28,6 +28,7 @@ type Config struct {
 	MaxUploadBytes int64
 	MaxImagePixels int64
 	LoginLimit     int
+	LoginIPLimit   int
 	LoginWindow    time.Duration
 	WSAuthInterval time.Duration
 	TrustProxy     bool
@@ -46,6 +47,7 @@ func DefaultConfig(uploadDir string) Config {
 		MaxUploadBytes: 25 << 20,
 		MaxImagePixels: 40_000_000,
 		LoginLimit:     5,
+		LoginIPLimit:   50,
 		LoginWindow:    5 * time.Minute,
 		WSAuthInterval: 10 * time.Second,
 		Logger:         slog.Default(),
@@ -54,18 +56,19 @@ func DefaultConfig(uploadDir string) Config {
 }
 
 type Server struct {
-	repo        store.Repository
-	uploadDir   string
-	hub         *realtime.Hub
-	handler     http.Handler
-	config      Config
-	logger      *slog.Logger
-	login       *loginLimiter
-	awareness   *awarenessRegistry
-	startupErr  error
-	wsHandlers  sync.WaitGroup
-	wsLifecycle sync.Mutex
-	wsClosing   bool
+	repo         store.Repository
+	uploadDir    string
+	hub          *realtime.Hub
+	handler      http.Handler
+	config       Config
+	logger       *slog.Logger
+	loginAccount *loginLimiter
+	loginIP      *loginLimiter
+	awareness    *awarenessRegistry
+	startupErr   error
+	wsHandlers   sync.WaitGroup
+	wsLifecycle  sync.Mutex
+	wsClosing    bool
 }
 
 // NewServer preserves the original constructor for tests and embedders. Production
@@ -77,13 +80,14 @@ func NewServer(repo store.Repository, uploadDir string) http.Handler {
 func NewServerWithConfig(repo store.Repository, cfg Config) *Server {
 	cfg = normalizeConfig(cfg)
 	s := &Server{
-		repo:      repo,
-		uploadDir: cfg.UploadDir,
-		hub:       realtime.NewHub(),
-		config:    cfg,
-		logger:    cfg.Logger,
-		login:     newLoginLimiter(cfg.LoginLimit, cfg.LoginWindow),
-		awareness: newAwarenessRegistry(),
+		repo:         repo,
+		uploadDir:    cfg.UploadDir,
+		hub:          realtime.NewHub(),
+		config:       cfg,
+		logger:       cfg.Logger,
+		loginAccount: newLoginLimiter(cfg.LoginLimit, cfg.LoginWindow),
+		loginIP:      newLoginLimiter(cfg.LoginIPLimit, cfg.LoginWindow),
+		awareness:    newAwarenessRegistry(),
 	}
 	if err := os.MkdirAll(cfg.UploadDir, 0o750); err != nil {
 		s.startupErr = err
@@ -142,6 +146,9 @@ func normalizeConfig(cfg Config) Config {
 	}
 	if cfg.LoginLimit <= 0 {
 		cfg.LoginLimit = defaults.LoginLimit
+	}
+	if cfg.LoginIPLimit <= 0 {
+		cfg.LoginIPLimit = defaults.LoginIPLimit
 	}
 	if cfg.LoginWindow <= 0 {
 		cfg.LoginWindow = defaults.LoginWindow

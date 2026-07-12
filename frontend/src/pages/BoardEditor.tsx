@@ -4,6 +4,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { api, canEdit as canUserEdit, canManage as canUserManage, type BoardAccess, type Project, type ProjectMember, type ProjectRole, type User } from '../lib/api';
 import { BoardToolbar } from '../board/BoardToolbar';
 import { CanvasViewport } from '../board/CanvasViewport';
+import { useBoardImageUpload } from '../board/imageUpload';
 import { useBoardKeyboard } from '../board/keyboard';
 import { useBoardRuntime } from '../board/runtime';
 import { useI18n } from '../lib/i18n';
@@ -49,10 +50,11 @@ function BoardWorkspace({ access, project, role, user }: { access: BoardAccess; 
   const editable = useMemo(() => canUserEdit(role, user, access.permission?.can_edit), [access.permission?.can_edit, role, user]);
   const manageable = useMemo(() => access.permission?.can_manage ?? canUserManage(role, user), [access.permission?.can_manage, role, user]);
   const runtime = useBoardRuntime(access.board.id, access.board.project_id, user, editable, manageable);
-  useBoardKeyboard(runtime);
+  const imageUpload = useBoardImageUpload(runtime);
+  useBoardKeyboard(runtime, (file) => imageUpload.upload(file) !== undefined);
   return (
     <div className="editor-shell">
-      <BoardToolbar runtime={runtime} board={access.board} project={project} onBackProjectID={access.board.project_id} />
+      <BoardToolbar runtime={runtime} board={access.board} project={project} onBackProjectID={access.board.project_id} imageUpload={imageUpload} />
       <CanvasViewport runtime={runtime} />
     </div>
   );

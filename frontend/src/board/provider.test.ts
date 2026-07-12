@@ -92,6 +92,108 @@ describe('BoardProvider', () => {
     provider.stop();
   });
 
+  it('persists a continuous drag as one merged update instead of one sequence per frame', () => {
+    const doc = new Y.Doc();
+    const block = textBlock();
+    block.set('x', 0);
+    block.set('y', 0);
+    doc.getMap<Y.Map<unknown>>('blocks').set('moving', block);
+    const remote = new Y.Doc();
+    Y.applyUpdate(remote, Y.encodeStateAsUpdate(doc));
+    const pending: number[] = [];
+    let provider: BoardProvider;
+    const commands = new BoardCommands(doc, () => true, () => provider.flushDocumentUpdates());
+    provider = createProvider(doc, true, (count) => pending.push(count));
+    provider.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    sendSyncStart(socket, true);
+    socket.receive({ type: 'sync_complete', server_sequence: 0 });
+
+    for (let frame = 0; frame < 60; frame += 1) commands.move(['moving'], 1, 2);
+
+    expect(sent(socket, 'update')).toHaveLength(0);
+    expect(pending[pending.length - 1]).toBe(1);
+    commands.stopCapturing();
+
+    const updates = sent(socket, 'update');
+    expect(updates).toHaveLength(1);
+    Y.applyUpdate(remote, decodeBase64(String(updates[0].data)));
+    expect(remote.getMap<Y.Map<unknown>>('blocks').get('moving')?.get('x')).toBe(60);
+    expect(remote.getMap<Y.Map<unknown>>('blocks').get('moving')?.get('y')).toBe(120);
+
+    socket.receive({ type: 'update_ack', update_id: updates[0].update_id, server_sequence: 1 });
+    expect(pending[pending.length - 1]).toBe(0);
+    commands.destroy();
+    provider.stop();
+    remote.destroy();
+  });
+
+  it('flushes a queued continuous update before stopping the provider', () => {
+    const doc = new Y.Doc();
+    const block = textBlock();
+    block.set('x', 0);
+    block.set('y', 0);
+    doc.getMap<Y.Map<unknown>>('blocks').set('moving', block);
+    const remote = new Y.Doc();
+    Y.applyUpdate(remote, Y.encodeStateAsUpdate(doc));
+    const provider = createProvider(doc, true, () => undefined);
+    const commands = new BoardCommands(doc, () => true, () => provider.flushDocumentUpdates());
+    provider.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    sendSyncStart(socket, true);
+    socket.receive({ type: 'sync_complete', server_sequence: 0 });
+
+    commands.move(['moving'], 12, 34);
+    expect(sent(socket, 'update')).toHaveLength(0);
+    provider.stop();
+
+    const updates = sent(socket, 'update');
+    expect(updates).toHaveLength(1);
+    Y.applyUpdate(remote, decodeBase64(String(updates[0].data)));
+    expect(remote.getMap<Y.Map<unknown>>('blocks').get('moving')?.get('x')).toBe(12);
+    expect(remote.getMap<Y.Map<unknown>>('blocks').get('moving')?.get('y')).toBe(34);
+    commands.destroy();
+    remote.destroy();
+  });
+
+  it('retains a queued continuous update across reconnect before it was flushed', async () => {
+    const doc = new Y.Doc();
+    const block = textBlock();
+    block.set('x', 0);
+    block.set('y', 0);
+    doc.getMap<Y.Map<unknown>>('blocks').set('moving', block);
+    const remote = new Y.Doc();
+    Y.applyUpdate(remote, Y.encodeStateAsUpdate(doc));
+    const provider = createProvider(doc, true, () => undefined);
+    const commands = new BoardCommands(doc, () => true, () => provider.flushDocumentUpdates());
+    provider.start();
+    const first = FakeWebSocket.instances[0];
+    first.open();
+    sendSyncStart(first, true);
+    first.receive({ type: 'sync_complete', server_sequence: 0 });
+
+    for (let frame = 0; frame < 20; frame += 1) commands.move(['moving'], 2, 3);
+    expect(sent(first, 'update')).toHaveLength(0);
+    first.close();
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    const second = FakeWebSocket.instances[1];
+    second.open();
+    sendSyncStart(second, true);
+    second.receive({ type: 'sync_complete', server_sequence: 0 });
+
+    const updates = sent(second, 'update');
+    expect(updates).toHaveLength(1);
+    Y.applyUpdate(remote, decodeBase64(String(updates[0].data)));
+    expect(remote.getMap<Y.Map<unknown>>('blocks').get('moving')?.get('x')).toBe(40);
+    expect(remote.getMap<Y.Map<unknown>>('blocks').get('moving')?.get('y')).toBe(60);
+    commands.destroy();
+    provider.stop();
+    remote.destroy();
+  });
+
   it('backs off connections that close before sync and resets the delay after a successful sync', async () => {
     const random = vi.spyOn(Math, 'random').mockReturnValue(0);
     const provider = createProvider(new Y.Doc(), true, () => undefined);
@@ -927,4 +1029,9 @@ function base64(bytes: Uint8Array) {
   let binary = '';
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary);
+}
+
+function decodeBase64(value: string) {
+  const binary = atob(value);
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
 }

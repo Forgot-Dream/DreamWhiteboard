@@ -82,6 +82,7 @@ func main() {
 	cfg.MaxUploadBytes = int64Env(logger, "MAX_UPLOAD_BYTES", cfg.MaxUploadBytes)
 	cfg.MaxImagePixels = int64Env(logger, "MAX_IMAGE_PIXELS", cfg.MaxImagePixels)
 	cfg.LoginLimit = intEnv(logger, "LOGIN_RATE_LIMIT", cfg.LoginLimit)
+	cfg.LoginIPLimit = intEnv(logger, "LOGIN_IP_RATE_LIMIT", cfg.LoginIPLimit)
 	cfg.LoginWindow = durationEnv(logger, "LOGIN_RATE_WINDOW", cfg.LoginWindow)
 	cfg.WSAuthInterval = durationEnv(logger, "WS_AUTH_CHECK_INTERVAL", cfg.WSAuthInterval)
 	cfg.TrustProxy = boolEnv(logger, "TRUST_PROXY_HEADERS", false)

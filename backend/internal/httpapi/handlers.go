@@ -452,6 +452,9 @@ func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request, _ doma
 			return
 		}
 		created, err := s.repo.CreateUser(email, req.Name, req.Password, req.SystemRole)
+		if err == nil {
+			s.loginAccount.reset("account:" + email)
+		}
 		writeResultStatus(w, r, http.StatusCreated, publicUser(created), err)
 	default:
 		methodNotAllowed(w, r, http.MethodGet, http.MethodPost)
@@ -512,7 +515,8 @@ func (s *Server) handleAdminPasswordReset(w http.ResponseWriter, r *http.Request
 		methodNotAllowed(w, r, http.MethodPost)
 		return
 	}
-	if _, err := s.repo.GetUser(userID); err != nil {
+	target, err := s.repo.GetUser(userID)
+	if err != nil {
 		writeResult(w, r, nil, err)
 		return
 	}
@@ -534,6 +538,7 @@ func (s *Server) handleAdminPasswordReset(w http.ResponseWriter, r *http.Request
 		writeResult(w, r, nil, err)
 		return
 	}
+	s.loginAccount.reset("account:" + target.Email)
 	if actor.ID == userID {
 		s.clearSessionCookie(w)
 	}

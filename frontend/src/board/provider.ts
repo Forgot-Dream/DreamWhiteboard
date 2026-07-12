@@ -2,11 +2,14 @@ import * as Y from 'yjs';
 import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate, removeAwarenessStates } from 'y-protocols/awareness';
 import { APIError, api, wsURL } from '../lib/api';
 import { createID } from '../lib/id';
+import { isBatchedBoardCommandOrigin } from './commands';
 import { introducedAssetIDs, referencedAssetIDs, referencedAssetsByBlock } from './schema';
 import type { ConnectionState, RemotePresence, Viewport } from './store';
 
 export const COLLABORATION_PROTOCOL_VERSION = 5;
 const CLOSE_PROBE_TIMEOUT_MS = 5_000;
+const DOCUMENT_UPDATE_IDLE_MS = 100;
+const DOCUMENT_UPDATE_MAX_MS = 500;
 
 interface WireMessage {
   type: string;
@@ -43,6 +46,8 @@ interface PendingUpdate {
   referenceBaseSequence: number;
   assetIDs: string[];
   introducedAssetIDs: string[];
+  baseAssetsByBlock?: Map<string, string>;
+  batchedUpdates?: Uint8Array[];
 }
 
 export class BoardProvider {
@@ -54,6 +59,9 @@ export class BoardProvider {
   private lifecycleVersion = 0;
   private reconnectAttempt = 0;
   private reconnectTimer = 0;
+  private documentUpdateIdleTimer = 0;
+  private documentUpdateMaxTimer = 0;
+  private batchedUpdateID = '';
   private closeProbeAbort: AbortController | null = null;
   private referenceTimer = 0;
   private referencesInFlight = false;
@@ -92,10 +100,12 @@ export class BoardProvider {
   }
 
   stop() {
+    this.flushDocumentUpdates();
     this.stopped = true;
     this.lifecycleVersion += 1;
     this.cancelCloseProbe();
     window.clearTimeout(this.reconnectTimer);
+    this.clearDocumentUpdateTimers();
     window.clearTimeout(this.referenceTimer);
     this.clearRemoteAwareness();
     this.awareness.setLocalState(null);
@@ -113,6 +123,13 @@ export class BoardProvider {
 
   updateLocalPresence(field: 'cursor' | 'viewport' | 'selection', value: unknown) {
     this.awareness.setLocalStateField(field, value);
+  }
+
+  flushDocumentUpdates() {
+    const updateID = this.sealBatchedUpdate();
+    if (!updateID || !this.synced) return;
+    const pending = this.pending.get(updateID);
+    if (pending) this.sendUpdate(updateID, pending);
   }
 
   private connect() {
@@ -269,6 +286,10 @@ export class BoardProvider {
         break;
       case 'checkpoint_request':
         if (this.authoritativeCanEdit && this.authoritativeCanManage && message.request_id && message.through_sequence !== undefined) {
+          // A checkpoint must never be the first network message containing a
+          // locally batched document change. WebSocket frames are ordered, so
+          // flush the update before encoding and returning the checkpoint.
+          this.flushDocumentUpdates();
           this.checkpointResponseInFlight = message.request_id;
           this.checkpointPermissionDowngraded = false;
           if (!this.send({
@@ -396,17 +417,22 @@ export class BoardProvider {
   }
 
   private handleDocumentUpdate = (update: Uint8Array, origin: unknown) => {
+    const previousAssetsByBlock = this.lastAssetsByBlock;
     const assetsByBlock = referencedAssetsByBlock(this.doc);
-    const introducedAssets = introducedAssetIDs(this.lastAssetsByBlock, assetsByBlock);
     this.lastAssetsByBlock = assetsByBlock;
-    const assetIDs = Array.from(new Set(assetsByBlock.values())).sort();
     if (origin === this || !this.authoritativeCanEdit) return;
+    if (isBatchedBoardCommandOrigin(origin)) {
+      this.mergeBatchedUpdate(update, previousAssetsByBlock, assetsByBlock);
+      return;
+    }
+    this.flushDocumentUpdates();
+    const assetIDs = Array.from(new Set(assetsByBlock.values())).sort();
     const updateID = createID('upd');
     const pending: PendingUpdate = {
       data: update.slice(),
       referenceBaseSequence: this.sequenceFrontier,
       assetIDs,
-      introducedAssetIDs: introducedAssets
+      introducedAssetIDs: introducedAssetIDs(previousAssetsByBlock, assetsByBlock)
     };
     this.pending.set(updateID, pending);
     this.callbacks.onPending(this.pending.size);
@@ -440,7 +466,61 @@ export class BoardProvider {
   };
 
   private sendPending() {
+    this.sealBatchedUpdate();
     for (const [id, update] of this.pending) this.sendUpdate(id, update);
+  }
+
+  private mergeBatchedUpdate(
+    update: Uint8Array,
+    previousAssetsByBlock: Map<string, string>,
+    assetsByBlock: Map<string, string>
+  ) {
+    let updateID = this.batchedUpdateID;
+    let pending = updateID ? this.pending.get(updateID) : undefined;
+    if (!pending) {
+      updateID = createID('upd');
+      const firstUpdate = update.slice();
+      pending = {
+        data: firstUpdate,
+        referenceBaseSequence: this.sequenceFrontier,
+        assetIDs: Array.from(new Set(assetsByBlock.values())).sort(),
+        introducedAssetIDs: introducedAssetIDs(previousAssetsByBlock, assetsByBlock),
+        baseAssetsByBlock: new Map(previousAssetsByBlock),
+        batchedUpdates: [firstUpdate]
+      };
+      this.batchedUpdateID = updateID;
+      this.pending.set(updateID, pending);
+      this.callbacks.onPending(this.pending.size);
+      this.documentUpdateMaxTimer = window.setTimeout(() => this.flushDocumentUpdates(), DOCUMENT_UPDATE_MAX_MS);
+    } else {
+      pending.batchedUpdates?.push(update.slice());
+      pending.assetIDs = Array.from(new Set(assetsByBlock.values())).sort();
+      pending.introducedAssetIDs = introducedAssetIDs(pending.baseAssetsByBlock ?? previousAssetsByBlock, assetsByBlock);
+    }
+    window.clearTimeout(this.documentUpdateIdleTimer);
+    this.documentUpdateIdleTimer = window.setTimeout(() => this.flushDocumentUpdates(), DOCUMENT_UPDATE_IDLE_MS);
+  }
+
+  private sealBatchedUpdate() {
+    const updateID = this.batchedUpdateID;
+    if (!updateID) return '';
+    this.batchedUpdateID = '';
+    this.clearDocumentUpdateTimers();
+    const pending = this.pending.get(updateID);
+    if (pending) {
+      const updates = pending.batchedUpdates;
+      if (updates?.length) pending.data = updates.length === 1 ? updates[0] : Y.mergeUpdates(updates);
+      delete pending.baseAssetsByBlock;
+      delete pending.batchedUpdates;
+    }
+    return updateID;
+  }
+
+  private clearDocumentUpdateTimers() {
+    window.clearTimeout(this.documentUpdateIdleTimer);
+    window.clearTimeout(this.documentUpdateMaxTimer);
+    this.documentUpdateIdleTimer = 0;
+    this.documentUpdateMaxTimer = 0;
   }
 
   private sendUpdate(id: string, update: PendingUpdate) {
@@ -475,6 +555,8 @@ export class BoardProvider {
     this.synced = false;
     window.clearTimeout(this.reconnectTimer);
     window.clearTimeout(this.referenceTimer);
+    this.clearDocumentUpdateTimers();
+    this.batchedUpdateID = '';
     this.checkpointResponseInFlight = '';
     this.checkpointPermissionDowngraded = false;
     this.pending.clear();
@@ -495,6 +577,8 @@ export class BoardProvider {
     this.synced = false;
     window.clearTimeout(this.reconnectTimer);
     window.clearTimeout(this.referenceTimer);
+    this.clearDocumentUpdateTimers();
+    this.batchedUpdateID = '';
     this.checkpointResponseInFlight = '';
     this.checkpointPermissionDowngraded = false;
     this.pending.clear();

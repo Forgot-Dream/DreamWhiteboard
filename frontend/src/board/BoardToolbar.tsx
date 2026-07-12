@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useRef } from 'react';
 import {
   AlignHorizontalJustifyCenter, AlignVerticalJustifyCenter, ArrowLeft, BetweenHorizontalStart,
   BetweenVerticalStart, BringToFront, ChevronDown, ChevronUp, Copy, FileImage, Hand, Maximize2, MousePointer2, Redo2,
@@ -6,20 +6,23 @@ import {
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useShallow } from 'zustand/react/shallow';
-import { uploadAsset, type Board, type Project } from '../lib/api';
+import type { Board, Project } from '../lib/api';
 import { useI18n } from '../lib/i18n';
+import type { BoardImageUpload } from './imageUpload';
 import type { BoardRuntime } from './runtime';
 import { blockBounds } from './schema';
 import { useBoardStore, type Viewport } from './store';
 
-const MAX_CLIENT_UPLOAD = 25 * 1024 * 1024;
-const ALLOWED_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif']);
-
-export function BoardToolbar({ runtime, board, project, onBackProjectID }: { runtime: BoardRuntime; board: Board; project?: Project; onBackProjectID: string }) {
+export function BoardToolbar({ runtime, board, project, onBackProjectID, imageUpload }: {
+  runtime: BoardRuntime;
+  board: Board;
+  project?: Project;
+  onBackProjectID: string;
+  imageUpload: BoardImageUpload;
+}) {
   const { errorMessage, t } = useI18n();
   const navigate = useNavigate();
   const input = useRef<HTMLInputElement>(null);
-  const [upload, setUpload] = useState<{ file: File; progress: number; error: string; controller: AbortController } | null>(null);
   const selected = useBoardStore(useShallow((state) => {
     const ids = new Set(state.selection.ids);
     return state.document.blocks.filter((block) => ids.has(block.id));
@@ -28,36 +31,6 @@ export function BoardToolbar({ runtime, board, project, onBackProjectID }: { run
   const scale = useBoardStore((state) => state.viewport.scale);
   const connection = useBoardStore(useShallow((state) => state.connection));
   const selectedOne = selected.length === 1 ? selected[0] : undefined;
-
-  async function chooseFile(file: File) {
-    if (!ALLOWED_IMAGE_TYPES.has(file.type)) { setUpload({ file, progress: 0, error: t('editor.upload.invalidType'), controller: new AbortController() }); return; }
-    if (file.size > MAX_CLIENT_UPLOAD) { setUpload({ file, progress: 0, error: t('editor.upload.tooLarge'), controller: new AbortController() }); return; }
-    const controller = new AbortController();
-    setUpload({ file, progress: 0, error: '', controller });
-    try {
-      const dimensions = await readImageDimensions(file, t('editor.upload.decodeFailed'));
-      const asset = await uploadAsset(board.project_id, file, {
-        signal: controller.signal,
-        onProgress: (progress) => setUpload((current) => current ? { ...current, progress } : null)
-      });
-      const size = fitImageSize(asset.width ?? dimensions.width, asset.height ?? dimensions.height);
-      const viewport = useBoardStore.getState().viewport;
-      const center = screenToWorld(window.innerWidth / 2, (window.innerHeight - 58) / 2, viewport);
-      const id = runtime.commands.createImage({
-        x: center.x - size.width / 2, y: center.y - size.height / 2,
-        assetId: asset.id, alt: file.name,
-        naturalWidth: asset.width ?? dimensions.width, naturalHeight: asset.height ?? dimensions.height,
-        width: size.width, height: size.height
-      });
-      if (id) useBoardStore.getState().setSelection([id]);
-      setUpload(null);
-    } catch (error) {
-      if (error instanceof DOMException && error.name === 'AbortError') { setUpload(null); return; }
-      setUpload((current) => current ? { ...current, error: errorMessage(error, 'editor.upload.failed') } : null);
-    } finally {
-      if (input.current) input.current.value = '';
-    }
-  }
 
   function fit(blocks = useBoardStore.getState().document.blocks) {
     const bounds = blockBounds(blocks);
@@ -76,8 +49,12 @@ export function BoardToolbar({ runtime, board, project, onBackProjectID }: { run
         <ToolButton active={tool === 'select'} label={t('editor.select')} onClick={() => useBoardStore.getState().setTool('select')}><MousePointer2 size={18} /></ToolButton>
         <ToolButton active={tool === 'pan'} label={t('editor.pan')} onClick={() => useBoardStore.getState().setTool('pan')}><Hand size={18} /></ToolButton>
         <ToolButton active={tool === 'text'} disabled={!runtime.canEdit} label={t('editor.textTool')} onClick={() => useBoardStore.getState().setTool('text')}><Type size={18} /></ToolButton>
-        <button className="icon-btn" disabled={!runtime.canEdit || Boolean(upload && !upload.error)} title={t('editor.uploadImage')} onClick={() => input.current?.click()}><FileImage size={18} /></button>
-        <input ref={input} hidden type="file" accept="image/png,image/jpeg,image/gif" onChange={(event) => event.target.files?.[0] && chooseFile(event.target.files[0])} />
+        <button className="icon-btn" disabled={!runtime.canEdit || Boolean(imageUpload.status && !imageUpload.status.error)} title={t('editor.uploadImage')} onClick={() => input.current?.click()}><FileImage size={18} /></button>
+        <input ref={input} hidden type="file" accept="image/png,image/jpeg,image/gif" onChange={(event) => {
+          const file = event.currentTarget.files?.[0];
+          event.currentTarget.value = '';
+          if (file) void imageUpload.upload(file);
+        }} />
         <span className="toolbar-divider" />
         <button className="icon-btn" disabled={!runtime.canEdit} title={t('editor.undo')} onClick={() => runtime.commands.undo()}><Undo2 size={18} /></button>
         <button className="icon-btn" disabled={!runtime.canEdit} title={t('editor.redo')} onClick={() => runtime.commands.redo()}><Redo2 size={18} /></button>
@@ -100,7 +77,7 @@ export function BoardToolbar({ runtime, board, project, onBackProjectID }: { run
         <button className="icon-btn" title={t('editor.resetView')} onClick={() => useBoardStore.getState().setViewport({ x: 80, y: 80, scale: 1 })}><RotateCcw size={18} /></button>
         <button className="icon-btn danger" disabled={!runtime.canEdit || !selected.length} title={t('editor.delete')} onClick={() => { const state = useBoardStore.getState(); runtime.commands.delete(state.selection.ids); state.setSelection([]); }}><Trash2 size={18} /></button>
       </div>
-      {upload && <div className={`upload-status ${upload.error ? 'failed' : ''}`}><span>{upload.error || t('editor.upload.progress', { file: upload.file.name, progress: upload.progress })}</span>{upload.error ? <button onClick={() => chooseFile(upload.file)}>{t('editor.upload.retry')}</button> : <button onClick={() => upload.controller.abort()}>{t('editor.upload.cancel')}</button>}</div>}
+      {imageUpload.status && <div className={`upload-status ${imageUpload.status.error ? 'failed' : ''}`}><span>{imageUpload.status.error || t('editor.upload.progress', { file: imageUpload.status.file.name, progress: imageUpload.status.progress })}</span>{imageUpload.status.error ? <button onClick={imageUpload.retry}>{t('editor.upload.retry')}</button> : <button onClick={imageUpload.cancel}>{t('editor.upload.cancel')}</button>}</div>}
       {connection.error && <div className="toast">{errorMessage(connection.error, 'errors.collaboration')}</div>}
     </header>
   );
@@ -145,19 +122,4 @@ function connectionLabel(state: string, pending: number, sequence: number, t: Re
 
 function screenToWorld(x: number, y: number, viewport: Viewport) {
   return { x: (x - viewport.x) / viewport.scale, y: (y - viewport.y) / viewport.scale };
-}
-
-function readImageDimensions(file: File, decodeError: string) {
-  return new Promise<{ width: number; height: number }>((resolve, reject) => {
-    const image = new Image();
-    const url = URL.createObjectURL(file);
-    image.onload = () => { URL.revokeObjectURL(url); resolve({ width: image.naturalWidth || 320, height: image.naturalHeight || 220 }); };
-    image.onerror = () => { URL.revokeObjectURL(url); reject(new Error(decodeError)); };
-    image.src = url;
-  });
-}
-
-function fitImageSize(width: number, height: number) {
-  const ratio = Math.min(1, 560 / Math.max(width, 1), 400 / Math.max(height, 1));
-  return { width: Math.max(80, Math.round(width * ratio)), height: Math.max(54, Math.round(height * ratio)) };
 }

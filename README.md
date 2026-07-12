@@ -268,7 +268,8 @@ Important API settings:
 | `MAX_REQUEST_BYTES` | `1 MiB` | JSON request limit. |
 | `MAX_UPLOAD_BYTES` | `25 MiB` | Multipart upload limit. |
 | `MAX_IMAGE_PIXELS` | `40,000,000` | Decoded image dimension limit. |
-| `LOGIN_RATE_LIMIT` / `LOGIN_RATE_WINDOW` | `5` / `5m` | Failed login throttle. |
+| `LOGIN_RATE_LIMIT` / `LOGIN_IP_RATE_LIMIT` / `LOGIN_RATE_WINDOW` | `5` / `50` / `5m` | Per-account and per-client-IP failed login throttles. |
+| `FRONTEND_TRUSTED_PROXY_CIDR` | non-matching `127.255.255.255/32` | Narrow CIDR of the one trusted proxy in front of the frontend; restores real client IPs for login throttling. Leave unchanged for direct access. |
 | `WS_AUTH_CHECK_INTERVAL` | `10s` | Maximum interval before an open collaboration socket revalidates its session and project access. |
 | `ASSET_GC_GRACE` | `168h` | Recovery window before a freshly detected unreferenced asset becomes eligible for deletion. |
 | `ASSET_GC_INTERVAL` | `10m` | Interval between orphan-asset discovery sweeps. |
@@ -279,7 +280,7 @@ Important API settings:
 | `UPLOAD_DIR` | `./uploads` | Local asset root. |
 | `LOG_LEVEL` | `info` | JSON log level (`debug`, `info`, `warn`, `error`). |
 
-For a shared deployment, terminate TLS in front of Nginx, set `SESSION_COOKIE_SECURE=true`, bind only to the intended interface, use a URL-safe random database password, restrict backup permissions, and do not reuse the bootstrap password.
+For a shared deployment, terminate TLS in front of Nginx, set `SESSION_COOKIE_SECURE=true`, and set `FRONTEND_TRUSTED_PROXY_CIDR` to only that proxy's address or narrow container-network CIDR. Never use `0.0.0.0/0`: direct clients could then spoof forwarding headers and evade IP throttling. Bind only to the intended interface, use a URL-safe random database password, restrict backup permissions, and do not reuse the bootstrap password.
 
 ## Quality gates
 

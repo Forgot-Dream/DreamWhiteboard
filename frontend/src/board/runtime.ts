@@ -59,7 +59,6 @@ export function useBoardRuntime(boardID: string, projectID: string, user: User, 
     const doc = new Y.Doc();
     const active = () => scopeRef.current === runtimeScope;
     const editable = () => active() && permission.current.canEdit;
-    const commands = new BoardCommands(doc, editable);
     const store = useBoardStore.getState;
     const provider = new BoardProvider(boardID, doc, permission.current.canEdit, permission.current.canManage, {
       onConnection: (state, sequence) => { if (active()) store().setConnection(state, sequence); },
@@ -74,6 +73,7 @@ export function useBoardRuntime(boardID: string, projectID: string, user: User, 
       },
       onResetRequired: () => { if (active()) setGeneration((current) => current + 1); }
     });
+    const commands = new BoardCommands(doc, editable, () => provider.flushDocumentUpdates());
     return { doc, commands, provider, projectID };
   }, [boardID, generation, projectID, scope, user.email, user.id, user.name]);
 

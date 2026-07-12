@@ -274,6 +274,12 @@ func randomID(prefix string) string { return prefix + "_" + randomHex(16) }
 type loginAttempt struct {
 	count       int
 	windowStart time.Time
+	generation  uint64
+}
+
+type loginReservation struct {
+	key        string
+	generation uint64
 }
 
 type loginLimiter struct {
@@ -281,6 +287,7 @@ type loginLimiter struct {
 	limit       int
 	window      time.Duration
 	lastCleanup time.Time
+	nextGen     uint64
 	attempt     map[string]loginAttempt
 }
 
@@ -288,7 +295,7 @@ func newLoginLimiter(limit int, window time.Duration) *loginLimiter {
 	return &loginLimiter{limit: limit, window: window, attempt: make(map[string]loginAttempt)}
 }
 
-func (l *loginLimiter) allow(key string, now time.Time) (bool, time.Duration) {
+func (l *loginLimiter) allow(key string, now time.Time) (loginReservation, bool, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.lastCleanup.IsZero() || now.Sub(l.lastCleanup) >= l.window {
@@ -302,35 +309,37 @@ func (l *loginLimiter) allow(key string, now time.Time) (bool, time.Duration) {
 	entry, ok := l.attempt[key]
 	if !ok || now.Sub(entry.windowStart) >= l.window {
 		if !ok && len(l.attempt) >= 100_000 {
-			return false, l.window
+			return loginReservation{}, false, l.window
 		}
-		l.attempt[key] = loginAttempt{count: 1, windowStart: now}
-		return true, 0
+		l.nextGen++
+		entry = loginAttempt{count: 1, windowStart: now, generation: l.nextGen}
+		l.attempt[key] = entry
+		return loginReservation{key: key, generation: entry.generation}, true, 0
 	}
 	if entry.count >= l.limit {
 		retry := l.window - now.Sub(entry.windowStart)
 		if retry < time.Second {
 			retry = time.Second
 		}
-		return false, retry
+		return loginReservation{}, false, retry
 	}
 	entry.count++
 	l.attempt[key] = entry
-	return true, 0
+	return loginReservation{key: key, generation: entry.generation}, true, 0
 }
 
-func (l *loginLimiter) release(key string) {
+func (l *loginLimiter) release(reservation loginReservation) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	entry, ok := l.attempt[key]
-	if !ok {
+	entry, ok := l.attempt[reservation.key]
+	if !ok || entry.generation != reservation.generation {
 		return
 	}
 	entry.count--
 	if entry.count <= 0 {
-		delete(l.attempt, key)
+		delete(l.attempt, reservation.key)
 	} else {
-		l.attempt[key] = entry
+		l.attempt[reservation.key] = entry
 	}
 }
 

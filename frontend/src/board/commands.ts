@@ -7,13 +7,29 @@ export interface ImageInput {
   naturalWidth: number; naturalHeight: number; width: number; height: number;
 }
 
+export interface BoardCommandOrigin {
+  kind: 'local-board-command';
+  delivery: 'immediate' | 'batched';
+}
+
+export function isBatchedBoardCommandOrigin(origin: unknown): origin is BoardCommandOrigin {
+  if (!origin || typeof origin !== 'object') return false;
+  const candidate = origin as Partial<BoardCommandOrigin>;
+  return candidate.kind === 'local-board-command' && candidate.delivery === 'batched';
+}
+
 export class BoardCommands {
   readonly undoManager: Y.UndoManager;
-  private readonly origin = { kind: 'local-board-command' };
+  private readonly immediateOrigin: BoardCommandOrigin = { kind: 'local-board-command', delivery: 'immediate' };
+  private readonly batchedOrigin: BoardCommandOrigin = { kind: 'local-board-command', delivery: 'batched' };
 
-  constructor(private readonly doc: Y.Doc, private readonly canEdit: () => boolean) {
+  constructor(
+    private readonly doc: Y.Doc,
+    private readonly canEdit: () => boolean,
+    private readonly flushBatchedUpdates: () => void = () => undefined
+  ) {
     this.undoManager = new Y.UndoManager(blocksMap(doc), {
-      trackedOrigins: new Set([this.origin]),
+      trackedOrigins: new Set([this.immediateOrigin, this.batchedOrigin]),
       captureTimeout: 450
     });
   }
@@ -64,7 +80,7 @@ export class BoardCommands {
       if (deleteLength > 0) text.delete(prefix, deleteLength);
       const inserted = value.slice(prefix, value.length - suffix);
       if (inserted) text.insert(prefix, inserted);
-    });
+    }, true);
   }
 
   move(ids: string[], dx: number, dy: number) {
@@ -76,7 +92,7 @@ export class BoardCommands {
         map.set('x', number(map.get('x')) + dx);
         map.set('y', number(map.get('y')) + dy);
       }
-    });
+    }, true);
   }
 
   resize(id: string, rect: { x: number; y: number; width: number; height: number }) {
@@ -86,7 +102,7 @@ export class BoardCommands {
     this.transact(() => {
       map.set('x', rect.x); map.set('y', rect.y);
       map.set('width', Math.max(24, rect.width)); map.set('height', Math.max(24, rect.height));
-    });
+    }, true);
   }
 
   updateStyle(ids: string[], patch: Partial<BlockStyle>) {
@@ -103,7 +119,7 @@ export class BoardCommands {
         if (patch.borderColor !== undefined) styleMap.set('border_color', patch.borderColor);
         if (patch.borderWidth !== undefined) styleMap.set('border_width', patch.borderWidth);
       }
-    });
+    }, true);
   }
 
   setAspectLocked(id: string, locked: boolean) {
@@ -190,15 +206,18 @@ export class BoardCommands {
 
   undo() { if (this.canEdit()) this.undoManager.undo(); }
   redo() { if (this.canEdit()) this.undoManager.redo(); }
-  stopCapturing() { this.undoManager.stopCapturing(); }
+  stopCapturing() {
+    this.undoManager.stopCapturing();
+    this.flushBatchedUpdates();
+  }
   destroy() { this.undoManager.destroy(); }
 
   private maxZ() {
     return readBlocks(this.doc).reduce((max, block) => Math.max(max, block.z), 0);
   }
 
-  private transact(callback: () => void) {
-    this.doc.transact(callback, this.origin);
+  private transact(callback: () => void, batched = false) {
+    this.doc.transact(callback, batched ? this.batchedOrigin : this.immediateOrigin);
   }
 }
 

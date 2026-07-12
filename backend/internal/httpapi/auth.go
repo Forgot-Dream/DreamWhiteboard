@@ -31,13 +31,15 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	now := s.config.Now().UTC()
 	accountLimitKey := "account:" + email
 	ipLimitKey := "ip:" + s.clientIP(r)
-	if allowed, retryAfter := s.login.allow(accountLimitKey, now); !allowed {
+	accountReservation, allowed, retryAfter := s.loginAccount.allow(accountLimitKey, now)
+	if !allowed {
 		setRetryAfter(w, retryAfter)
 		writeAPIError(w, r, http.StatusTooManyRequests, "login_rate_limited", "too many login attempts; try again later", nil)
 		return
 	}
-	if allowed, retryAfter := s.login.allow(ipLimitKey, now); !allowed {
-		s.login.release(accountLimitKey)
+	ipReservation, allowed, retryAfter := s.loginIP.allow(ipLimitKey, now)
+	if !allowed {
+		s.loginAccount.release(accountReservation)
 		setRetryAfter(w, retryAfter)
 		writeAPIError(w, r, http.StatusTooManyRequests, "login_rate_limited", "too many login attempts; try again later", nil)
 		return
@@ -48,13 +50,13 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		s.login.release(accountLimitKey)
-		s.login.release(ipLimitKey)
+		s.loginAccount.release(accountReservation)
+		s.loginIP.release(ipReservation)
 		s.writeRepositoryUnavailable(w, r, "authenticate credentials", err)
 		return
 	}
-	s.login.reset(accountLimitKey)
-	s.login.release(ipLimitKey)
+	s.loginAccount.reset(accountLimitKey)
+	s.loginIP.release(ipReservation)
 	if err := s.issueSession(w, user.ID, now); err != nil {
 		s.logger.Error("create login session", "request_id", requestID(r.Context()), "user_id", user.ID, "error", err)
 		writeAPIError(w, r, http.StatusInternalServerError, "session_create_failed", "could not create session", nil)
@@ -116,6 +118,7 @@ func (s *Server) handlePasswordChange(w http.ResponseWriter, r *http.Request, us
 		writeResult(w, r, nil, err)
 		return
 	}
+	s.loginAccount.reset("account:" + user.Email)
 	if err := s.issueSession(w, user.ID, s.config.Now().UTC()); err != nil {
 		s.logger.Error("renew session after password change", "request_id", requestID(r.Context()), "user_id", user.ID, "error", err)
 		s.clearSessionCookie(w)

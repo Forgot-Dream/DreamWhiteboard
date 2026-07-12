@@ -72,7 +72,7 @@ describe('Simplified Chinese UI coverage', () => {
     useBoardStore.getState().setConnectionError('opaque collaboration failure');
     render(
       <MemoryRouter>
-        <I18nProvider><BoardToolbar runtime={runtime} board={board} onBackProjectID={project.id} /></I18nProvider>
+        <I18nProvider><BoardToolbar runtime={runtime} board={board} onBackProjectID={project.id} imageUpload={{ status: null, upload: vi.fn(), cancel: vi.fn(), retry: vi.fn() }} /></I18nProvider>
       </MemoryRouter>
     );
 

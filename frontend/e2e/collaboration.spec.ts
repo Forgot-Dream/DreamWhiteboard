@@ -89,7 +89,7 @@ test('admin setup, dual-session collaboration, reconnect, viewer permissions, an
   await expect(adminText).toHaveValue(`${converged} offline replay`, { timeout: 20_000 });
 
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2n2kAAAAASUVORK5CYII=', 'base64');
-  await editor.locator('input[type="file"]').setInputFiles({ name: 'pixel.png', mimeType: 'image/png', buffer: png });
+  await pasteImage(editor, 'clipboard-pixel.png', 'image/png', png);
   await expect(editor.locator('.block-image img')).toBeVisible({ timeout: 15_000 });
   await expect(editor.locator('.title-block')).toContainText('synced');
   await editor.reload();
@@ -155,6 +155,20 @@ async function addMember(page: Page, email: string, role: 'editor' | 'viewer') {
   await form.locator('select').nth(1).selectOption(role);
   await form.getByRole('button', { name: 'Add' }).click();
   await expect(page.locator('.member-row', { hasText: email })).toContainText(role);
+}
+
+async function pasteImage(page: Page, name: string, type: string, bytes: Buffer) {
+  await page.evaluate(({ name, type, base64 }) => {
+    const binary = atob(base64);
+    const data = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([data], name, { type }));
+    window.dispatchEvent(new ClipboardEvent('paste', {
+      bubbles: true,
+      cancelable: true,
+      clipboardData: transfer
+    }));
+  }, { name, type, base64: bytes.toString('base64') });
 }
 
 async function compose(...args: string[]) {
