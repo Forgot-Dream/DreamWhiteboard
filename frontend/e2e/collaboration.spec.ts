@@ -88,6 +88,24 @@ test('admin setup, dual-session collaboration, reconnect, viewer permissions, an
   await editor.goto(projectURL);
   await editor.locator('.board-open', { hasText: boardName }).click();
   await expect(editor.locator('.title-block')).toContainText('synced');
+  const selectPanTool = editor.getByTitle('Select or pan canvas (V)');
+  await expect(selectPanTool).toHaveClass(/selected/);
+  const canvas = editor.locator('.canvas');
+  const world = editor.locator('.world');
+  const canvasBox = await canvas.boundingBox();
+  expect(canvasBox).not.toBeNull();
+  const viewportBeforePan = await world.evaluate((element) => {
+    const matrix = new DOMMatrixReadOnly(getComputedStyle(element).transform);
+    return { x: matrix.m41, y: matrix.m42 };
+  });
+  await editor.mouse.move(canvasBox!.x + 120, canvasBox!.y + 140);
+  await editor.mouse.down();
+  await editor.mouse.move(canvasBox!.x + 190, canvasBox!.y + 180, { steps: 4 });
+  await editor.mouse.up();
+  await expect.poll(() => world.evaluate((element) => {
+    const matrix = new DOMMatrixReadOnly(getComputedStyle(element).transform);
+    return { x: matrix.m41, y: matrix.m42 };
+  })).toEqual({ x: viewportBeforePan.x + 70, y: viewportBeforePan.y + 40 });
   await editor.getByTitle('Text').click();
   await expect(editor.getByTitle('Text')).toHaveClass(/selected/);
   await editor.locator('.canvas').click({ position: { x: 420, y: 260 } });
@@ -95,6 +113,7 @@ test('admin setup, dual-session collaboration, reconnect, viewer permissions, an
   await expect(editorText).toBeVisible({ timeout: 10_000 });
   await editorText.fill('shared seed');
   await editor.keyboard.press('Escape');
+  await expect(selectPanTool).toHaveClass(/selected/);
   await expect(editor.locator('.title-block')).toContainText('synced');
   await expect(admin.locator('.block-text textarea').first()).toHaveValue('shared seed');
 

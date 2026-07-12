@@ -94,8 +94,8 @@ describe('Simplified Chinese UI coverage', () => {
 
     expect(screen.getByTitle('返回')).toBeInTheDocument();
     expect(screen.getByRole('toolbar', { name: '白板工具' })).toBeInTheDocument();
-    expect(screen.getByTitle('选择（V）')).toBeInTheDocument();
-    expect(screen.getByTitle('平移')).toBeInTheDocument();
+    expect(screen.getByTitle('选择或拖动画布（V）')).toBeInTheDocument();
+    expect(screen.queryByTitle('平移')).not.toBeInTheDocument();
     expect(screen.getByTitle('文本')).toBeInTheDocument();
     expect(screen.getByTitle('上传图片')).toBeInTheDocument();
     expect(screen.getByTitle('撤销')).toBeInTheDocument();

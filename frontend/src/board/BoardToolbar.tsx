@@ -1,7 +1,7 @@
 import { useRef } from 'react';
 import {
   AlignHorizontalJustifyCenter, AlignVerticalJustifyCenter, ArrowLeft, BetweenHorizontalStart,
-  BetweenVerticalStart, BringToFront, ChevronDown, ChevronUp, Copy, FileImage, Hand, Maximize2, MousePointer2, Redo2,
+  BetweenVerticalStart, BringToFront, ChevronDown, ChevronUp, Copy, FileImage, Maximize2, MousePointer2, Redo2,
   RotateCcw, Scan, SendToBack, Trash2, Type, Undo2, ZoomIn, ZoomOut
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
@@ -47,7 +47,6 @@ export function BoardToolbar({ runtime, board, project, onBackProjectID, imageUp
       <div className="title-block"><strong>{board.name}</strong><span>{project?.name ?? t('editor.projectFallback')} · {connectionLabel(connection.state, connection.pending, connection.lastSequence, t)}</span></div>
       <div className="toolbar" role="toolbar" aria-label={t('editor.toolbarLabel')}>
         <ToolButton active={tool === 'select'} label={t('editor.select')} onClick={() => useBoardStore.getState().setTool('select')}><MousePointer2 size={18} /></ToolButton>
-        <ToolButton active={tool === 'pan'} label={t('editor.pan')} onClick={() => useBoardStore.getState().setTool('pan')}><Hand size={18} /></ToolButton>
         <ToolButton active={tool === 'text'} disabled={!runtime.canEdit} label={t('editor.textTool')} onClick={() => useBoardStore.getState().setTool('text')}><Type size={18} /></ToolButton>
         <button className="icon-btn" disabled={!runtime.canEdit || Boolean(imageUpload.status && !imageUpload.status.error)} title={t('editor.uploadImage')} onClick={() => input.current?.click()}><FileImage size={18} /></button>
         <input ref={input} hidden type="file" accept="image/png,image/jpeg,image/gif" onChange={(event) => {

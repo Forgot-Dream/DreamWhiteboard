@@ -6,11 +6,12 @@ import { useBoardStore, type RemotePresence, type Viewport } from './store';
 
 type ResizeHandle = 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'nw';
 type ActiveInteraction =
-  | { kind: 'pan'; start: Point; origin: Viewport }
+  | { kind: 'pan'; start: Point; origin: Viewport; clearSelectionOnClick: boolean; moved: boolean }
   | { kind: 'select-box'; start: Point; additive: boolean }
   | { kind: 'move'; ids: string[]; last: Point }
   | { kind: 'resize'; block: WhiteboardBlock; handle: ResizeHandle; start: Point };
 type Point = { x: number; y: number };
+const panThreshold = 4;
 const resizeMessageKeys = {
   n: 'editor.resize.n', ne: 'editor.resize.ne', e: 'editor.resize.e', se: 'editor.resize.se',
   s: 'editor.resize.s', sw: 'editor.resize.sw', w: 'editor.resize.w', nw: 'editor.resize.nw'
@@ -63,9 +64,9 @@ export function CanvasViewport({ runtime }: { runtime: BoardRuntime }) {
     event.preventDefault();
     const screen = localPoint(event);
     const world = toWorld(screen, viewport);
-    if (event.button === 1 || tool === 'pan') {
-      interaction.current = { kind: 'pan', start: screen, origin: viewport };
-      useBoardStore.getState().setInteraction('pan', true);
+    if (event.button === 1 || (tool === 'select' && !event.shiftKey)) {
+      startPan(event, event.button === 0);
+      return;
     } else if (tool === 'text' && runtime.canEdit) {
       const id = runtime.commands.createText(world.x - 8, world.y - 8);
       if (id) useBoardStore.getState().setSelection([id]);
@@ -80,10 +81,18 @@ export function CanvasViewport({ runtime }: { runtime: BoardRuntime }) {
 
   function pointerDownBlock(event: ReactPointerEvent<HTMLElement>, block: WhiteboardBlock) {
     event.stopPropagation();
+    if (event.button === 1) {
+      startPan(event, false);
+      return;
+    }
+    if (event.button !== 0) return;
     const store = useBoardStore.getState();
     if (event.shiftKey) store.toggleSelection(block.id);
     else if (!store.selection.ids.includes(block.id)) store.setSelection([block.id]);
-    if (!runtime.canEdit || event.button !== 0) return;
+    if (!runtime.canEdit) {
+      startPan(event, false);
+      return;
+    }
     const ids = useBoardStore.getState().selection.ids;
     if (!ids.includes(block.id)) return;
     interaction.current = { kind: 'move', ids, last: toWorld(localPoint(event), useBoardStore.getState().viewport) };
@@ -118,7 +127,11 @@ export function CanvasViewport({ runtime }: { runtime: BoardRuntime }) {
     if (!active || !screen) return;
     const store = useBoardStore.getState();
     if (active.kind === 'pan') {
-      store.setViewport({ ...active.origin, x: active.origin.x + screen.x - active.start.x, y: active.origin.y + screen.y - active.start.y });
+      const dx = screen.x - active.start.x;
+      const dy = screen.y - active.start.y;
+      if (!active.moved && Math.hypot(dx, dy) < panThreshold) return;
+      active.moved = true;
+      store.setViewport({ ...active.origin, x: active.origin.x + dx, y: active.origin.y + dy });
       return;
     }
     const world = toWorld(screen, store.viewport);
@@ -142,6 +155,9 @@ export function CanvasViewport({ runtime }: { runtime: BoardRuntime }) {
       applyLatestPointer();
     }
     const active = interaction.current;
+    if (active?.kind === 'pan' && active.clearSelectionOnClick && !active.moved) {
+      useBoardStore.getState().setSelection([]);
+    }
     if (active?.kind === 'select-box') {
       const store = useBoardStore.getState();
       const box = store.selection.box;
@@ -155,6 +171,31 @@ export function CanvasViewport({ runtime }: { runtime: BoardRuntime }) {
     latestPointer.current = null;
     useBoardStore.getState().setSelectionBox(null);
     useBoardStore.getState().setInteraction('idle', false);
+  }
+
+  function pointerCancel() {
+    if (pointerFrame.current) {
+      cancelAnimationFrame(pointerFrame.current);
+      pointerFrame.current = 0;
+    }
+    const active = interaction.current;
+    if (active?.kind === 'move' || active?.kind === 'resize') runtime.commands.stopCapturing();
+    interaction.current = null;
+    latestPointer.current = null;
+    useBoardStore.getState().setSelectionBox(null);
+    useBoardStore.getState().setInteraction('idle', false);
+  }
+
+  function startPan(event: ReactPointerEvent<HTMLElement>, clearSelectionOnClick: boolean) {
+    event.preventDefault();
+    const store = useBoardStore.getState();
+    interaction.current = {
+      kind: 'pan', start: localPoint(event), origin: store.viewport,
+      clearSelectionOnClick,
+      moved: false
+    };
+    store.setInteraction('pan', true);
+    event.currentTarget.setPointerCapture(event.pointerId);
   }
 
   function wheel(event: ReactWheelEvent<HTMLDivElement>) {
@@ -173,7 +214,7 @@ export function CanvasViewport({ runtime }: { runtime: BoardRuntime }) {
       onPointerDown={pointerDownCanvas}
       onPointerMove={pointerMove}
       onPointerUp={pointerUp}
-      onPointerCancel={pointerUp}
+      onPointerCancel={pointerCancel}
       onWheel={wheel}
     >
       <div className="world" style={{ transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})` }}>
@@ -220,7 +261,7 @@ const BlockView = memo(function BlockView({ block, selected, onlySelection, read
   const { t } = useI18n();
   return (
     <article
-      className={`block block-${block.type} ${selected ? 'selected' : ''}`}
+      className={`block block-${block.type} ${selected ? 'selected' : ''} ${readOnly ? 'read-only' : ''}`}
       style={{
         left: block.x, top: block.y, width: block.width, height: block.height, zIndex: block.z,
         background: block.style.fill, borderColor: block.style.borderColor, borderWidth: block.style.borderWidth
@@ -237,7 +278,11 @@ const BlockView = memo(function BlockView({ block, selected, onlySelection, read
             readOnly={readOnly}
             autoFocus={selected && block.text === ''}
             style={{ color: block.style.textColor }}
-            onPointerDown={(event) => { event.stopPropagation(); onSelect(event.shiftKey); }}
+            onPointerDown={(event) => {
+              event.stopPropagation();
+              if (readOnly || event.button === 1) onPointerDown(event);
+              else if (event.button === 0) onSelect(event.shiftKey);
+            }}
             onFocus={() => onSelect(false)}
             onChange={(event) => onText(event.target.value)}
             onBlur={onEmptyBlur}

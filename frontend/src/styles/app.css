@@ -281,8 +281,8 @@ textarea { resize: vertical; }
   cursor: default;
 }
 .canvas-tool-text { cursor: text; }
-.canvas-tool-pan { cursor: grab; }
-.canvas-tool-pan:active { cursor: grabbing; }
+.canvas-tool-select { cursor: grab; }
+.canvas-tool-select:active { cursor: grabbing; }
 .world { position: absolute; inset: 0; transform-origin: 0 0; pointer-events: none; }
 .canvas-stats { position: absolute; left: 10px; bottom: 9px; padding: 4px 7px; border-radius: 4px; background: rgba(255,255,255,.78); color: #66756f; font-size: 11px; pointer-events: none; }
 .selection-box { position: absolute; z-index: 100000; border: 1px solid #17746f; background: rgba(35, 102, 107, .12); pointer-events: none; }
@@ -300,6 +300,10 @@ textarea { resize: vertical; }
 .block-drag-handle { position: absolute; z-index: 2; top: 0; left: 0; width: 100%; height: 12px; border: 0; background: transparent; cursor: move; }
 .block-image { background-color: #fff; }
 .block-image img { position: relative; z-index: 1; display: block; width: 100%; height: 100%; object-fit: contain; pointer-events: none; user-select: none; }
+.block.read-only, .block.read-only .block-drag-handle { cursor: grab; }
+.block.read-only:active, .block.read-only .block-drag-handle:active { cursor: grabbing; }
+.block.read-only textarea { cursor: grab; }
+.block.read-only textarea:active { cursor: grabbing; }
 
 .remote-selection { position: absolute; z-index: 5; border: 2px solid currentColor; pointer-events: none; }
 .remote-selection span { position: absolute; left: -2px; bottom: calc(100% + 3px); max-width: 160px; padding: 3px 6px; color: #fff; font-size: 11px; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

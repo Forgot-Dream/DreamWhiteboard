@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import type { Rect, WhiteboardBlock } from './schema';
 
-export type BoardTool = 'select' | 'text' | 'pan';
+export type BoardTool = 'select' | 'text';
 export type ConnectionState = 'connecting' | 'syncing' | 'live' | 'offline';
 
 export interface Viewport {
