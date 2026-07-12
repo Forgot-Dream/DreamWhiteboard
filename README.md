@@ -45,6 +45,27 @@ docker compose -f deploy/docker-compose.yml --env-file deploy/.env ps
 
 Only Nginx binds a host port. Postgres and the API are reachable only on the internal Compose network.
 
+### Use an existing Postgres container
+
+If Postgres already runs on an external Docker bridge network, set these additional values in `deploy/.env`:
+
+```dotenv
+DATABASE_URL=postgres://application-user:url-safe-password@postgres-container:5432/application-db?sslmode=disable
+POSTGRES_NETWORK=existing-docker-network
+```
+
+Then disable the bundled database and attach the API to that network with the external-database override:
+
+```bash
+docker compose \
+  -f deploy/docker-compose.yml \
+  -f deploy/docker-compose.external-db.yml \
+  --env-file deploy/.env \
+  up -d --build
+```
+
+The database user must own an empty database or an already-compatible DreamWhiteboard schema. `GOPROXY` in `deploy/.env` can override the Go module proxy if the default is unreachable during a source build.
+
 ## Local development
 
 Start Postgres from the Compose stack after creating `deploy/.env`:
