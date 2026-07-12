@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -133,6 +134,87 @@ func TestWorkerRemovesProjectDirectoryRecursively(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, project.ID)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("project directory survived cleanup: %v", err)
 	}
+}
+
+func TestWorkerCollectsOrphanedAssetAndRemovesFile(t *testing.T) {
+	repo, project, asset := cleanupFixture(t, "orphan.png")
+	root := t.TempDir()
+	projectDir := filepath.Join(root, project.ID)
+	if err := os.MkdirAll(projectDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(projectDir, asset.StorageKey)
+	if err := os.WriteFile(path, []byte("orphan"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 7, 12, 5, 0, 0, 0, time.UTC)
+	cfg := testWorkerConfig(root, &now)
+	cfg.AssetGCGrace = time.Hour
+	cfg.AssetGCInterval = time.Minute
+	worker, err := New(repo, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if processed, err := worker.RunOnce(context.Background()); err != nil || processed != 0 {
+		t.Fatalf("mark orphan candidate: processed=%d err=%v", processed, err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("candidate file was removed before grace elapsed: %v", err)
+	}
+	if _, err := repo.GetAsset(asset.ID); err != nil {
+		t.Fatalf("candidate metadata was removed before grace elapsed: %v", err)
+	}
+
+	now = now.Add(cfg.AssetGCGrace)
+	if processed, err := worker.RunOnce(context.Background()); err != nil || processed != 1 {
+		t.Fatalf("collect orphan asset: processed=%d err=%v", processed, err)
+	}
+	if _, err := repo.GetAsset(asset.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("orphan metadata = %v, want not found", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphan file survived cleanup: %v", err)
+	}
+}
+
+func TestWorkerContinuesCleanupWhenAssetSweepFails(t *testing.T) {
+	repo, project, asset := cleanupFixture(t, "sweep-failure.png")
+	root := t.TempDir()
+	projectDir := filepath.Join(root, project.ID)
+	if err := os.MkdirAll(projectDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(projectDir, asset.StorageKey)
+	if err := os.WriteFile(path, []byte("queued"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.DeleteAsset(asset.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 7, 12, 6, 0, 0, 0, time.UTC)
+	repository := &failingSweepStore{MemoryStore: repo, err: errors.New("asset GC unavailable")}
+	worker, err := New(repository, testWorkerConfig(root, &now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	processed, err := worker.RunOnce(context.Background())
+	if processed != 1 || err == nil || !strings.Contains(err.Error(), "asset GC unavailable") {
+		t.Fatalf("cleanup with failed sweep: processed=%d err=%v", processed, err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("queued cleanup was blocked by failed sweep: %v", err)
+	}
+}
+
+type failingSweepStore struct {
+	*store.MemoryStore
+	err error
+}
+
+func (s *failingSweepStore) SweepOrphanedAssets(context.Context, time.Time, time.Duration, int) (int, error) {
+	return 0, s.err
 }
 
 func cleanupFixture(t *testing.T, storageKey string) (*store.MemoryStore, domain.Project, domain.Asset) {

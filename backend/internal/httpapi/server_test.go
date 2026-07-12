@@ -355,6 +355,14 @@ func TestSecurityHeadersCORSRequestIDAndBodyLimit(t *testing.T) {
 	if rec.Header().Get("Access-Control-Allow-Origin") != "http://localhost:5173" || rec.Header().Get("X-Content-Type-Options") != "nosniff" || rec.Header().Get("X-Request-ID") == "" {
 		t.Fatalf("security headers missing: %#v", rec.Header())
 	}
+	req = httptest.NewRequest(http.MethodOptions, "/api/boards/board/asset-references", nil)
+	req.Header.Set("Origin", "http://localhost:5173")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	assertStatus(t, rec, http.StatusNoContent)
+	if methods := rec.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(methods, http.MethodPut) {
+		t.Fatalf("CORS methods do not permit asset-reference reconciliation: %q", methods)
+	}
 
 	rec = requestJSON(t, handler, http.MethodPost, "/api/auth/login", nil, map[string]any{
 		"email": "admin@example.com", "password": strings.Repeat("x", 100),

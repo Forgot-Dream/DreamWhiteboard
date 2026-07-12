@@ -23,6 +23,7 @@ func TestValidMigrationFilename(t *testing.T) {
 	}{
 		{name: "001_init.sql", version: 1, valid: true},
 		{name: "002_v2_security_crdt.sql", version: 2, valid: true},
+		{name: "005_asset_garbage_collection.sql", version: 5, valid: true},
 		{name: "2_v2.sql", version: 2, valid: false},
 		{name: "002-V2.sql", version: 2, valid: false},
 		{name: "002_.sql", version: 2, valid: false},

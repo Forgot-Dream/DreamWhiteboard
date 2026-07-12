@@ -88,6 +88,9 @@ func main() {
 	cfg.Logger = logger
 	api := httpapi.NewServerWithConfig(repo, cfg)
 	cleanupConfig := storagecleanup.DefaultConfig(uploadDir)
+	cleanupConfig.AssetGCGrace = durationEnv(logger, "ASSET_GC_GRACE", cleanupConfig.AssetGCGrace)
+	cleanupConfig.AssetGCInterval = durationEnv(logger, "ASSET_GC_INTERVAL", cleanupConfig.AssetGCInterval)
+	cleanupConfig.AssetGCBatchSize = intEnv(logger, "ASSET_GC_BATCH_SIZE", cleanupConfig.AssetGCBatchSize)
 	cleanupConfig.Logger = logger
 	cleanupWorker, err := storagecleanup.New(repo, cleanupConfig)
 	if err != nil {

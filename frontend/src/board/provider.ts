@@ -1,11 +1,14 @@
 import * as Y from 'yjs';
 import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate, removeAwarenessStates } from 'y-protocols/awareness';
 import { APIError, api, wsURL } from '../lib/api';
-import { referencedAssetIDs } from './schema';
+import { introducedAssetIDs, referencedAssetIDs, referencedAssetsByBlock } from './schema';
 import type { ConnectionState, RemotePresence, Viewport } from './store';
+
+export const COLLABORATION_PROTOCOL_VERSION = 4;
 
 interface WireMessage {
   type: string;
+  protocol?: number;
   board_id?: string;
   client_id?: string;
   user_id?: string;
@@ -34,6 +37,7 @@ interface PendingUpdate {
   data: Uint8Array;
   referenceBaseSequence: number;
   assetIDs: string[];
+  introducedAssetIDs: string[];
 }
 
 export class BoardProvider {
@@ -51,6 +55,7 @@ export class BoardProvider {
   private latestKnownSequence = 0;
   private seenSequences = new Set<number>();
   private pending = new Map<string, PendingUpdate>();
+  private lastAssetsByBlock: Map<string, string>;
   private remoteAwarenessIDs = new Map<string, Set<number>>();
   private authoritativeCanEdit: boolean;
 
@@ -62,6 +67,7 @@ export class BoardProvider {
     private readonly callbacks: ProviderCallbacks
   ) {
     this.authoritativeCanEdit = canEdit;
+    this.lastAssetsByBlock = referencedAssetsByBlock(doc);
     this.awareness = new Awareness(doc);
     doc.on('update', this.handleDocumentUpdate);
     this.awareness.on('update', this.handleAwarenessUpdate);
@@ -121,6 +127,14 @@ export class BoardProvider {
     try { message = JSON.parse(raw) as WireMessage; } catch { return; }
     switch (message.type) {
       case 'sync_start':
+        if (message.protocol !== COLLABORATION_PROTOCOL_VERSION) {
+          this.stopped = true;
+          this.setAuthoritativePermission(false);
+          this.callbacks.onError(`Unsupported collaboration protocol ${message.protocol ?? 'unknown'}; expected v${COLLABORATION_PROTOCOL_VERSION}`);
+          this.callbacks.onConnection('offline');
+          this.socket?.close(1002, 'unsupported protocol');
+          return;
+        }
         this.setAuthoritativePermission(message.can_edit === true);
         if (!this.authoritativeCanEdit && this.pending.size > 0) {
           this.discardPendingAndReset();
@@ -191,7 +205,7 @@ export class BoardProvider {
           this.discardPendingAndReset();
           return;
         }
-        if (message.update_id && ['invalid_update', 'invalid_asset_reference', 'update_id_conflict'].includes(message.code ?? '')) {
+        if (message.update_id && ['invalid_update', 'invalid_asset_reference', 'asset_claims_required', 'update_id_conflict'].includes(message.code ?? '')) {
           this.discardPendingAndReset();
         }
         break;
@@ -216,12 +230,17 @@ export class BoardProvider {
   }
 
   private handleDocumentUpdate = (update: Uint8Array, origin: unknown) => {
+    const assetsByBlock = referencedAssetsByBlock(this.doc);
+    const introducedAssets = introducedAssetIDs(this.lastAssetsByBlock, assetsByBlock);
+    this.lastAssetsByBlock = assetsByBlock;
+    const assetIDs = Array.from(new Set(assetsByBlock.values())).sort();
     if (origin === this || !this.authoritativeCanEdit) return;
     const updateID = `upd_${crypto.randomUUID()}`;
     const pending: PendingUpdate = {
       data: update.slice(),
       referenceBaseSequence: this.sequenceFrontier,
-      assetIDs: referencedAssetIDs(this.doc)
+      assetIDs,
+      introducedAssetIDs: introducedAssets
     };
     this.pending.set(updateID, pending);
     this.callbacks.onPending(this.pending.size);
@@ -263,7 +282,8 @@ export class BoardProvider {
       update_id: id,
       data: toBase64(update.data),
       reference_base_sequence: update.referenceBaseSequence,
-      asset_ids: update.assetIDs
+      asset_ids: update.assetIDs,
+      introduced_asset_ids: update.introducedAssetIDs
     });
   }
 

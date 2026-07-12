@@ -159,11 +159,12 @@ func TestBoardUpdateIdempotencyAndCheckpointCompaction(t *testing.T) {
 	}
 
 	firstInput := domain.BoardUpdate{
-		BoardID:  board.ID,
-		UpdateID: "update-1",
-		ClientID: "client-1",
-		UserID:   user.ID,
-		Update:   []byte{1, 2, 3},
+		BoardID:            board.ID,
+		UpdateID:           "update-1",
+		ClientID:           "client-1",
+		UserID:             user.ID,
+		Update:             []byte{1, 2, 3},
+		IntroducedAssetIDs: []string{},
 	}
 	first, inserted, err := repo.AppendBoardUpdate(firstInput)
 	if err != nil || !inserted || first.ServerSequence != 1 {
@@ -179,11 +180,12 @@ func TestBoardUpdateIdempotencyAndCheckpointCompaction(t *testing.T) {
 		t.Fatalf("reused update id with different content should conflict, got %v", err)
 	}
 	second, inserted, err := repo.AppendBoardUpdate(domain.BoardUpdate{
-		BoardID:  board.ID,
-		UpdateID: "update-2",
-		ClientID: "client-1",
-		UserID:   user.ID,
-		Update:   []byte{4, 5, 6},
+		BoardID:            board.ID,
+		UpdateID:           "update-2",
+		ClientID:           "client-1",
+		UserID:             user.ID,
+		Update:             []byte{4, 5, 6},
+		IntroducedAssetIDs: []string{},
 	})
 	if err != nil || !inserted || second.ServerSequence != 2 {
 		t.Fatalf("unexpected second append: update=%#v inserted=%v err=%v", second, inserted, err)

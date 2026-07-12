@@ -9,6 +9,7 @@ DreamWhiteboard is a single-host, self-hosted collaborative whiteboard. The v2 a
 - Versioned SQL migrations, health/readiness endpoints, structured request logs, request IDs, body limits, login throttling, security headers, and a CORS allowlist.
 - Yjs `Y.Map("blocks")` documents with `text` and `image` block schemas, durable ordered updates, stable update IDs, acknowledgements, automatic reconnect/replay, checkpoints, and Awareness presence.
 - Sequence-bound image reference manifests prevent deletion of assets that are still used by a board; stale or conflicting indexes fail closed.
+- Automatic orphan-upload collection keeps newly unreferenced assets for a configurable seven-day grace period and removes files through the durable cleanup outbox.
 - A routed React UI using TanStack Query and Zustand, including multi-select, box select, undo/redo, copy/cut/paste, duplicate, z-ordering, align/distribute, keyboard movement, image upload progress/cancel/retry, and saved per-board viewports.
 - Same-origin Nginx proxying, private API/Postgres networks, container health checks, graceful shutdown, backup/restore verification scripts, CI, dependency updates, vulnerability scans, and tagged image publishing.
 - A transactional Postgres cleanup outbox retries asset-file and project-directory removal across filesystem errors and process restarts.
@@ -104,6 +105,9 @@ Later migrations add:
 
 - `storage_cleanup_jobs`: leased, retryable filesystem deletion jobs written in the same transaction as metadata deletion.
 - `board_asset_reference_state` and `board_asset_references`: the last exact, server-sequence-bound asset manifest for each board.
+- `board_updates.introduced_asset_ids` and `asset_gc_candidates`: protocol-v4 asset-introduction claims and delayed orphan-asset collection.
+
+Schema version 5 and collaboration protocol 4 are deployed as one compatibility boundary: upgrade the API and frontend together. Persisted protocol-v2/v3 update receipts remain readable because `introduced_asset_ids` is nullable for existing rows, but every new protocol-v4 update must send the field, including an empty array when it introduces no image asset. Before this upgrade, let active boards finish saving and have collaborators reload or close existing tabs; a protocol-v3 page cannot replay page-lifetime unacknowledged edits to a protocol-v4 API.
 
 Prototype whiteboard content is not migrated. For a clean development upgrade:
 
@@ -122,14 +126,16 @@ Messages are WebSocket text frames containing JSON. Binary Yjs data uses standar
 
 Initial sync is ordered:
 
-1. `sync_start` with the authoritative client/user IDs and `can_edit` permission.
+1. `sync_start` with `protocol: 4`, the authoritative client/user IDs, and `can_edit` permission.
 2. An optional `checkpoint`.
 3. Zero or more `update` messages ordered by `server_sequence`.
 4. `sync_complete`.
 
-An editor sends `{type:"update", update_id, data, reference_base_sequence, asset_ids}`. The manifest is derived from the complete local Yjs document and is covered by the update's idempotency hash. The server persists the opaque update before replying with `update_ack`; a stale manifest never rejects an otherwise independent offline update. Editor declarations cannot authorize deletion by themselves.
+An editor sends `{type:"update", update_id, data, reference_base_sequence, asset_ids, introduced_asset_ids}`. The complete `asset_ids` manifest and the per-update `introduced_asset_ids` claim are covered by the idempotency hash. The introduced list must be present, may be empty, must be a subset of the manifest, and is validated against assets in the board's project even when the full manifest is stale. The server persists the opaque update before replying with `update_ack`; a stale manifest never rejects an otherwise independent offline update. Editor declarations cannot authorize deletion by themselves.
 
 After reaching a contiguous server sequence with no pending updates, an owner/admin client reconciles the complete manifest through `PUT /api/boards/:id/asset-references`. A stale sequence is rejected; two different manifests for the same exact sequence mark the index conflicted. Asset deletion fails closed while any project board is stale/conflicted, and returns `asset_in_use` when referenced. Opaque checkpoints are likewise accepted only from project managers; malformed incremental updates are quarantined by clients instead of preventing the board from opening.
+
+Automatic garbage collection also fails closed unless every board reference index in the project is fresh and non-conflicting. An unreferenced asset is first recorded as a candidate, then retained for `ASSET_GC_GRACE` (default `168h`, seven days). Re-referencing it or any uncertain collaboration state clears the candidate and restarts the safety window; a project that never remains continuously eligible for a full grace period intentionally defers collection. After the grace period, metadata deletion and file cleanup use the same transactional outbox as explicit deletion. Set the grace period longer than the longest reconnect/recovery interval you intend to support: once an asset has been collected, a late offline update that introduces it is rejected. This window is not a substitute for tested backups.
 
 Awareness messages carry participant, cursor, viewport, and selection state but are never persisted and do not mark a board as saved. On disconnect, the server immediately broadcasts a removal message. Viewers receive document and awareness traffic, but document updates and checkpoints are rejected.
 
@@ -235,6 +241,9 @@ Important API settings:
 | `MAX_IMAGE_PIXELS` | `40,000,000` | Decoded image dimension limit. |
 | `LOGIN_RATE_LIMIT` / `LOGIN_RATE_WINDOW` | `5` / `5m` | Failed login throttle. |
 | `WS_AUTH_CHECK_INTERVAL` | `10s` | Maximum interval before an open collaboration socket revalidates its session and project access. |
+| `ASSET_GC_GRACE` | `168h` | Recovery window before a freshly detected unreferenced asset becomes eligible for deletion. |
+| `ASSET_GC_INTERVAL` | `10m` | Interval between orphan-asset discovery sweeps. |
+| `ASSET_GC_BATCH_SIZE` | `100` | Maximum assets considered by one discovery sweep (server-capped at 1,000). |
 | `UPLOAD_DIR` | `./uploads` | Local asset root. |
 | `LOG_LEVEL` | `info` | JSON log level (`debug`, `info`, `warn`, `error`). |
 

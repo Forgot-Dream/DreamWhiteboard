@@ -20,7 +20,7 @@ const (
 	MessageCheckpointAck     = "checkpoint_ack"
 	MessageError             = "error"
 
-	ProtocolVersion = 3
+	ProtocolVersion = 4
 
 	defaultCheckpointEvery    = int64(100)
 	defaultCheckpointInterval = 5 * time.Minute

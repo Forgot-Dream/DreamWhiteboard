@@ -40,6 +40,7 @@ type wsClientMessage struct {
 	ThroughSequence       int64    `json:"through_sequence"`
 	ReferenceBaseSequence *int64   `json:"reference_base_sequence"`
 	AssetIDs              []string `json:"asset_ids"`
+	IntroducedAssetIDs    []string `json:"introduced_asset_ids"`
 	Data                  []byte   `json:"data"`
 }
 
@@ -309,11 +310,15 @@ func (s *Server) handleBoardWSMessage(client *realtime.Client, board domain.Boar
 			Update:                message.Data,
 			ReferenceBaseSequence: message.ReferenceBaseSequence,
 			AssetIDs:              message.AssetIDs,
+			IntroducedAssetIDs:    message.IntroducedAssetIDs,
 			AssetManifestTrusted:  canManage,
 		})
 		if err != nil {
 			if errors.Is(err, store.ErrUpdateIDConflict) {
 				return s.sendWSError(client, "update_id_conflict", "update_id was already used for different data", message.UpdateID)
+			}
+			if errors.Is(err, store.ErrAssetClaimsRequired) {
+				return s.sendWSError(client, "asset_claims_required", "introduced_asset_ids is required by collaboration protocol v4", message.UpdateID)
 			}
 			if errors.Is(err, store.ErrInvalidAssetReference) {
 				return s.sendWSError(client, "invalid_asset_reference", "asset references must exist in the board project", message.UpdateID)

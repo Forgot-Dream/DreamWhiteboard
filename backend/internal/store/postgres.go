@@ -12,7 +12,7 @@ import (
 	"github.com/lib/pq"
 )
 
-const LatestSchemaVersion = 4
+const LatestSchemaVersion = 5
 
 type PostgresStore struct {
 	db *sql.DB
@@ -50,17 +50,18 @@ func (s *PostgresStore) Ready(ctx context.Context) error {
 	if count != LatestSchemaVersion || minimum != 1 || maximum != LatestSchemaVersion || verified != LatestSchemaVersion {
 		return fmt.Errorf("database migration history is incomplete or incompatible: count=%d verified=%d min=%d max=%d required=1..%d", count, verified, minimum, maximum, LatestSchemaVersion)
 	}
-	var sessions, documents, updates, cleanupJobs, referenceState, references sql.NullString
+	var sessions, documents, updates, cleanupJobs, referenceState, references, gcCandidates sql.NullString
 	if err := s.db.QueryRowContext(ctx, `SELECT
 		to_regclass('sessions'),
 		to_regclass('board_documents'),
 		to_regclass('board_updates'),
 		to_regclass('storage_cleanup_jobs'),
 		to_regclass('board_asset_reference_state'),
-		to_regclass('board_asset_references')`).Scan(&sessions, &documents, &updates, &cleanupJobs, &referenceState, &references); err != nil {
+		to_regclass('board_asset_references'),
+		to_regclass('asset_gc_candidates')`).Scan(&sessions, &documents, &updates, &cleanupJobs, &referenceState, &references, &gcCandidates); err != nil {
 		return fmt.Errorf("inspect required schema: %w", err)
 	}
-	if !sessions.Valid || !documents.Valid || !updates.Valid || !cleanupJobs.Valid || !referenceState.Valid || !references.Valid {
+	if !sessions.Valid || !documents.Valid || !updates.Valid || !cleanupJobs.Valid || !referenceState.Valid || !references.Valid || !gcCandidates.Valid {
 		return fmt.Errorf("database schema is missing required relations")
 	}
 	return nil
@@ -672,7 +673,7 @@ func (s *PostgresStore) LoadBoardDocument(boardID string) (domain.BoardDocument,
 	if err != nil {
 		return domain.BoardDocument{}, nil, mapSQLError(err)
 	}
-	rows, err := tx.Query(`SELECT board_id, server_sequence, update_id, client_id, user_id, update_data, update_hash, compacted_at, created_at
+	rows, err := tx.Query(`SELECT board_id, server_sequence, update_id, client_id, user_id, update_data, update_hash, introduced_asset_ids, compacted_at, created_at
 		FROM board_updates
 		WHERE board_id=$1 AND server_sequence>$2
 		ORDER BY server_sequence`, boardID, document.CheckpointSequence)
@@ -702,6 +703,7 @@ func (s *PostgresStore) AppendBoardUpdate(update domain.BoardUpdate) (domain.Boa
 		return domain.BoardUpdate{}, false, ErrInvalidInput
 	}
 	manifestPresent := update.AssetIDs != nil
+	introducedAssetsPresent := update.IntroducedAssetIDs != nil
 	if manifestPresent != (update.ReferenceBaseSequence != nil) || (update.ReferenceBaseSequence != nil && *update.ReferenceBaseSequence < 0) {
 		return domain.BoardUpdate{}, false, ErrInvalidInput
 	}
@@ -709,8 +711,16 @@ func (s *PostgresStore) AppendBoardUpdate(update domain.BoardUpdate) (domain.Boa
 	if err != nil {
 		return domain.BoardUpdate{}, false, err
 	}
+	introduced, err := canonicalAssetIDs(update.IntroducedAssetIDs)
+	if err != nil {
+		return domain.BoardUpdate{}, false, err
+	}
+	if !assetIDsContainAll(canonical, introduced) {
+		return domain.BoardUpdate{}, false, ErrInvalidAssetReference
+	}
 	update.AssetIDs = canonical
-	update.UpdateHash = hashBoardUpdate(update.Update, update.ReferenceBaseSequence, canonical)
+	update.IntroducedAssetIDs = introduced
+	update.UpdateHash = hashBoardUpdate(update.Update, update.ReferenceBaseSequence, canonical, introduced)
 	tx, err := s.db.Begin()
 	if err != nil {
 		return domain.BoardUpdate{}, false, err
@@ -721,7 +731,7 @@ func (s *PostgresStore) AppendBoardUpdate(update domain.BoardUpdate) (domain.Boa
 		return domain.BoardUpdate{}, false, err
 	}
 	var existing domain.BoardUpdate
-	err = tx.QueryRow(`SELECT board_id, server_sequence, update_id, client_id, user_id, update_data, update_hash, compacted_at, created_at
+	err = tx.QueryRow(`SELECT board_id, server_sequence, update_id, client_id, user_id, update_data, update_hash, introduced_asset_ids, compacted_at, created_at
 		FROM board_updates WHERE board_id=$1 AND update_id=$2`, update.BoardID, update.UpdateID).Scan(
 		&existing.BoardID,
 		&existing.ServerSequence,
@@ -730,6 +740,7 @@ func (s *PostgresStore) AppendBoardUpdate(update domain.BoardUpdate) (domain.Boa
 		&existing.UserID,
 		&existing.Update,
 		&existing.UpdateHash,
+		pq.Array(&existing.IntroducedAssetIDs),
 		&existing.CompactedAt,
 		&existing.CreatedAt,
 	)
@@ -745,9 +756,17 @@ func (s *PostgresStore) AppendBoardUpdate(update domain.BoardUpdate) (domain.Boa
 	if !errors.Is(err, sql.ErrNoRows) {
 		return domain.BoardUpdate{}, false, err
 	}
+	if !introducedAssetsPresent {
+		return domain.BoardUpdate{}, false, ErrAssetClaimsRequired
+	}
 	latestSequence, err := latestBoardSequenceTx(tx, update.BoardID, checkpointSequence)
 	if err != nil {
 		return domain.BoardUpdate{}, false, err
+	}
+	if introducedAssetsPresent {
+		if err := validateProjectAssetReferencesTx(tx, projectID, introduced); err != nil {
+			return domain.BoardUpdate{}, false, err
+		}
 	}
 	if manifestPresent && update.AssetManifestTrusted && *update.ReferenceBaseSequence == latestSequence {
 		if err := validateProjectAssetReferencesTx(tx, projectID, canonical); err != nil {
@@ -757,8 +776,8 @@ func (s *PostgresStore) AppendBoardUpdate(update domain.BoardUpdate) (domain.Boa
 	update.ServerSequence = latestSequence + 1
 	update.CreatedAt = time.Now().UTC()
 	_, err = tx.Exec(`INSERT INTO board_updates
-		(board_id, server_sequence, update_id, client_id, user_id, update_data, update_hash, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		(board_id, server_sequence, update_id, client_id, user_id, update_data, update_hash, introduced_asset_ids, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
 		update.BoardID,
 		update.ServerSequence,
 		update.UpdateID,
@@ -766,6 +785,7 @@ func (s *PostgresStore) AppendBoardUpdate(update domain.BoardUpdate) (domain.Boa
 		update.UserID,
 		update.Update,
 		update.UpdateHash,
+		pq.Array(update.IntroducedAssetIDs),
 		update.CreatedAt,
 	)
 	if err != nil {
@@ -778,6 +798,8 @@ func (s *PostgresStore) AppendBoardUpdate(update domain.BoardUpdate) (domain.Boa
 		if _, err := replaceBoardAssetReferencesTx(tx, update.BoardID, projectID, update.UserID, update.ServerSequence, canonical); err != nil {
 			return domain.BoardUpdate{}, false, err
 		}
+	} else if err := clearAssetGCCandidatesTx(tx, projectID); err != nil {
+		return domain.BoardUpdate{}, false, err
 	}
 	if err := tx.Commit(); err != nil {
 		return domain.BoardUpdate{}, false, err
@@ -909,7 +931,8 @@ func (s *PostgresStore) DeleteAsset(id string) error {
 	if err := tx.QueryRow(`SELECT id FROM projects WHERE id=$1 FOR UPDATE`, projectID).Scan(&lockedProject); err != nil {
 		return mapSQLError(err)
 	}
-	if err := lockFreshProjectBoardReferencesTx(tx, projectID); err != nil {
+	boards, err := lockProjectBoardDocumentsTx(tx, projectID)
+	if err != nil {
 		return err
 	}
 	var lockedProjectID, storageKey string
@@ -918,6 +941,9 @@ func (s *PostgresStore) DeleteAsset(id string) error {
 	}
 	if lockedProjectID != projectID {
 		return ErrInvalidAssetReference
+	}
+	if err := validateFreshProjectBoardReferencesTx(tx, boards); err != nil {
+		return err
 	}
 	var referenced bool
 	if err := tx.QueryRow(`SELECT EXISTS (
@@ -988,6 +1014,7 @@ func scanBoardUpdate(row interface{ Scan(...any) error }, update *domain.BoardUp
 		&update.UserID,
 		&update.Update,
 		&update.UpdateHash,
+		pq.Array(&update.IntroducedAssetIDs),
 		&update.CompactedAt,
 		&update.CreatedAt,
 	)

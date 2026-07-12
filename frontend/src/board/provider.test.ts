@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
-import { BoardProvider } from './provider';
+import { BoardCommands } from './commands';
+import { BoardProvider, COLLABORATION_PROTOCOL_VERSION } from './provider';
 
 class FakeWebSocket {
   static readonly CONNECTING = 0;
@@ -62,28 +63,107 @@ describe('BoardProvider', () => {
     provider.start();
     const first = FakeWebSocket.instances[0];
     first.open();
-    first.receive({ type: 'sync_start', can_edit: true });
+    sendSyncStart(first, true);
     first.receive({ type: 'sync_complete', server_sequence: 0 });
 
-    doc.getMap('blocks').set('local', 'value');
+    doc.getMap<Y.Map<unknown>>('blocks').set('local', textBlock());
     const firstUpdate = sent(first, 'update')[0];
     expect(firstUpdate.update_id).toMatch(/^upd_/);
+    expect(firstUpdate.asset_ids).toEqual([]);
+    expect(firstUpdate.introduced_asset_ids).toEqual([]);
     expect(pending[pending.length - 1]).toBe(1);
 
     first.close();
     await vi.advanceTimersByTimeAsync(1_000);
     const second = FakeWebSocket.instances[1];
     second.open();
-    second.receive({ type: 'sync_start', can_edit: true });
+    sendSyncStart(second, true);
     second.receive({ type: 'sync_complete', server_sequence: 0 });
     const resent = sent(second, 'update')[0];
     expect(resent.update_id).toBe(firstUpdate.update_id);
     expect(resent.data).toBe(firstUpdate.data);
     expect(resent.reference_base_sequence).toBe(0);
     expect(resent.asset_ids).toEqual([]);
+    expect(resent.introduced_asset_ids).toEqual([]);
 
     second.receive({ type: 'update_ack', update_id: resent.update_id, server_sequence: 1, duplicate: true });
     expect(pending[pending.length - 1]).toBe(0);
+    provider.stop();
+  });
+
+  it('requires the collaboration protocol v4 handshake', () => {
+    const errors: string[] = [];
+    const permissions: boolean[] = [];
+    const provider = createProvider(new Y.Doc(), true, () => undefined, {
+      onError: (message) => errors.push(message),
+      onPermission: (allowed) => permissions.push(allowed)
+    });
+    provider.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    socket.receive({ type: 'sync_start', protocol: 3, can_edit: true });
+
+    expect(COLLABORATION_PROTOCOL_VERSION).toBe(4);
+    expect(errors[errors.length - 1]).toContain('expected v4');
+    expect(permissions).toEqual([false]);
+    expect(socket.readyState).toBe(FakeWebSocket.CLOSED);
+    provider.stop();
+  });
+
+  it('claims new block-to-asset mappings, including reuse and an asset change on an existing block', () => {
+    const doc = new Y.Doc();
+    const provider = createProvider(doc, true, () => undefined);
+    provider.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    sendSyncStart(socket, true);
+    socket.receive({ type: 'sync_complete', server_sequence: 0 });
+    const blocks = doc.getMap<Y.Map<unknown>>('blocks');
+
+    blocks.set('image-1', imageBlock('ast_1'));
+    expect(latestSent(socket, 'update')).toMatchObject({
+      asset_ids: ['ast_1'],
+      introduced_asset_ids: ['ast_1']
+    });
+
+    blocks.set('image-2', imageBlock('ast_1'));
+    expect(latestSent(socket, 'update')).toMatchObject({
+      asset_ids: ['ast_1'],
+      introduced_asset_ids: ['ast_1']
+    });
+
+    const image = blocks.get('image-1')?.get('image');
+    expect(image).toBeInstanceOf(Y.Map);
+    (image as Y.Map<unknown>).set('asset_id', 'ast_2');
+    expect(latestSent(socket, 'update')).toMatchObject({
+      asset_ids: ['ast_1', 'ast_2'],
+      introduced_asset_ids: ['ast_2']
+    });
+    provider.stop();
+  });
+
+  it('sends empty claims for deletion and redo, but reclaims the restored mapping on undo', () => {
+    const doc = new Y.Doc();
+    doc.getMap<Y.Map<unknown>>('blocks').set('image-1', imageBlock('ast_1'));
+    const commands = new BoardCommands(doc, () => true);
+    const provider = createProvider(doc, true, () => undefined);
+    provider.start();
+    const socket = FakeWebSocket.instances[0];
+    socket.open();
+    sendSyncStart(socket, true);
+    socket.receive({ type: 'sync_complete', server_sequence: 0 });
+
+    commands.delete(['image-1']);
+    commands.stopCapturing();
+    commands.undo();
+    commands.redo();
+
+    const updates = sent(socket, 'update');
+    expect(updates).toHaveLength(3);
+    expect(updates[0]).toMatchObject({ asset_ids: [], introduced_asset_ids: [] });
+    expect(updates[1]).toMatchObject({ asset_ids: ['ast_1'], introduced_asset_ids: ['ast_1'] });
+    expect(updates[2]).toMatchObject({ asset_ids: [], introduced_asset_ids: [] });
+    commands.destroy();
     provider.stop();
   });
 
@@ -93,7 +173,7 @@ describe('BoardProvider', () => {
     provider.start();
     const socket = FakeWebSocket.instances[0];
     socket.open();
-    socket.receive({ type: 'sync_start', can_edit: false });
+    sendSyncStart(socket, false);
     socket.receive({ type: 'sync_complete', server_sequence: 0 });
 
     const remote = new Y.Doc();
@@ -119,7 +199,7 @@ describe('BoardProvider', () => {
     provider.start();
     const socket = FakeWebSocket.instances[0];
     socket.open();
-    socket.receive({ type: 'sync_start', can_edit: true });
+    sendSyncStart(socket, true);
     socket.receive({ type: 'sync_complete', server_sequence: 0 });
 
     doc.getMap('blocks').set('local', 'rejected');
@@ -144,7 +224,7 @@ describe('BoardProvider', () => {
     provider.start();
     const socket = FakeWebSocket.instances[0];
     socket.open();
-    socket.receive({ type: 'sync_start', can_edit: true });
+    sendSyncStart(socket, true);
     socket.receive({ type: 'checkpoint', server_sequence: 7, data: base64(Y.encodeStateAsUpdate(doc)) });
     socket.receive({ type: 'sync_complete', server_sequence: 7 });
 
@@ -162,7 +242,7 @@ describe('BoardProvider', () => {
     provider.start();
     const socket = FakeWebSocket.instances[0];
     socket.open();
-    socket.receive({ type: 'sync_start', can_edit: true });
+    sendSyncStart(socket, true);
     socket.receive({ type: 'sync_complete', server_sequence: 0 });
     await vi.advanceTimersByTimeAsync(100);
     vi.mocked(fetch).mockClear();
@@ -190,7 +270,7 @@ describe('BoardProvider', () => {
     provider.start();
     const first = FakeWebSocket.instances[0];
     first.open();
-    first.receive({ type: 'sync_start', can_edit: true });
+    sendSyncStart(first, true);
     first.receive({ type: 'sync_complete', server_sequence: 0 });
     doc.getMap('blocks').set('local', 'value');
     const update = sent(first, 'update')[0];
@@ -200,7 +280,7 @@ describe('BoardProvider', () => {
     await vi.advanceTimersByTimeAsync(1_000);
     const second = FakeWebSocket.instances[1];
     second.open();
-    second.receive({ type: 'sync_start', can_edit: true });
+    sendSyncStart(second, true);
     second.receive({ type: 'sync_complete', server_sequence: 0 });
     expect(resets).toBe(1);
     provider.stop();
@@ -220,7 +300,7 @@ describe('BoardProvider', () => {
     provider.start();
     const socket = FakeWebSocket.instances[0];
     socket.open();
-    socket.receive({ type: 'sync_start', can_edit: true });
+    sendSyncStart(socket, true);
     socket.receive({ type: 'sync_complete', server_sequence: 0 });
 
     await vi.advanceTimersByTimeAsync(100);
@@ -235,7 +315,7 @@ describe('BoardProvider', () => {
     provider.start();
     const socket = FakeWebSocket.instances[0];
     socket.open();
-    socket.receive({ type: 'sync_start', can_edit: true });
+    sendSyncStart(socket, true);
     socket.receive({ type: 'sync_complete', server_sequence: 0 });
     await vi.advanceTimersByTimeAsync(100);
     expect(fetch).not.toHaveBeenCalled();
@@ -249,7 +329,7 @@ describe('BoardProvider', () => {
     provider.start();
     const socket = FakeWebSocket.instances[0];
     socket.open();
-    socket.receive({ type: 'sync_start', can_edit: true });
+    sendSyncStart(socket, true);
     socket.receive({ type: 'sync_complete', server_sequence: 0 });
     socket.receive({ type: 'update', update_id: 'malformed', server_sequence: 1, data: base64(new Uint8Array([1])) });
 
@@ -279,6 +359,33 @@ function createProvider(
 
 function sent(socket: FakeWebSocket, type: string) {
   return socket.sent.map((value) => JSON.parse(value) as Record<string, unknown>).filter((message) => message.type === type);
+}
+
+function latestSent(socket: FakeWebSocket, type: string) {
+  const messages = sent(socket, type);
+  const message = messages[messages.length - 1];
+  if (!message) throw new Error(`Expected a sent ${type} message`);
+  return message;
+}
+
+function sendSyncStart(socket: FakeWebSocket, canEdit: boolean) {
+  socket.receive({ type: 'sync_start', protocol: COLLABORATION_PROTOCOL_VERSION, can_edit: canEdit });
+}
+
+function imageBlock(assetID: string) {
+  const image = new Y.Map<unknown>();
+  image.set('asset_id', assetID);
+  const block = new Y.Map<unknown>();
+  block.set('type', 'image');
+  block.set('image', image);
+  return block;
+}
+
+function textBlock() {
+  const block = new Y.Map<unknown>();
+  block.set('type', 'text');
+  block.set('text', new Y.Text());
+  return block;
 }
 
 function base64(bytes: Uint8Array) {

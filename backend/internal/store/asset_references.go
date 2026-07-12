@@ -39,7 +39,34 @@ func canonicalAssetIDs(assetIDs []string) ([]string, error) {
 	return canonical, nil
 }
 
-func hashBoardUpdate(update []byte, referenceBaseSequence *int64, canonicalAssetIDs []string) string {
+func hashBoardUpdate(update []byte, referenceBaseSequence *int64, canonicalAssetIDs, introducedAssetIDs []string) string {
+	if introducedAssetIDs != nil {
+		hash := sha256.New()
+		writeHashPart(hash, []byte("dreamwhiteboard-board-update-v4"))
+		writeHashPart(hash, update)
+		if canonicalAssetIDs == nil || referenceBaseSequence == nil {
+			writeHashPart(hash, []byte{0})
+		} else {
+			writeHashPart(hash, []byte{1})
+			var sequence [8]byte
+			binary.BigEndian.PutUint64(sequence[:], uint64(*referenceBaseSequence))
+			writeHashPart(hash, sequence[:])
+			var count [8]byte
+			binary.BigEndian.PutUint64(count[:], uint64(len(canonicalAssetIDs)))
+			writeHashPart(hash, count[:])
+			for _, id := range canonicalAssetIDs {
+				writeHashPart(hash, []byte(id))
+			}
+		}
+		var count [8]byte
+		writeHashPart(hash, []byte("introduced"))
+		binary.BigEndian.PutUint64(count[:], uint64(len(introducedAssetIDs)))
+		writeHashPart(hash, count[:])
+		for _, id := range introducedAssetIDs {
+			writeHashPart(hash, []byte(id))
+		}
+		return hex.EncodeToString(hash.Sum(nil))
+	}
 	// Preserve idempotent receipts written by protocol-v2 servers. The absence
 	// of both reference fields is itself the legacy manifest state; any v3
 	// manifest uses the domain-separated hash below.
@@ -72,6 +99,22 @@ func hashAssetReferences(canonicalAssetIDs []string) string {
 		writeHashPart(hash, []byte(id))
 	}
 	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func assetIDsContainAll(assetIDs, required []string) bool {
+	if len(required) == 0 {
+		return true
+	}
+	available := make(map[string]struct{}, len(assetIDs))
+	for _, id := range assetIDs {
+		available[id] = struct{}{}
+	}
+	for _, id := range required {
+		if _, ok := available[id]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 type hashWriter interface {

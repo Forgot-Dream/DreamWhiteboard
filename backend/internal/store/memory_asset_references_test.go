@@ -4,9 +4,102 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"dreamwhiteboard/backend/internal/domain"
 )
+
+func TestMemoryProtocolV4RequiresClaimsButAcceptsLegacyDuplicate(t *testing.T) {
+	repo := NewMemoryStore()
+	user, _ := repo.EnsureSystemAdmin("memory-v4-claims@example.com", "password")
+	project, _ := repo.CreateProject("Protocol v4", "", user.ID)
+	board, _ := repo.CreateBoard(project.ID, "Board", user.ID)
+	legacyBase := int64(0)
+	legacyInput := domain.BoardUpdate{
+		BoardID: board.ID, UpdateID: "legacy-v3", ClientID: "legacy-client", UserID: user.ID,
+		Update: []byte{1, 2, 3}, ReferenceBaseSequence: &legacyBase, AssetIDs: []string{},
+	}
+	legacyReceipt := legacyInput
+	legacyReceipt.ServerSequence = 1
+	legacyReceipt.UpdateHash = hashBoardUpdate(legacyInput.Update, legacyInput.ReferenceBaseSequence, legacyInput.AssetIDs, nil)
+	legacyReceipt.CreatedAt = time.Now().UTC()
+	repo.boardUpdates[board.ID] = append(repo.boardUpdates[board.ID], legacyReceipt)
+
+	duplicate, inserted, err := repo.AppendBoardUpdate(legacyInput)
+	if err != nil || inserted || duplicate.ServerSequence != 1 {
+		t.Fatalf("legacy duplicate after protocol upgrade: update=%#v inserted=%v err=%v", duplicate, inserted, err)
+	}
+	legacyInput.UpdateID = "new-legacy-v3"
+	if _, _, err := repo.AppendBoardUpdate(legacyInput); !errors.Is(err, ErrAssetClaimsRequired) {
+		t.Fatalf("new update without introduced_asset_ids = %v, want ErrAssetClaimsRequired", err)
+	}
+	if got := len(repo.boardUpdates[board.ID]); got != 1 {
+		t.Fatalf("missing-claims update was persisted: update count=%d", got)
+	}
+}
+
+func TestMemoryProtocolV4IntroducedClaimsParticipateInIdempotency(t *testing.T) {
+	repo := NewMemoryStore()
+	user, _ := repo.EnsureSystemAdmin("memory-v4-conflict@example.com", "password")
+	project, _ := repo.CreateProject("Claims conflict", "", user.ID)
+	board, _ := repo.CreateBoard(project.ID, "Board", user.ID)
+	firstAsset := saveMemoryReferenceTestAsset(t, repo, project.ID, user.ID, "claims-first.png")
+	secondAsset := saveMemoryReferenceTestAsset(t, repo, project.ID, user.ID, "claims-second.png")
+	base := int64(0)
+	input := domain.BoardUpdate{
+		BoardID: board.ID, UpdateID: "same-update", ClientID: "client", UserID: user.ID,
+		Update: []byte{4, 5, 6}, ReferenceBaseSequence: &base,
+		AssetIDs: []string{firstAsset.ID, secondAsset.ID}, IntroducedAssetIDs: []string{firstAsset.ID},
+	}
+	if _, inserted, err := repo.AppendBoardUpdate(input); err != nil || !inserted {
+		t.Fatalf("append first claims: inserted=%v err=%v", inserted, err)
+	}
+	input.IntroducedAssetIDs = []string{secondAsset.ID}
+	if _, _, err := repo.AppendBoardUpdate(input); !errors.Is(err, ErrUpdateIDConflict) {
+		t.Fatalf("same update ID with different introduced claims = %v, want ErrUpdateIDConflict", err)
+	}
+}
+
+func TestMemoryProtocolV4AcceptsStaleEmptyClaims(t *testing.T) {
+	repo := NewMemoryStore()
+	user, _ := repo.EnsureSystemAdmin("memory-v4-stale-empty@example.com", "password")
+	project, _ := repo.CreateProject("Stale empty claims", "", user.ID)
+	board, _ := repo.CreateBoard(project.ID, "Board", user.ID)
+	base := int64(0)
+	if _, _, err := repo.AppendBoardUpdate(domain.BoardUpdate{
+		BoardID: board.ID, UpdateID: "advance", ClientID: "manager", UserID: user.ID,
+		Update: []byte{1}, ReferenceBaseSequence: &base, AssetIDs: []string{},
+		IntroducedAssetIDs: []string{}, AssetManifestTrusted: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	update, inserted, err := repo.AppendBoardUpdate(domain.BoardUpdate{
+		BoardID: board.ID, UpdateID: "stale-empty", ClientID: "offline", UserID: user.ID,
+		Update: []byte{2}, ReferenceBaseSequence: &base, AssetIDs: []string{}, IntroducedAssetIDs: []string{},
+	})
+	if err != nil || !inserted || update.ServerSequence != 2 {
+		t.Fatalf("stale empty claims: update=%#v inserted=%v err=%v", update, inserted, err)
+	}
+}
+
+func TestMemoryUntrustedCurrentManifestMayContainDeletedAssetWithEmptyClaims(t *testing.T) {
+	repo := NewMemoryStore()
+	user, _ := repo.EnsureSystemAdmin("memory-v4-current-deleted@example.com", "password")
+	project, _ := repo.CreateProject("Current deleted manifest", "", user.ID)
+	board, _ := repo.CreateBoard(project.ID, "Board", user.ID)
+	asset := saveMemoryReferenceTestAsset(t, repo, project.ID, user.ID, "deleted-before-text-update.png")
+	if err := repo.DeleteAsset(asset.ID); err != nil {
+		t.Fatalf("delete unreferenced asset: %v", err)
+	}
+	base := int64(0)
+	update, inserted, err := repo.AppendBoardUpdate(domain.BoardUpdate{
+		BoardID: board.ID, UpdateID: "unrelated-text", ClientID: "editor", UserID: user.ID,
+		Update: []byte{1}, ReferenceBaseSequence: &base, AssetIDs: []string{asset.ID}, IntroducedAssetIDs: []string{},
+	})
+	if err != nil || !inserted || update.ServerSequence != 1 {
+		t.Fatalf("untrusted unrelated update with deleted manifest asset: update=%#v inserted=%v err=%v", update, inserted, err)
+	}
+}
 
 func TestMemoryAssetReferenceLifecycle(t *testing.T) {
 	repo := NewMemoryStore()
@@ -32,7 +125,8 @@ func TestMemoryAssetReferenceLifecycle(t *testing.T) {
 	base := int64(0)
 	input := domain.BoardUpdate{
 		BoardID: board.ID, UpdateID: "manifest-update", ClientID: "client", UserID: user.ID,
-		Update: []byte{1}, ReferenceBaseSequence: &base, AssetIDs: []string{referenced.ID, referenced.ID}, AssetManifestTrusted: true,
+		Update: []byte{1}, ReferenceBaseSequence: &base, AssetIDs: []string{referenced.ID, referenced.ID},
+		IntroducedAssetIDs: []string{referenced.ID}, AssetManifestTrusted: true,
 	}
 	first, inserted, err := repo.AppendBoardUpdate(input)
 	if err != nil || !inserted || first.ServerSequence != 1 || len(first.AssetIDs) != 1 || first.AssetIDs[0] != referenced.ID {
@@ -59,7 +153,8 @@ func TestMemoryAssetReferenceLifecycle(t *testing.T) {
 	foreign := saveMemoryReferenceTestAsset(t, repo, foreignProject.ID, user.ID, "foreign.png")
 	invalid := domain.BoardUpdate{
 		BoardID: board.ID, UpdateID: "foreign-update", ClientID: "client", UserID: user.ID,
-		Update: []byte{2}, ReferenceBaseSequence: &differentBase, AssetIDs: []string{foreign.ID}, AssetManifestTrusted: true,
+		Update: []byte{2}, ReferenceBaseSequence: &differentBase, AssetIDs: []string{foreign.ID},
+		IntroducedAssetIDs: []string{foreign.ID}, AssetManifestTrusted: true,
 	}
 	if _, _, err := repo.AppendBoardUpdate(invalid); !errors.Is(err, ErrInvalidAssetReference) {
 		t.Fatalf("cross-project update manifest = %v, want ErrInvalidAssetReference", err)
@@ -68,7 +163,7 @@ func TestMemoryAssetReferenceLifecycle(t *testing.T) {
 	staleBase := int64(0)
 	stale, inserted, err := repo.AppendBoardUpdate(domain.BoardUpdate{
 		BoardID: board.ID, UpdateID: "stale-base", ClientID: "client", UserID: user.ID,
-		Update: []byte{3}, ReferenceBaseSequence: &staleBase, AssetIDs: []string{referenced.ID},
+		Update: []byte{3}, ReferenceBaseSequence: &staleBase, AssetIDs: []string{referenced.ID}, IntroducedAssetIDs: []string{},
 	})
 	if err != nil || !inserted || stale.ServerSequence != 2 {
 		t.Fatalf("append stale-base update: update=%#v inserted=%v err=%v", stale, inserted, err)
@@ -104,7 +199,8 @@ func TestMemoryAssetReferenceLifecycle(t *testing.T) {
 	recoveryBase := int64(2)
 	if _, inserted, err := repo.AppendBoardUpdate(domain.BoardUpdate{
 		BoardID: board.ID, UpdateID: "resolve-conflict", ClientID: "client", UserID: user.ID,
-		Update: []byte{4}, ReferenceBaseSequence: &recoveryBase, AssetIDs: []string{referenced.ID}, AssetManifestTrusted: true,
+		Update: []byte{4}, ReferenceBaseSequence: &recoveryBase, AssetIDs: []string{referenced.ID},
+		IntroducedAssetIDs: []string{}, AssetManifestTrusted: true,
 	}); err != nil || !inserted {
 		t.Fatalf("advance past conflicted index: inserted=%v err=%v", inserted, err)
 	}
@@ -116,7 +212,7 @@ func TestMemoryAssetReferenceLifecycle(t *testing.T) {
 	}
 }
 
-func TestMemoryLegacyUpdateMakesAssetIndexStale(t *testing.T) {
+func TestMemoryClaimsOnlyUpdateMakesAssetIndexStale(t *testing.T) {
 	repo := NewMemoryStore()
 	user, err := repo.EnsureSystemAdmin("memory-legacy-refs@example.com", "password")
 	if err != nil {
@@ -132,7 +228,8 @@ func TestMemoryLegacyUpdateMakesAssetIndexStale(t *testing.T) {
 	}
 	asset := saveMemoryReferenceTestAsset(t, repo, project.ID, user.ID, "legacy.png")
 	if _, _, err := repo.AppendBoardUpdate(domain.BoardUpdate{
-		BoardID: board.ID, UpdateID: "legacy", ClientID: "old-client", UserID: user.ID, Update: []byte{1},
+		BoardID: board.ID, UpdateID: "claims-only", ClientID: "client", UserID: user.ID,
+		Update: []byte{1}, IntroducedAssetIDs: []string{},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -151,14 +248,16 @@ func TestMemoryStaleManifestDoesNotRejectUnrelatedOfflineUpdate(t *testing.T) {
 	base := int64(0)
 	if _, _, err := repo.AppendBoardUpdate(domain.BoardUpdate{
 		BoardID: board.ID, UpdateID: "add-image", ClientID: "manager", UserID: user.ID,
-		Update: []byte{1}, ReferenceBaseSequence: &base, AssetIDs: []string{asset.ID}, AssetManifestTrusted: true,
+		Update: []byte{1}, ReferenceBaseSequence: &base, AssetIDs: []string{asset.ID},
+		IntroducedAssetIDs: []string{asset.ID}, AssetManifestTrusted: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	base = 1
 	if _, _, err := repo.AppendBoardUpdate(domain.BoardUpdate{
 		BoardID: board.ID, UpdateID: "remove-image", ClientID: "manager", UserID: user.ID,
-		Update: []byte{2}, ReferenceBaseSequence: &base, AssetIDs: []string{}, AssetManifestTrusted: true,
+		Update: []byte{2}, ReferenceBaseSequence: &base, AssetIDs: []string{},
+		IntroducedAssetIDs: []string{}, AssetManifestTrusted: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +268,7 @@ func TestMemoryStaleManifestDoesNotRejectUnrelatedOfflineUpdate(t *testing.T) {
 	offlineBase := int64(1)
 	update, inserted, err := repo.AppendBoardUpdate(domain.BoardUpdate{
 		BoardID: board.ID, UpdateID: "offline-text", ClientID: "offline-editor", UserID: user.ID,
-		Update: []byte{3}, ReferenceBaseSequence: &offlineBase, AssetIDs: []string{asset.ID},
+		Update: []byte{3}, ReferenceBaseSequence: &offlineBase, AssetIDs: []string{asset.ID}, IntroducedAssetIDs: []string{},
 	})
 	if err != nil || !inserted || update.ServerSequence != 3 {
 		t.Fatalf("stale manifest rejected unrelated offline update: update=%#v inserted=%v err=%v", update, inserted, err)
@@ -185,7 +284,7 @@ func TestMemoryUntrustedEditorManifestCannotAuthorizeAssetDeletion(t *testing.T)
 	base := int64(0)
 	if _, _, err := repo.AppendBoardUpdate(domain.BoardUpdate{
 		BoardID: board.ID, UpdateID: "lying-editor", ClientID: "editor", UserID: user.ID,
-		Update: []byte{1}, ReferenceBaseSequence: &base, AssetIDs: []string{},
+		Update: []byte{1}, ReferenceBaseSequence: &base, AssetIDs: []string{}, IntroducedAssetIDs: []string{},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +293,25 @@ func TestMemoryUntrustedEditorManifestCannotAuthorizeAssetDeletion(t *testing.T)
 	}
 }
 
-func TestMemoryAssetDeleteAndUpdateAreAtomic(t *testing.T) {
+func TestMemoryFreshUntrustedManifestRejectsDeletedAsset(t *testing.T) {
+	repo := NewMemoryStore()
+	user, _ := repo.EnsureSystemAdmin("memory-deleted-asset@example.com", "password")
+	project, _ := repo.CreateProject("Deleted asset", "", user.ID)
+	board, _ := repo.CreateBoard(project.ID, "Board", user.ID)
+	asset := saveMemoryReferenceTestAsset(t, repo, project.ID, user.ID, "deleted-before-update.png")
+	if err := repo.DeleteAsset(asset.ID); err != nil {
+		t.Fatalf("delete unreferenced asset: %v", err)
+	}
+	base := int64(0)
+	if _, _, err := repo.AppendBoardUpdate(domain.BoardUpdate{
+		BoardID: board.ID, UpdateID: "reference-deleted", ClientID: "editor", UserID: user.ID,
+		Update: []byte{1}, ReferenceBaseSequence: &base, AssetIDs: []string{asset.ID}, IntroducedAssetIDs: []string{asset.ID},
+	}); !errors.Is(err, ErrInvalidAssetReference) {
+		t.Fatalf("fresh editor manifest referencing a deleted asset = %v, want ErrInvalidAssetReference", err)
+	}
+}
+
+func TestMemoryAssetDeleteAndEditorUpdateAreAtomic(t *testing.T) {
 	repo := NewMemoryStore()
 	user, err := repo.EnsureSystemAdmin("memory-asset-race@example.com", "password")
 	if err != nil {
@@ -219,7 +336,8 @@ func TestMemoryAssetDeleteAndUpdateAreAtomic(t *testing.T) {
 		<-start
 		_, _, updateErr = repo.AppendBoardUpdate(domain.BoardUpdate{
 			BoardID: board.ID, UpdateID: "race", ClientID: "client", UserID: user.ID,
-			Update: []byte{1}, ReferenceBaseSequence: &base, AssetIDs: []string{asset.ID}, AssetManifestTrusted: true,
+			Update: []byte{1}, ReferenceBaseSequence: &base, AssetIDs: []string{asset.ID},
+			IntroducedAssetIDs: []string{asset.ID},
 		})
 	}()
 	go func() {
@@ -232,8 +350,8 @@ func TestMemoryAssetDeleteAndUpdateAreAtomic(t *testing.T) {
 	if updateErr == nil && deleteErr == nil {
 		t.Fatal("update and delete both committed")
 	}
-	if updateErr == nil && !errors.Is(deleteErr, ErrAssetInUse) {
-		t.Fatalf("update won but delete error = %v, want ErrAssetInUse", deleteErr)
+	if updateErr == nil && !errors.Is(deleteErr, ErrAssetReferenceIndexStale) {
+		t.Fatalf("editor update won but delete error = %v, want ErrAssetReferenceIndexStale", deleteErr)
 	}
 	if deleteErr == nil && !errors.Is(updateErr, ErrInvalidAssetReference) {
 		t.Fatalf("delete won but update error = %v, want ErrInvalidAssetReference", updateErr)
@@ -258,7 +376,8 @@ func TestMemoryAssetReferencesCascadeWithBoardAndProject(t *testing.T) {
 	base := int64(0)
 	if _, _, err := repo.AppendBoardUpdate(domain.BoardUpdate{
 		BoardID: board.ID, UpdateID: "reference", ClientID: "client", UserID: user.ID,
-		Update: []byte{1}, ReferenceBaseSequence: &base, AssetIDs: []string{asset.ID}, AssetManifestTrusted: true,
+		Update: []byte{1}, ReferenceBaseSequence: &base, AssetIDs: []string{asset.ID},
+		IntroducedAssetIDs: []string{asset.ID}, AssetManifestTrusted: true,
 	}); err != nil {
 		t.Fatal(err)
 	}

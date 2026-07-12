@@ -77,15 +77,16 @@ func TestRunMigrationsIntegration(t *testing.T) {
 		t.Fatalf("recorded migration count = %d, want %d", versions, store.LatestSchemaVersion)
 	}
 
-	latest := filepath.Join(testDirectory, fmt.Sprintf("%03d_v2_security_crdt.sql", store.LatestSchemaVersion))
-	if _, err := os.Stat(latest); err != nil {
-		// Keep the test resilient if the descriptive suffix is renamed.
-		for _, entry := range entries {
-			if strings.HasPrefix(entry.Name(), fmt.Sprintf("%03d_", store.LatestSchemaVersion)) {
-				latest = filepath.Join(testDirectory, entry.Name())
-				break
-			}
+	latest := ""
+	latestPrefix := fmt.Sprintf("%03d_", store.LatestSchemaVersion)
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasPrefix(entry.Name(), latestPrefix) && filepath.Ext(entry.Name()) == ".sql" {
+			latest = filepath.Join(testDirectory, entry.Name())
+			break
 		}
+	}
+	if latest == "" {
+		t.Fatalf("latest migration with prefix %q was not found", latestPrefix)
 	}
 	file, err := os.OpenFile(latest, os.O_APPEND|os.O_WRONLY, 0)
 	if err != nil {

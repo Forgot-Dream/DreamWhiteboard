@@ -113,7 +113,7 @@ func TestBoardWebSocketInitialSyncReplaysCheckpointThenUpdates(t *testing.T) {
 	fixture := newWSFixture(t)
 	first, inserted, err := fixture.repo.AppendBoardUpdate(domain.BoardUpdate{
 		BoardID: fixture.board.ID, UpdateID: "first", ClientID: "old-client",
-		UserID: fixture.editor.ID, Update: []byte{1},
+		UserID: fixture.editor.ID, Update: []byte{1}, IntroducedAssetIDs: []string{},
 	})
 	if err != nil || !inserted {
 		t.Fatalf("append first update: inserted=%v err=%v", inserted, err)
@@ -124,7 +124,7 @@ func TestBoardWebSocketInitialSyncReplaysCheckpointThenUpdates(t *testing.T) {
 	}
 	second, inserted, err := fixture.repo.AppendBoardUpdate(domain.BoardUpdate{
 		BoardID: fixture.board.ID, UpdateID: "second", ClientID: "old-client",
-		UserID: fixture.editor.ID, Update: []byte{2},
+		UserID: fixture.editor.ID, Update: []byte{2}, IntroducedAssetIDs: []string{},
 	})
 	if err != nil || !inserted {
 		t.Fatalf("append second update: inserted=%v err=%v", inserted, err)
@@ -154,7 +154,7 @@ func TestBoardWebSocketPersistsAcknowledgesAndBroadcastsUpdate(t *testing.T) {
 	peer, _ := fixture.connect(fixture.editor)
 	update := []byte{1, 2, 3, 4}
 	if err := sender.WriteJSON(wsClientMessage{
-		Type: realtime.MessageUpdate, UpdateID: "update-1", Data: update,
+		Type: realtime.MessageUpdate, UpdateID: "update-1", Data: update, IntroducedAssetIDs: []string{},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestBoardWebSocketPersistsAcknowledgesAndBroadcastsUpdate(t *testing.T) {
 	}
 
 	if err := sender.WriteJSON(wsClientMessage{
-		Type: realtime.MessageUpdate, UpdateID: "update-1", Data: update,
+		Type: realtime.MessageUpdate, UpdateID: "update-1", Data: update, IntroducedAssetIDs: []string{},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -298,7 +298,7 @@ func TestBoardWebSocketRejectsUpdateIDReuseWithDifferentData(t *testing.T) {
 	fixture := newWSFixture(t)
 	connection, _ := fixture.connect(fixture.editor)
 	if err := connection.WriteJSON(wsClientMessage{
-		Type: realtime.MessageUpdate, UpdateID: "same-id", Data: []byte{1},
+		Type: realtime.MessageUpdate, UpdateID: "same-id", Data: []byte{1}, IntroducedAssetIDs: []string{},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +306,7 @@ func TestBoardWebSocketRejectsUpdateIDReuseWithDifferentData(t *testing.T) {
 		t.Fatalf("unexpected update ack: %#v", ack)
 	}
 	if err := connection.WriteJSON(wsClientMessage{
-		Type: realtime.MessageUpdate, UpdateID: "same-id", Data: []byte{2},
+		Type: realtime.MessageUpdate, UpdateID: "same-id", Data: []byte{2}, IntroducedAssetIDs: []string{},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -316,15 +316,41 @@ func TestBoardWebSocketRejectsUpdateIDReuseWithDifferentData(t *testing.T) {
 	}
 }
 
-func TestBoardWebSocketAdvertisesAssetReferenceProtocolV3(t *testing.T) {
+func TestBoardWebSocketAdvertisesAssetReferenceProtocolV4(t *testing.T) {
+	if realtime.ProtocolVersion != 4 {
+		t.Fatalf("realtime protocol constant = %d, want 4", realtime.ProtocolVersion)
+	}
 	fixture := newWSFixture(t)
 	connection := fixture.dial(fixture.editor)
 	start := readRealtimeMessage(t, connection)
-	if start.Type != realtime.MessageSyncStart || start.Protocol != 3 {
+	if start.Type != realtime.MessageSyncStart || start.Protocol != realtime.ProtocolVersion {
 		t.Fatalf("unexpected sync start protocol: %#v", start)
 	}
 	if complete := readRealtimeMessage(t, connection); complete.Type != realtime.MessageSyncComplete {
 		t.Fatalf("unexpected sync completion: %#v", complete)
+	}
+}
+
+func TestBoardWebSocketProtocolV4RejectsMissingAssetClaims(t *testing.T) {
+	fixture := newWSFixture(t)
+	connection, _ := fixture.connect(fixture.editor)
+	if err := connection.WriteJSON(map[string]any{
+		"type":      realtime.MessageUpdate,
+		"update_id": "missing-claims",
+		"data":      []byte{1, 2, 3},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	message := readRealtimeMessage(t, connection)
+	if message.Type != realtime.MessageError || message.Code != "asset_claims_required" || message.UpdateID != "missing-claims" {
+		t.Fatalf("unexpected missing claims response: %#v", message)
+	}
+	_, updates, err := fixture.repo.LoadBoardDocument(fixture.board.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updates) != 0 {
+		t.Fatalf("missing-claims update was persisted: %#v", updates)
 	}
 }
 
@@ -338,6 +364,7 @@ func TestBoardWebSocketPersistsAssetReferenceManifest(t *testing.T) {
 		"data":                    []byte{1, 2, 3},
 		"reference_base_sequence": int64(0),
 		"asset_ids":               []string{asset.ID},
+		"introduced_asset_ids":    []string{asset.ID},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -349,7 +376,7 @@ func TestBoardWebSocketPersistsAssetReferenceManifest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(updates) != 1 || updates[0].ReferenceBaseSequence == nil || *updates[0].ReferenceBaseSequence != 0 || len(updates[0].AssetIDs) != 1 || updates[0].AssetIDs[0] != asset.ID {
+	if len(updates) != 1 || updates[0].ReferenceBaseSequence == nil || *updates[0].ReferenceBaseSequence != 0 || len(updates[0].AssetIDs) != 1 || updates[0].AssetIDs[0] != asset.ID || len(updates[0].IntroducedAssetIDs) != 1 || updates[0].IntroducedAssetIDs[0] != asset.ID {
 		t.Fatalf("asset reference manifest was not persisted: %#v", updates)
 	}
 }
@@ -368,6 +395,7 @@ func TestBoardWebSocketRejectsCrossProjectAssetReference(t *testing.T) {
 		"data":                    []byte{1},
 		"reference_base_sequence": int64(0),
 		"asset_ids":               []string{foreignAsset.ID},
+		"introduced_asset_ids":    []string{foreignAsset.ID},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -395,6 +423,7 @@ func TestBoardWebSocketRejectsUpdateIDReuseWithDifferentAssetManifest(t *testing
 		"data":                    []byte{7, 8, 9},
 		"reference_base_sequence": int64(0),
 		"asset_ids":               []string{first.ID},
+		"introduced_asset_ids":    []string{first.ID},
 	}
 	if err := connection.WriteJSON(update); err != nil {
 		t.Fatal(err)
@@ -404,6 +433,7 @@ func TestBoardWebSocketRejectsUpdateIDReuseWithDifferentAssetManifest(t *testing
 	}
 
 	update["asset_ids"] = []string{second.ID}
+	update["introduced_asset_ids"] = []string{second.ID}
 	if err := connection.WriteJSON(update); err != nil {
 		t.Fatal(err)
 	}
@@ -413,7 +443,7 @@ func TestBoardWebSocketRejectsUpdateIDReuseWithDifferentAssetManifest(t *testing
 	}
 }
 
-func TestLegacyWebSocketUpdateMakesAssetDeletionStale(t *testing.T) {
+func TestClaimsOnlyWebSocketUpdateMakesAssetDeletionStale(t *testing.T) {
 	fixture := newWSFixture(t)
 	asset := saveWSAsset(t, fixture, fixture.project, "legacy-stale")
 	connection, token := fixture.dialWithToken(fixture.editor)
@@ -424,11 +454,10 @@ func TestLegacyWebSocketUpdateMakesAssetDeletionStale(t *testing.T) {
 		t.Fatalf("unexpected sync completion: %#v", complete)
 	}
 
-	// Omitting both reference fields models a protocol-v2 client. Its update is
-	// accepted for compatibility, but the server can no longer prove that the
-	// current document does not reference an asset.
+	// A claims-only v4 update is accepted, but without a trusted full manifest
+	// the server can no longer prove that the current document omits an asset.
 	if err := connection.WriteJSON(wsClientMessage{
-		Type: realtime.MessageUpdate, UpdateID: "legacy-without-manifest", Data: []byte{4, 5, 6},
+		Type: realtime.MessageUpdate, UpdateID: "claims-without-manifest", Data: []byte{4, 5, 6}, IntroducedAssetIDs: []string{},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -470,7 +499,7 @@ func TestBoardWebSocketDuplicateRemainsIdempotentAfterCheckpoint(t *testing.T) {
 	connection, _ := fixture.connect(fixture.editor)
 	update := []byte{9, 8, 7}
 	if err := connection.WriteJSON(wsClientMessage{
-		Type: realtime.MessageUpdate, UpdateID: "compacted-update", Data: update,
+		Type: realtime.MessageUpdate, UpdateID: "compacted-update", Data: update, IntroducedAssetIDs: []string{},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -504,7 +533,7 @@ func TestBoardWebSocketDuplicateRemainsIdempotentAfterCheckpoint(t *testing.T) {
 	// This models a lost ACK: the page still has the original update in its
 	// pending queue and reconnect/resend happens after compaction.
 	if err := connection.WriteJSON(wsClientMessage{
-		Type: realtime.MessageUpdate, UpdateID: "compacted-update", Data: update,
+		Type: realtime.MessageUpdate, UpdateID: "compacted-update", Data: update, IntroducedAssetIDs: []string{},
 	}); err != nil {
 		t.Fatal(err)
 	}

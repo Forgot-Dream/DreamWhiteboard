@@ -40,7 +40,8 @@ func TestPostgresMigrationsAndReadinessIntegration(t *testing.T) {
 		t.Fatalf("close legacy store: %v", err)
 	}
 
-	applyPostgresTestMigrations(t, databaseURL, LatestSchemaVersion-1)
+	const assetReferenceMigrationVersion = 4
+	applyPostgresTestMigrations(t, databaseURL, assetReferenceMigrationVersion-1)
 	preReferenceDB, err := sql.Open("postgres", databaseURL)
 	if err != nil {
 		t.Fatal(err)
@@ -54,6 +55,21 @@ func TestPostgresMigrationsAndReadinessIntegration(t *testing.T) {
 		t.Fatalf("seed pre-reference board: %v", err)
 	}
 	if err := preReferenceDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	applyPostgresTestMigrations(t, databaseURL, assetReferenceMigrationVersion)
+	preGCDB, err := sql.Open("postgres", databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := preGCDB.Exec(`INSERT INTO board_updates
+		(board_id,server_sequence,update_id,client_id,user_id,update_data,update_hash,created_at)
+		VALUES ('legacy-board',1,'legacy-update','legacy-client','legacy-user',decode('01','hex'),repeat('a',64),now())`); err != nil {
+		_ = preGCDB.Close()
+		t.Fatalf("seed pre-GC board update: %v", err)
+	}
+	if err := preGCDB.Close(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -84,14 +100,44 @@ func TestPostgresMigrationsAndReadinessIntegration(t *testing.T) {
 	assertPostgresRelationExists(t, repo.db, schema, "storage_cleanup_jobs", true)
 	assertPostgresRelationExists(t, repo.db, schema, "board_asset_reference_state", true)
 	assertPostgresRelationExists(t, repo.db, schema, "board_asset_references", true)
+	assertPostgresRelationExists(t, repo.db, schema, "asset_gc_candidates", true)
+	assertPostgresRelationExists(t, repo.db, schema, "asset_gc_candidates_due_idx", true)
+	assertPostgresRelationExists(t, repo.db, schema, "asset_gc_candidates_project_idx", true)
+	assertPostgresRelationExists(t, repo.db, schema, "boards_project_id_idx", true)
 	assertPostgresRelationExists(t, repo.db, schema, "board_operations", false)
 	assertPostgresRelationExists(t, repo.db, schema, "board_snapshots", false)
+	var introducedType, introducedNullable string
+	if err := repo.db.QueryRow(`SELECT udt_name, is_nullable
+		FROM information_schema.columns
+		WHERE table_schema=$1 AND table_name='board_updates' AND column_name='introduced_asset_ids'`, schema).Scan(&introducedType, &introducedNullable); err != nil {
+		t.Fatalf("inspect introduced_asset_ids migration: %v", err)
+	}
+	if introducedType != "_text" || introducedNullable != "YES" {
+		t.Fatalf("introduced_asset_ids type/nullability = %q/%q, want _text/YES", introducedType, introducedNullable)
+	}
+	var legacyClaimsAreNull bool
+	if err := repo.db.QueryRow(`SELECT introduced_asset_ids IS NULL
+		FROM board_updates WHERE board_id='legacy-board' AND update_id='legacy-update'`).Scan(&legacyClaimsAreNull); err != nil {
+		t.Fatalf("read migrated legacy asset claims: %v", err)
+	}
+	if !legacyClaimsAreNull {
+		t.Fatal("migration rewrote legacy introduced_asset_ids; want NULL compatibility marker")
+	}
 	var legacyIndexedThrough int64
 	if err := repo.db.QueryRow(`SELECT indexed_through_sequence FROM board_asset_reference_state WHERE board_id='legacy-board'`).Scan(&legacyIndexedThrough); err != nil {
 		t.Fatalf("read migrated legacy board reference state: %v", err)
 	}
 	if legacyIndexedThrough != -1 {
 		t.Fatalf("legacy board indexed_through_sequence = %d, want -1", legacyIndexedThrough)
+	}
+	if _, err := repo.db.Exec(`ALTER TABLE asset_gc_candidates RENAME TO asset_gc_candidates_missing`); err != nil {
+		t.Fatalf("temporarily hide asset_gc_candidates: %v", err)
+	}
+	if err := repo.Ready(context.Background()); err == nil || !strings.Contains(err.Error(), "missing required relations") {
+		t.Fatalf("missing asset GC schema should fail readiness, got %v", err)
+	}
+	if _, err := repo.db.Exec(`ALTER TABLE asset_gc_candidates_missing RENAME TO asset_gc_candidates`); err != nil {
+		t.Fatalf("restore asset_gc_candidates name: %v", err)
 	}
 	if _, err := repo.db.Exec(`UPDATE schema_migrations SET checksum='tampered' WHERE version=$1`, LatestSchemaVersion); err != nil {
 		t.Fatalf("tamper migration checksum: %v", err)
@@ -271,11 +317,12 @@ func TestPostgresBoardUpdatePersistenceAndCheckpointIntegration(t *testing.T) {
 	}
 
 	firstInput := domain.BoardUpdate{
-		BoardID:  board.ID,
-		UpdateID: "update-1",
-		ClientID: "client-a",
-		UserID:   user.ID,
-		Update:   []byte{1, 2, 3},
+		BoardID:            board.ID,
+		UpdateID:           "update-1",
+		ClientID:           "client-a",
+		UserID:             user.ID,
+		Update:             []byte{1, 2, 3},
+		IntroducedAssetIDs: []string{},
 	}
 	first, inserted, err := repo.AppendBoardUpdate(firstInput)
 	if err != nil || !inserted || first.ServerSequence != 1 {
@@ -739,11 +786,12 @@ func createPostgresTestUser(t *testing.T, repo *PostgresStore, suffix string) do
 func appendPostgresTestBoardUpdate(t *testing.T, repo *PostgresStore, boardID, userID, updateID string, data []byte) domain.BoardUpdate {
 	t.Helper()
 	update, inserted, err := repo.AppendBoardUpdate(domain.BoardUpdate{
-		BoardID:  boardID,
-		UpdateID: updateID,
-		ClientID: "integration-client",
-		UserID:   userID,
-		Update:   data,
+		BoardID:            boardID,
+		UpdateID:           updateID,
+		ClientID:           "integration-client",
+		UserID:             userID,
+		Update:             data,
+		IntroducedAssetIDs: []string{},
 	})
 	if err != nil || !inserted {
 		t.Fatalf("append board update %q: update=%#v inserted=%v err=%v", updateID, update, inserted, err)

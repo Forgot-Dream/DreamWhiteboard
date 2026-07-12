@@ -75,6 +75,7 @@ type BoardUpdate struct {
 	Update                []byte     `json:"update"`
 	ReferenceBaseSequence *int64     `json:"reference_base_sequence,omitempty"`
 	AssetIDs              []string   `json:"asset_ids,omitempty"`
+	IntroducedAssetIDs    []string   `json:"introduced_asset_ids,omitempty"`
 	AssetManifestTrusted  bool       `json:"-"`
 	UpdateHash            string     `json:"-"`
 	CompactedAt           *time.Time `json:"-"`

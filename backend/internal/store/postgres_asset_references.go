@@ -51,6 +51,9 @@ func (s *PostgresStore) SaveBoardAssetReferences(boardID, indexedBy string, thro
 				}
 				state.Conflicted = true
 			}
+			if err := clearAssetGCCandidatesTx(tx, projectID); err != nil {
+				return domain.BoardAssetReferenceState{}, err
+			}
 			if err := tx.Commit(); err != nil {
 				return domain.BoardAssetReferenceState{}, err
 			}
@@ -173,6 +176,9 @@ func replaceBoardAssetReferencesTx(tx *sql.Tx, boardID, projectID, indexedBy str
 		WHERE board_id=$1`, boardID, throughSequence, refsHash, indexedBy, now); err != nil {
 		return domain.BoardAssetReferenceState{}, mapSQLError(err)
 	}
+	if err := clearReferencedAssetGCCandidatesTx(tx, projectID, canonical); err != nil {
+		return domain.BoardAssetReferenceState{}, err
+	}
 	return domain.BoardAssetReferenceState{
 		BoardID:                boardID,
 		IndexedThroughSequence: throughSequence,
@@ -190,11 +196,15 @@ func mapAssetReferenceSQLError(err error) error {
 	return mapSQLError(err)
 }
 
-// lockFreshProjectBoardReferencesTx establishes the same lock order used by
-// AppendBoardUpdate: board documents first, then the asset row in DeleteAsset.
-// This makes a concurrent update either commit first and make the index stale,
-// or observe the asset deletion and fail validation.
-func lockFreshProjectBoardReferencesTx(tx *sql.Tx, projectID string) error {
+type projectBoardReferenceSequence struct {
+	boardID        string
+	latestSequence int64
+}
+
+// lockProjectBoardDocumentsTx freezes every board sequence in a project. The
+// caller must lock its target asset rows before validating reference states so
+// all update, delete, and GC transactions use document -> asset -> state order.
+func lockProjectBoardDocumentsTx(tx *sql.Tx, projectID string) ([]projectBoardReferenceSequence, error) {
 	rows, err := tx.Query(`SELECT b.id, d.checkpoint_sequence
 		FROM boards b
 		JOIN board_documents d ON d.board_id=b.id
@@ -202,7 +212,7 @@ func lockFreshProjectBoardReferencesTx(tx *sql.Tx, projectID string) error {
 		ORDER BY b.id
 		FOR UPDATE OF d`, projectID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	type boardSequence struct {
 		id         string
@@ -213,26 +223,34 @@ func lockFreshProjectBoardReferencesTx(tx *sql.Tx, projectID string) error {
 		var board boardSequence
 		if err := rows.Scan(&board.id, &board.checkpoint); err != nil {
 			rows.Close()
-			return err
+			return nil, err
 		}
 		boards = append(boards, board)
 	}
 	if err := rows.Close(); err != nil {
-		return err
+		return nil, err
 	}
+	locked := make([]projectBoardReferenceSequence, 0, len(boards))
 	for _, board := range boards {
 		latest, err := latestBoardSequenceTx(tx, board.id, board.checkpoint)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		state, err := lockBoardAssetReferenceStateTx(tx, board.id)
+		locked = append(locked, projectBoardReferenceSequence{boardID: board.id, latestSequence: latest})
+	}
+	return locked, nil
+}
+
+func validateFreshProjectBoardReferencesTx(tx *sql.Tx, boards []projectBoardReferenceSequence) error {
+	for _, board := range boards {
+		state, err := lockBoardAssetReferenceStateTx(tx, board.boardID)
 		if err != nil {
 			if errors.Is(err, ErrAssetReferenceIndexStale) {
 				return ErrAssetReferenceIndexStale
 			}
 			return err
 		}
-		if state.Conflicted || state.IndexedThroughSequence != latest {
+		if state.Conflicted || state.IndexedThroughSequence != board.latestSequence {
 			return ErrAssetReferenceIndexStale
 		}
 	}

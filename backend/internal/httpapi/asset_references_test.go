@@ -194,7 +194,7 @@ func (f *assetReferenceHTTPFixture) appendLegacyUpdate(t *testing.T, updateID st
 	t.Helper()
 	if _, inserted, err := f.repo.AppendBoardUpdate(domain.BoardUpdate{
 		BoardID: f.board.ID, UpdateID: updateID, ClientID: "legacy-client",
-		UserID: f.editor.ID, Update: []byte{1},
+		UserID: f.editor.ID, Update: []byte{1}, IntroducedAssetIDs: []string{},
 	}); err != nil || !inserted {
 		t.Fatalf("append update: inserted=%v err=%v", inserted, err)
 	}

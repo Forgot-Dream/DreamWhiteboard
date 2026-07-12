@@ -151,15 +151,27 @@ export function readBlocks(doc: Y.Doc) {
   return result.sort((a, b) => a.z - b.z || a.id.localeCompare(b.id));
 }
 
-export function referencedAssetIDs(doc: Y.Doc) {
-  const references = new Set<string>();
-  blocksMap(doc).forEach((value) => {
+export function referencedAssetsByBlock(doc: Y.Doc) {
+  const references = new Map<string, string>();
+  blocksMap(doc).forEach((value, blockID) => {
     if (!(value instanceof Y.Map) || value.get('type') !== 'image') return;
     const image = value.get('image');
     const assetID = image instanceof Y.Map ? image.get('asset_id') : undefined;
-    if (typeof assetID === 'string' && assetID) references.add(assetID);
+    if (typeof assetID === 'string' && assetID) references.set(blockID, assetID);
   });
-  return Array.from(references).sort();
+  return references;
+}
+
+export function introducedAssetIDs(previous: ReadonlyMap<string, string>, current: ReadonlyMap<string, string>) {
+  const introduced = new Set<string>();
+  current.forEach((assetID, blockID) => {
+    if (previous.get(blockID) !== assetID) introduced.add(assetID);
+  });
+  return Array.from(introduced).sort();
+}
+
+export function referencedAssetIDs(doc: Y.Doc) {
+  return Array.from(new Set(referencedAssetsByBlock(doc).values())).sort();
 }
 
 export function blockBounds(blocks: WhiteboardBlock[]): Rect | null {

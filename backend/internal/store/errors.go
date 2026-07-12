@@ -16,4 +16,5 @@ var (
 	ErrAssetReferenceIndexStale  = errors.New("asset reference index is stale")
 	ErrAssetReferenceConflict    = errors.New("asset reference index is conflicted")
 	ErrAssetInUse                = errors.New("asset is referenced by a board")
+	ErrAssetClaimsRequired       = errors.New("asset introduction claims are required")
 )
