@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Browser, type Page } from '@playwright/test';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -16,10 +16,13 @@ test('admin setup, dual-session collaboration, reconnect, viewer permissions, an
   const viewerInitial = 'Viewer-one-time-2026!';
   const projectName = `E2E Project ${suffix}`;
   const boardName = `Collaboration ${suffix}`;
+  const pageErrors: Error[] = [];
 
-  const adminContext = await browser.newContext();
+  const adminContext = await contextWithoutRandomUUID(browser);
   const admin = await adminContext.newPage();
+  admin.on('pageerror', (error) => pageErrors.push(error));
   await login(admin, bootstrapEmail, bootstrapPassword, 'Admin-private-password-2026!');
+  expect(await admin.evaluate(() => typeof globalThis.crypto.randomUUID)).toBe('undefined');
 
   await admin.goto('/admin');
   await createUser(admin, editorEmail, 'E2E Editor', editorInitial);
@@ -42,10 +45,12 @@ test('admin setup, dual-session collaboration, reconnect, viewer permissions, an
   await admin.locator('.board-open', { hasText: boardName }).click();
   await expect(admin).toHaveURL(/\/boards\//);
   const boardURL = admin.url();
+  await expect(admin.locator('.editor-shell')).toBeVisible();
   await expect(admin.locator('.title-block')).toContainText('synced');
 
-  const editorContext = await browser.newContext();
+  const editorContext = await contextWithoutRandomUUID(browser);
   const editor = await editorContext.newPage();
+  editor.on('pageerror', (error) => pageErrors.push(error));
   await login(editor, editorEmail, editorInitial, 'Editor-private-password-2026!');
   await editor.goto(projectURL);
   await editor.locator('.board-open', { hasText: boardName }).click();
@@ -90,19 +95,29 @@ test('admin setup, dual-session collaboration, reconnect, viewer permissions, an
   await editor.reload();
   await expect(editor.locator('.block-image img')).toBeVisible({ timeout: 20_000 });
 
-  const viewerContext = await browser.newContext();
+  const viewerContext = await contextWithoutRandomUUID(browser);
   const viewer = await viewerContext.newPage();
+  viewer.on('pageerror', (error) => pageErrors.push(error));
   await login(viewer, viewerEmail, viewerInitial, 'Viewer-private-password-2026!');
   await viewer.goto(boardURL);
   await expect(viewer.locator('.title-block')).toContainText('synced');
   await expect(viewer.getByTitle('Text')).toBeDisabled();
   await expect(viewer.locator('.block-text textarea').first()).toHaveAttribute('readonly', '');
   await expect(viewer.locator('.block-image img')).toBeVisible();
+  expect(pageErrors).toEqual([]);
 
   await viewerContext.close();
   await editorContext.close();
   await adminContext.close();
 });
+
+async function contextWithoutRandomUUID(browser: Browser) {
+  const context = await browser.newContext({ locale: 'en-US' });
+  await context.addInitScript(() => {
+    Object.defineProperty(globalThis.crypto, 'randomUUID', { value: undefined, configurable: true });
+  });
+  return context;
+}
 
 async function login(page: Page, email: string, password: string, replacement: string) {
   await page.goto('/login');

@@ -3,6 +3,7 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { api, type User } from '../lib/api';
+import { I18nProvider } from '../lib/i18n';
 import { Admin } from './Admin';
 
 vi.mock('../lib/api', async (importOriginal) => {
@@ -32,7 +33,7 @@ describe('Admin user controls', () => {
 
   it('edits system roles and uses an inline masked password reset form', async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-    render(<QueryClientProvider client={queryClient}><Admin /></QueryClientProvider>);
+    render(<QueryClientProvider client={queryClient}><I18nProvider><Admin /></I18nProvider></QueryClientProvider>);
     const interaction = userEvent.setup();
 
     await screen.findByText(user.email);

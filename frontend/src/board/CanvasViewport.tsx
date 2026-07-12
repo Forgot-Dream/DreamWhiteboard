@@ -1,4 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type WheelEvent as ReactWheelEvent } from 'react';
+import { useI18n } from '../lib/i18n';
 import type { BoardRuntime } from './runtime';
 import { imageSource, intersects, type ImageBlock, type Rect, type WhiteboardBlock } from './schema';
 import { useBoardStore, type RemotePresence, type Viewport } from './store';
@@ -10,8 +11,13 @@ type ActiveInteraction =
   | { kind: 'move'; ids: string[]; last: Point }
   | { kind: 'resize'; block: WhiteboardBlock; handle: ResizeHandle; start: Point };
 type Point = { x: number; y: number };
+const resizeMessageKeys = {
+  n: 'editor.resize.n', ne: 'editor.resize.ne', e: 'editor.resize.e', se: 'editor.resize.se',
+  s: 'editor.resize.s', sw: 'editor.resize.sw', w: 'editor.resize.w', nw: 'editor.resize.nw'
+} as const;
 
 export function CanvasViewport({ runtime }: { runtime: BoardRuntime }) {
+  const { t } = useI18n();
   const canvas = useRef<HTMLDivElement>(null);
   const interaction = useRef<ActiveInteraction | null>(null);
   const latestPointer = useRef<Point | null>(null);
@@ -189,7 +195,7 @@ export function CanvasViewport({ runtime }: { runtime: BoardRuntime }) {
         {selectionBox && <div className="selection-box" style={{ left: selectionBox.x, top: selectionBox.y, width: selectionBox.width, height: selectionBox.height }} />}
         {remotes.map((remote) => remote.cursor && <RemoteCursor key={remote.awarenessID} remote={remote} />)}
       </div>
-      <div className="canvas-stats">{blocks.length} blocks · {visible.length} rendered</div>
+      <div className="canvas-stats">{t('editor.canvasStats', { total: blocks.length, rendered: visible.length })}</div>
     </div>
   );
 
@@ -211,6 +217,7 @@ const BlockView = memo(function BlockView({ block, selected, onlySelection, read
   onText: (value: string) => void;
   onEmptyBlur: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <article
       className={`block block-${block.type} ${selected ? 'selected' : ''}`}
@@ -224,7 +231,7 @@ const BlockView = memo(function BlockView({ block, selected, onlySelection, read
       {selected && onlySelection && !readOnly && <ResizeHandles onResize={(event, handle) => onResize(event, handle)} />}
       {block.type === 'text' ? (
         <>
-          <button className="block-drag-handle" aria-label="Move text block" onPointerDown={onPointerDown} />
+          <button className="block-drag-handle" aria-label={t('editor.moveTextBlock')} onPointerDown={onPointerDown} />
           <textarea
             value={block.text}
             readOnly={readOnly}
@@ -249,8 +256,9 @@ const BlockView = memo(function BlockView({ block, selected, onlySelection, read
 ));
 
 function ResizeHandles({ onResize }: { onResize: (event: ReactPointerEvent<HTMLButtonElement>, handle: ResizeHandle) => void }) {
+  const { t } = useI18n();
   const handles: ResizeHandle[] = ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw'];
-  return <>{handles.map((handle) => <button key={handle} className={`resize-handle resize-${handle}`} onPointerDown={(event) => onResize(event, handle)} aria-label={`Resize ${handle}`} />)}</>;
+  return <>{handles.map((handle) => <button key={handle} className={`resize-handle resize-${handle}`} onPointerDown={(event) => onResize(event, handle)} aria-label={t(resizeMessageKeys[handle])} />)}</>;
 }
 
 function RemoteCursor({ remote }: { remote: RemotePresence }) {

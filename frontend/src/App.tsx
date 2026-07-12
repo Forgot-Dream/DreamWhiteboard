@@ -13,6 +13,7 @@ import { Projects } from './pages/Projects';
 export const authQueryKey = ['auth', 'me'] as const;
 
 export function App() {
+  const { t } = useI18n();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const auth = useQuery({
@@ -31,7 +32,7 @@ export function App() {
     return () => window.removeEventListener(AUTH_EXPIRED_EVENT, expired);
   }, [navigate, queryClient]);
 
-  if (auth.isLoading) return <div className="loading">Loading…</div>;
+  if (auth.isLoading) return <div className="loading">{t('app.loading')}…</div>;
 
   return (
     <Routes>

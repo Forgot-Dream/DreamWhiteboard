@@ -6,8 +6,10 @@ import { BoardToolbar } from '../board/BoardToolbar';
 import { CanvasViewport } from '../board/CanvasViewport';
 import { useBoardKeyboard } from '../board/keyboard';
 import { useBoardRuntime } from '../board/runtime';
+import { useI18n } from '../lib/i18n';
 
 export function BoardEditor({ user }: { user: User }) {
+  const { errorMessage, t } = useI18n();
   const { boardId = '' } = useParams();
   const navigate = useNavigate();
   const access = useQuery({
@@ -29,8 +31,8 @@ export function BoardEditor({ user }: { user: User }) {
   });
   const role = access.data?.permission?.role ?? members.data?.find((member) => member.user_id === user.id)?.role;
 
-  if (access.isLoading) return <div className="loading">Loading board…</div>;
-  if (access.error || !access.data) return <div className="loading error-page"><div><h2>Unable to open board</h2><p>{access.error?.message ?? 'Board not found'}</p><button className="primary" onClick={() => navigate('/projects')}>Back to projects</button></div></div>;
+  if (access.isLoading) return <div className="loading">{t('editor.loadingBoard')}</div>;
+  if (access.error || !access.data) return <div className="loading error-page"><div><h2>{t('editor.unableToOpen')}</h2><p>{access.error ? errorMessage(access.error) : t('editor.boardNotFound')}</p><button className="primary" onClick={() => navigate('/projects')}>{t('editor.backToProjects')}</button></div></div>;
 
   return (
     <BoardWorkspace

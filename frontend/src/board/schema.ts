@@ -1,5 +1,6 @@
 import * as Y from 'yjs';
 import { assetURL } from '../lib/api';
+import { createID } from '../lib/id';
 
 export const BOARD_SCHEMA_VERSION = 1 as const;
 
@@ -192,7 +193,7 @@ export function imageSource(block: ImageBlock) {
 }
 
 function blockID() {
-  return `blk_${crypto.randomUUID()}`;
+  return createID('blk');
 }
 
 function stringValue(value: unknown, fallback: string) {

@@ -1,6 +1,7 @@
 import * as Y from 'yjs';
 import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate, removeAwarenessStates } from 'y-protocols/awareness';
 import { APIError, api, wsURL } from '../lib/api';
+import { createID } from '../lib/id';
 import { introducedAssetIDs, referencedAssetIDs, referencedAssetsByBlock } from './schema';
 import type { ConnectionState, RemotePresence, Viewport } from './store';
 
@@ -46,7 +47,7 @@ interface PendingUpdate {
 
 export class BoardProvider {
   readonly awareness: Awareness;
-  readonly clientID = `cli_${crypto.randomUUID()}`;
+  readonly clientID = createID('cli');
   private socket: WebSocket | null = null;
   private stopped = false;
   private synced = false;
@@ -400,7 +401,7 @@ export class BoardProvider {
     this.lastAssetsByBlock = assetsByBlock;
     const assetIDs = Array.from(new Set(assetsByBlock.values())).sort();
     if (origin === this || !this.authoritativeCanEdit) return;
-    const updateID = `upd_${crypto.randomUUID()}`;
+    const updateID = createID('upd');
     const pending: PendingUpdate = {
       data: update.slice(),
       referenceBaseSequence: this.sequenceFrontier,

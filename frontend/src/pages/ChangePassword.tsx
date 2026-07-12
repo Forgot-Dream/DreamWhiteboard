@@ -3,8 +3,10 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Navigate, useNavigate } from 'react-router-dom';
 import { authQueryKey } from '../App';
 import { api, type User } from '../lib/api';
+import { LocaleSelect, useI18n } from '../lib/i18n';
 
 export function ChangePassword({ user }: { user: User }) {
+  const { errorMessage, t } = useI18n();
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmation, setConfirmation] = useState('');
@@ -32,13 +34,14 @@ export function ChangePassword({ user }: { user: User }) {
   return (
     <main className="login-shell">
       <form className="login-panel" onSubmit={submit}>
-        <div><h1>Change password</h1><p>Choose a private password before continuing.</p></div>
-        <label>Current password<input type="password" autoComplete="current-password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required /></label>
-        <label>New password<input type="password" autoComplete="new-password" minLength={12} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required /></label>
-        <label>Confirm password<input type="password" autoComplete="new-password" minLength={12} value={confirmation} onChange={(event) => setConfirmation(event.target.value)} required /></label>
-        {newPassword !== confirmation && confirmation && <p className="error">Passwords do not match.</p>}
-        {mutation.error && <p className="error">{mutation.error.message}</p>}
-        <button className="primary" disabled={mutation.isPending || newPassword !== confirmation}>Save password</button>
+        <LocaleSelect />
+        <div><h1>{t('password.title')}</h1><p>{t('password.subtitle')}</p></div>
+        <label>{t('password.current')}<input type="password" autoComplete="current-password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required /></label>
+        <label>{t('password.new')}<input type="password" autoComplete="new-password" minLength={12} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required /></label>
+        <label>{t('password.confirm')}<input type="password" autoComplete="new-password" minLength={12} value={confirmation} onChange={(event) => setConfirmation(event.target.value)} required /></label>
+        {newPassword !== confirmation && confirmation && <p className="error">{t('password.mismatch')}</p>}
+        {mutation.error && <p className="error">{errorMessage(mutation.error)}</p>}
+        <button className="primary" disabled={mutation.isPending || newPassword !== confirmation}>{t('password.save')}</button>
       </form>
     </main>
   );

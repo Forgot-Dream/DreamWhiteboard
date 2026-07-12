@@ -1,6 +1,7 @@
 import { act, fireEvent, render } from '@testing-library/react';
 import { createElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { I18nProvider } from '../lib/i18n';
 import { CanvasViewport, filterVisibleBlocks } from './CanvasViewport';
 import type { BoardRuntime } from './runtime';
 import type { ImageBlock, TextBlock } from './schema';
@@ -70,7 +71,7 @@ describe('viewport spatial filtering', () => {
     useBoardStore.getState().reset('board');
     useBoardStore.getState().setBlocks([block]);
     useBoardStore.getState().setSelection([block.id]);
-    const view = render(createElement(CanvasViewport, { runtime }));
+    const view = render(createElement(I18nProvider, null, createElement(CanvasViewport, { runtime })));
     const renderedBlock = view.container.querySelector<HTMLElement>('.block-image');
     const canvas = view.container.querySelector<HTMLElement>('.canvas');
     expect(renderedBlock).not.toBeNull();

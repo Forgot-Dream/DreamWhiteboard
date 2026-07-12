@@ -1,4 +1,5 @@
 import * as Y from 'yjs';
+import { createID } from '../lib/id';
 import { blockToYMap, blocksMap, createImageBlock, createTextBlock, readBlocks, type BlockStyle, type ImageBlock, type WhiteboardBlock } from './schema';
 
 export interface ImageInput {
@@ -36,7 +37,7 @@ export class BoardCommands {
     const ids: string[] = [];
     this.transact(() => {
       for (const source of blocks) {
-        const block = { ...source, style: { ...source.style }, id: source.id || `blk_${crypto.randomUUID()}` } as WhiteboardBlock;
+        const block = { ...source, style: { ...source.style }, id: source.id || createID('blk') } as WhiteboardBlock;
         blocksMap(this.doc).set(block.id, blockToYMap(block));
         ids.push(block.id);
       }
@@ -123,7 +124,7 @@ export class BoardCommands {
     const maxZ = this.maxZ();
     const clones = selected.map((block, index) => ({
       ...block,
-      id: `blk_${crypto.randomUUID()}`,
+      id: createID('blk'),
       x: block.x + offset,
       y: block.y + offset,
       z: maxZ + index + 1,
@@ -136,7 +137,7 @@ export class BoardCommands {
     const maxZ = this.maxZ();
     return this.insert(blocks.map((block, index) => ({
       ...block,
-      id: `blk_${crypto.randomUUID()}`,
+      id: createID('blk'),
       x: block.x + offset,
       y: block.y + offset,
       z: maxZ + index + 1,
