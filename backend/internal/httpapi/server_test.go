@@ -33,6 +33,16 @@ func (r *failingAssetRepository) SaveAsset(domain.Asset) (domain.Asset, error) {
 	return domain.Asset{}, errors.New("injected asset persistence failure")
 }
 
+type passwordBearingUserRepository struct{ *store.MemoryStore }
+
+func (r *passwordBearingUserRepository) ListUsers() ([]domain.User, error) {
+	users, err := r.MemoryStore.ListUsers()
+	for i := range users {
+		users[i].PasswordHash = "injected-password-hash"
+	}
+	return users, err
+}
+
 type unavailableRepository struct {
 	*store.MemoryStore
 	authErr    error
@@ -256,6 +266,116 @@ func TestProjectRolePermissionsAndLastOwnerProtection(t *testing.T) {
 	if role, err := repo.MemberRole(project.ID, admin.ID); err != nil || role != domain.RoleOwner {
 		t.Fatalf("last owner was modified: %q, %v", role, err)
 	}
+}
+
+func TestMemberCandidatesPermissionsFilteringAndRedaction(t *testing.T) {
+	repo, handler, _, systemAdminCookie := setupAdmin(t)
+	const initialPassword = "InitialMemberPass123!"
+	const changedPassword = "ChangedMemberPass123!"
+
+	createActor := func(email, name string) (domain.User, *http.Cookie) {
+		t.Helper()
+		user := createUser(t, handler, systemAdminCookie, email, name, initialPassword, domain.SystemUser)
+		cookie, _ := loginCookie(t, handler, email, initialPassword, http.StatusOK)
+		return user, changePassword(t, handler, cookie, initialPassword, changedPassword)
+	}
+
+	owner, ownerCookie := createActor("project-owner@example.com", "Project Owner")
+	projectAdmin, projectAdminCookie := createActor("project-admin@example.com", "Project Admin")
+	editor, editorCookie := createActor("project-editor@example.com", "Project Editor")
+	viewer, viewerCookie := createActor("project-viewer@example.com", "Project Viewer")
+	outsider, outsiderCookie := createActor("project-outsider@example.com", "Project Outsider")
+	candidate := createUser(t, handler, systemAdminCookie, "candidate@example.com", "Candidate", initialPassword, domain.SystemUser)
+
+	project := jsonRequest[domain.Project](t, handler, http.MethodPost, "/api/projects", ownerCookie, map[string]any{
+		"name": "Candidate permissions",
+	}, http.StatusCreated)
+	for _, member := range []struct {
+		user domain.User
+		role string
+	}{
+		{user: projectAdmin, role: domain.RoleAdmin},
+		{user: editor, role: domain.RoleEditor},
+		{user: viewer, role: domain.RoleViewer},
+	} {
+		jsonRequest[domain.ProjectMember](t, handler, http.MethodPost, "/api/projects/"+project.ID+"/members", ownerCookie, map[string]any{
+			"user_id": member.user.ID,
+			"role":    member.role,
+		}, http.StatusOK)
+	}
+
+	// Inject a password hash at the repository boundary so this test verifies
+	// the HTTP response remains redacted even if a repository returns one.
+	handler = NewServer(&passwordBearingUserRepository{MemoryStore: repo}, t.TempDir())
+	path := "/api/projects/" + project.ID + "/member-candidates"
+	existingMemberIDs := map[string]bool{
+		owner.ID:        true,
+		projectAdmin.ID: true,
+		editor.ID:       true,
+		viewer.ID:       true,
+	}
+
+	assertCandidates := func(actor string, cookie *http.Cookie) {
+		t.Helper()
+		rec := requestJSON(t, handler, http.MethodGet, path, cookie, nil)
+		assertStatus(t, rec, http.StatusOK)
+		var candidates []map[string]any
+		decodeResponse(t, rec, &candidates)
+		candidateIDs := make(map[string]bool, len(candidates))
+		for _, candidate := range candidates {
+			if len(candidate) != 3 {
+				t.Fatalf("%s candidate response exposed unexpected fields: %#v", actor, candidate)
+			}
+			for _, field := range []string{"id", "name", "email"} {
+				if _, exists := candidate[field]; !exists {
+					t.Fatalf("%s candidate response omitted %s: %#v", actor, field, candidate)
+				}
+			}
+			id, ok := candidate["id"].(string)
+			if !ok || id == "" {
+				t.Fatalf("%s candidate response has invalid id: %#v", actor, candidate)
+			}
+			if existingMemberIDs[id] {
+				t.Fatalf("%s candidate response included existing member: %#v", actor, candidate)
+			}
+			candidateIDs[id] = true
+		}
+		if !candidateIDs[candidate.ID] || !candidateIDs[outsider.ID] {
+			t.Fatalf("%s candidate response omitted eligible users: %#v", actor, candidateIDs)
+		}
+	}
+
+	assertCandidates("owner", ownerCookie)
+	assertCandidates("project admin", projectAdminCookie)
+	assertCandidates("system admin", systemAdminCookie)
+
+	for _, denied := range []struct {
+		name   string
+		cookie *http.Cookie
+	}{
+		{name: "editor", cookie: editorCookie},
+		{name: "viewer", cookie: viewerCookie},
+		{name: "non-member", cookie: outsiderCookie},
+	} {
+		t.Run(denied.name+" is denied", func(t *testing.T) {
+			rec := requestJSON(t, handler, http.MethodGet, path, denied.cookie, nil)
+			assertStatus(t, rec, http.StatusForbidden)
+			assertErrorCode(t, rec, "project_admin_required")
+		})
+	}
+
+	rec := requestJSON(t, handler, http.MethodPost, path, systemAdminCookie, map[string]any{})
+	assertStatus(t, rec, http.StatusMethodNotAllowed)
+	assertErrorCode(t, rec, "method_not_allowed")
+	if allow := rec.Header().Get("Allow"); allow != http.MethodGet {
+		t.Fatalf("member candidates Allow header = %q, want %q", allow, http.MethodGet)
+	}
+	rec = requestJSON(t, handler, http.MethodGet, path+"/extra", systemAdminCookie, nil)
+	assertStatus(t, rec, http.StatusNotFound)
+	assertErrorCode(t, rec, "not_found")
+	rec = requestJSON(t, handler, http.MethodGet, "/api/projects/missing-project/member-candidates", systemAdminCookie, nil)
+	assertStatus(t, rec, http.StatusNotFound)
+	assertErrorCode(t, rec, "not_found")
 }
 
 func TestAdminPasswordResetRevokesSessionsAndForcesChange(t *testing.T) {

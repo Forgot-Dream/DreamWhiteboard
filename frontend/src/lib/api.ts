@@ -10,6 +10,8 @@ export interface User {
   created_at: string;
 }
 
+export type MemberCandidate = Pick<User, 'id' | 'email' | 'name'>;
+
 export interface Project {
   id: string;
   name: string;

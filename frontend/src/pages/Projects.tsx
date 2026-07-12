@@ -1,14 +1,15 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { FolderKanban, LayoutGrid, Pencil, Plus, Trash2, Users } from 'lucide-react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { api, canEdit, canManage, canManageOwners, type Board, type Project, type ProjectMember, type ProjectRole, type User } from '../lib/api';
+import { api, canEdit, canManage, canManageOwners, type Board, type MemberCandidate, type Project, type ProjectMember, type ProjectRole, type User } from '../lib/api';
 import { useI18n } from '../lib/i18n';
 
 const projectsKey = ['projects'] as const;
 const projectKey = (id: string) => ['projects', id] as const;
 const boardsKey = (id: string) => ['projects', id, 'boards'] as const;
 const membersKey = (id: string) => ['projects', id, 'members'] as const;
+const memberCandidatesKey = (id: string) => ['projects', id, 'member-candidates'] as const;
 const roleMessageKeys = {
   owner: 'role.owner', admin: 'role.admin', editor: 'role.editor', viewer: 'role.viewer'
 } as const;
@@ -40,15 +41,13 @@ export function Projects({ user }: { user: User }) {
     queryFn: () => api<ProjectMember[]>(`/api/projects/${encodeURIComponent(projectId)}/members`),
     enabled: Boolean(projectId)
   });
-  const users = useQuery({
-    queryKey: ['admin', 'users'],
-    queryFn: () => api<User[]>('/api/admin/users'),
-    enabled: user.system_role === 'system_admin'
-  });
-
   useEffect(() => {
     if (!projectId && projects.data?.[0]) navigate(`/projects/${projects.data[0].id}`, { replace: true });
   }, [navigate, projectId, projects.data]);
+  useEffect(() => {
+    setMemberIdentity('');
+    setMemberRole('editor');
+  }, [projectId]);
 
   const myRole = useMemo(
     () => members.data?.find((member) => member.user_id === user.id)?.role,
@@ -56,6 +55,12 @@ export function Projects({ user }: { user: User }) {
   );
   const manageable = canManage(myRole, user);
   const editable = canEdit(myRole, user);
+  const memberCandidates = useQuery({
+    queryKey: memberCandidatesKey(projectId),
+    queryFn: () => api<MemberCandidate[]>(`/api/projects/${encodeURIComponent(projectId)}/member-candidates`),
+    enabled: Boolean(projectId) && manageable
+  });
+  const validMemberIdentity = Boolean(projectId) && Boolean(memberCandidates.data?.some((candidate) => candidate.id === memberIdentity));
 
   const createProject = useMutation({
     mutationFn: () => api<Project>('/api/projects', { method: 'POST', body: JSON.stringify({ name: projectName, description: projectDescription }) }),
@@ -86,17 +91,20 @@ export function Projects({ user }: { user: User }) {
     onSuccess: async () => { setBoardName(''); await queryClient.invalidateQueries({ queryKey: boardsKey(projectId) }); }
   });
   const addMember = useMutation({
-    mutationFn: () => {
-      const selectedUser = users.data?.find((candidate) => candidate.id === memberIdentity || candidate.email === memberIdentity);
-      return api<ProjectMember>(`/api/projects/${encodeURIComponent(projectId)}/members`, {
-        method: 'POST',
-        body: JSON.stringify({ user_id: selectedUser?.id ?? memberIdentity, role: memberRole })
-      });
-    },
-    onSuccess: async () => { setMemberIdentity(''); await queryClient.invalidateQueries({ queryKey: membersKey(projectId) }); }
+    mutationFn: () => api<ProjectMember>(`/api/projects/${encodeURIComponent(projectId)}/members`, {
+      method: 'POST',
+      body: JSON.stringify({ user_id: memberIdentity, role: memberRole })
+    }),
+    onSuccess: async () => {
+      setMemberIdentity('');
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: membersKey(projectId) }),
+        queryClient.invalidateQueries({ queryKey: memberCandidatesKey(projectId) })
+      ]);
+    }
   });
 
-  const error = projects.error ?? selected.error ?? boards.error ?? members.error ?? createProject.error ?? updateProject.error ?? deleteProject.error ?? createBoard.error ?? addMember.error;
+  const error = projects.error ?? selected.error ?? boards.error ?? members.error ?? createProject.error ?? updateProject.error ?? deleteProject.error ?? createBoard.error;
 
   return (
     <div className="workspace-grid">
@@ -134,15 +142,16 @@ export function Projects({ user }: { user: User }) {
 
       <section className="panel members-panel">
         <div className="section-head"><h2>{t('projects.members')}</h2><Users size={20} /></div>
-        {manageable && <form className="inline-form member-form" onSubmit={(event) => { event.preventDefault(); addMember.mutate(); }}>
-          {users.data ? (
-            <select value={memberIdentity} onChange={(event) => setMemberIdentity(event.target.value)} required><option value="">{t('projects.selectUser')}</option>{users.data.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.email}</option>)}</select>
-          ) : <input placeholder={t('projects.userID')} value={memberIdentity} onChange={(event) => setMemberIdentity(event.target.value)} required />}
-          <select value={memberRole} onChange={(event) => setMemberRole(event.target.value as ProjectRole)}>
+        {manageable && <form className="inline-form member-form" onSubmit={(event) => { event.preventDefault(); if (validMemberIdentity) addMember.mutate(); }}>
+          {memberCandidates.data ? (
+            <UserCombobox key={projectId} users={memberCandidates.data} value={memberIdentity} onChange={setMemberIdentity} />
+          ) : <input aria-label={t('projects.searchUser')} placeholder={memberCandidates.isLoading ? t('projects.loadingUsers') : t('projects.searchUser')} disabled />}
+          <select aria-label={t('projects.memberRole')} value={memberRole} onChange={(event) => setMemberRole(event.target.value as ProjectRole)}>
             {canManageOwners(myRole, user) && <option value="owner">{t('role.owner')}</option>}<option value="admin">{t('role.admin')}</option><option value="editor">{t('role.editor')}</option><option value="viewer">{t('role.viewer')}</option>
           </select>
-          <button className="primary" disabled={addMember.isPending}><Plus size={16} /> {t('projects.add')}</button>
+          <button className="primary" disabled={addMember.isPending || !validMemberIdentity}><Plus size={16} /> {t('projects.add')}</button>
         </form>}
+        {(memberCandidates.error || addMember.error) && <p className="error" role="alert">{errorMessage(memberCandidates.error ?? addMember.error)}</p>}
         <div className="table compact">
           {members.data?.map((member) => <MemberRow key={member.user_id} member={member} projectID={projectId} canManage={manageable} canManageOwners={canManageOwners(myRole, user)} />)}
           {!members.isLoading && members.data?.length === 0 && <div className="empty-state">{t('projects.noMembers')}</div>}
@@ -150,6 +159,118 @@ export function Projects({ user }: { user: User }) {
       </section>
     </div>
   );
+}
+
+function UserCombobox({ users, value, onChange }: { users: MemberCandidate[]; value: string; onChange: (value: string) => void }) {
+  const { t } = useI18n();
+  const listboxID = useId();
+  const rootRef = useRef<HTMLDivElement>(null);
+  const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const keepTypedQueryRef = useRef(false);
+  const selectedUser = users.find((candidate) => candidate.id === value);
+  const [query, setQuery] = useState(selectedUser ? userOptionLabel(selectedUser) : '');
+  const [open, setOpen] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(-1);
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const filteredUsers = useMemo(() => {
+    if (!normalizedQuery || selectedUser && query === userOptionLabel(selectedUser)) return users;
+    return users.filter((candidate) => `${candidate.name} ${candidate.email}`.toLocaleLowerCase().includes(normalizedQuery));
+  }, [normalizedQuery, query, selectedUser, users]);
+
+  useEffect(() => {
+    if (!value) {
+      if (keepTypedQueryRef.current) keepTypedQueryRef.current = false;
+      else setQuery('');
+    }
+  }, [value]);
+
+  useEffect(() => {
+    setActiveIndex((current) => current >= filteredUsers.length ? filteredUsers.length - 1 : current);
+  }, [filteredUsers.length]);
+  useEffect(() => {
+    if (open && activeIndex >= 0) optionRefs.current[activeIndex]?.scrollIntoView?.({ block: 'nearest' });
+  }, [activeIndex, open]);
+
+  const selectUser = (candidate: MemberCandidate) => {
+    keepTypedQueryRef.current = false;
+    onChange(candidate.id);
+    setQuery(userOptionLabel(candidate));
+    setOpen(false);
+  };
+  const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      setOpen(true);
+      if (!filteredUsers.length) return;
+      setActiveIndex((current) => event.key === 'ArrowDown'
+        ? (current < 0 ? 0 : (current + 1) % filteredUsers.length)
+        : (current < 0 ? filteredUsers.length - 1 : (current - 1 + filteredUsers.length) % filteredUsers.length));
+    } else if (event.key === 'Enter' && open && filteredUsers[activeIndex]) {
+      event.preventDefault();
+      selectUser(filteredUsers[activeIndex]);
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      setOpen(false);
+    }
+  };
+
+  return (
+    <div
+      className="user-combobox"
+      ref={rootRef}
+      onBlur={(event) => {
+        if (!rootRef.current?.contains(event.relatedTarget)) setOpen(false);
+      }}
+    >
+      <input
+        role="combobox"
+        aria-label={t('projects.searchUser')}
+        aria-autocomplete="list"
+        aria-expanded={open}
+        aria-controls={listboxID}
+        aria-activedescendant={open && filteredUsers[activeIndex] ? `${listboxID}-${filteredUsers[activeIndex].id}` : undefined}
+        autoComplete="off"
+        placeholder={t('projects.searchUser')}
+        value={query}
+        onFocus={() => setOpen(true)}
+        onClick={() => setOpen(true)}
+        onChange={(event) => {
+          setQuery(event.target.value);
+          keepTypedQueryRef.current = true;
+          onChange('');
+          setActiveIndex(-1);
+          setOpen(true);
+        }}
+        onKeyDown={handleKeyDown}
+        required
+      />
+      {open && <div className="user-combobox-options" id={listboxID} role="listbox" aria-label={t('projects.userResults')}>
+        {filteredUsers.map((candidate, index) => (
+          <button
+            type="button"
+            id={`${listboxID}-${candidate.id}`}
+            key={candidate.id}
+            ref={(element) => { optionRefs.current[index] = element; }}
+            className={index === activeIndex ? 'active' : ''}
+            role="option"
+            tabIndex={-1}
+            aria-selected={candidate.id === value}
+            onMouseDown={(event) => event.preventDefault()}
+            onMouseEnter={() => setActiveIndex(index)}
+            onClick={() => selectUser(candidate)}
+          >
+            <strong>{candidate.name || candidate.email}</strong>
+            {candidate.name && <span>{candidate.email}</span>}
+          </button>
+        ))}
+        {filteredUsers.length === 0 && <div className="user-combobox-empty">{t('projects.noUserResults')}</div>}
+      </div>}
+    </div>
+  );
+}
+
+function userOptionLabel(user: MemberCandidate) {
+  return user.name ? `${user.name} · ${user.email}` : user.email;
 }
 
 function ProjectSettings({ project, onSave, onDelete }: { project: Project; onSave: (value: { name: string; description: string }) => void; onDelete: () => void }) {
@@ -200,13 +321,17 @@ function MemberRow({ member, projectID, canManage: manageable, canManageOwners: 
   });
   const remove = useMutation({
     mutationFn: () => api(`/api/projects/${encodeURIComponent(projectID)}/members?user_id=${encodeURIComponent(member.user_id)}`, { method: 'DELETE' }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: membersKey(projectID) })
+    onSuccess: () => Promise.all([
+      queryClient.invalidateQueries({ queryKey: membersKey(projectID) }),
+      queryClient.invalidateQueries({ queryKey: memberCandidatesKey(projectID) })
+    ])
   });
+  const identity = member.user?.email ?? member.user_id;
   return (
     <div className="table-row member-row">
-      <span>{member.user?.email ?? member.user_id}</span>
-      {manageable ? <select value={member.role} disabled={member.role === 'owner' && !owners} onChange={(event) => update.mutate(event.target.value as ProjectRole)}>{owners && <option value="owner">{t('role.owner')}</option>}<option value="admin">{t('role.admin')}</option><option value="editor">{t('role.editor')}</option><option value="viewer">{t('role.viewer')}</option></select> : <span className="badge">{t(roleMessageKeys[member.role])}</span>}
-      {manageable && <button className="small-btn danger" title={t('projects.removeMember')} disabled={member.role === 'owner' && !owners} onClick={() => window.confirm(t('projects.removeMemberConfirm')) && remove.mutate()}><Trash2 size={14} /></button>}
+      <div className="member-identity" title={member.user?.name ? `${member.user.name} · ${identity}` : identity}><strong>{member.user?.name || identity}</strong>{member.user?.name && <span>{identity}</span>}</div>
+      {manageable ? <select className="member-role" aria-label={t('projects.roleFor', { identity })} value={member.role} disabled={(member.role === 'owner' && !owners) || update.isPending} onChange={(event) => update.mutate(event.target.value as ProjectRole)}>{(owners || member.role === 'owner') && <option value="owner">{t('role.owner')}</option>}<option value="admin">{t('role.admin')}</option><option value="editor">{t('role.editor')}</option><option value="viewer">{t('role.viewer')}</option></select> : <span className="badge member-role">{t(roleMessageKeys[member.role])}</span>}
+      {manageable && <button className="small-btn danger member-remove" aria-label={t('projects.removeMemberFor', { identity })} title={t('projects.removeMember')} disabled={(member.role === 'owner' && !owners) || remove.isPending} onClick={() => window.confirm(t('projects.removeMemberConfirm')) && remove.mutate()}><Trash2 size={14} /></button>}
       {(update.error || remove.error) && <span className="error row-error">{errorMessage(update.error ?? remove.error)}</span>}
     </div>
   );

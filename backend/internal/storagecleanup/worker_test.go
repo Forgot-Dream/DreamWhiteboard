@@ -193,7 +193,10 @@ func TestWorkerContinuesCleanupWhenAssetSweepFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	now := time.Date(2026, 7, 12, 6, 0, 0, 0, time.UTC)
+	// Cleanup jobs are timestamped with the real clock by the repository. Keep
+	// the worker clock just ahead of job creation so this test does not become
+	// time-dependent once the former fixed timestamp is in the past.
+	now := time.Now().UTC().Add(time.Second)
 	repository := &failingSweepStore{MemoryStore: repo, err: errors.New("asset GC unavailable")}
 	worker, err := New(repository, testWorkerConfig(root, &now))
 	if err != nil {

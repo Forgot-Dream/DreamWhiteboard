@@ -54,6 +54,12 @@ func (s *Server) handleProjectSubroutes(w http.ResponseWriter, r *http.Request, 
 	switch parts[1] {
 	case "members":
 		s.handleMembers(w, r, user, projectID, parts[2:]...)
+	case "member-candidates":
+		if len(parts) != 2 {
+			writeAPIError(w, r, http.StatusNotFound, "not_found", "resource not found", nil)
+			return
+		}
+		s.handleMemberCandidates(w, r, user, projectID)
 	case "boards":
 		if len(parts) != 2 {
 			writeAPIError(w, r, http.StatusNotFound, "not_found", "resource not found", nil)
@@ -69,6 +75,48 @@ func (s *Server) handleProjectSubroutes(w http.ResponseWriter, r *http.Request, 
 	default:
 		writeAPIError(w, r, http.StatusNotFound, "not_found", "resource not found", nil)
 	}
+}
+
+func (s *Server) handleMemberCandidates(w http.ResponseWriter, r *http.Request, user domain.User, projectID string) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, r, http.MethodGet)
+		return
+	}
+	allowed, permissionErr := s.canManageProject(user, projectID)
+	if !s.requirePermission(w, r, allowed, permissionErr, "project_admin_required", "project administrator access required") {
+		return
+	}
+	if _, err := s.repo.GetProject(projectID); err != nil {
+		writeResult(w, r, nil, err)
+		return
+	}
+	members, err := s.repo.ListMembers(projectID)
+	if err != nil {
+		writeResult(w, r, nil, err)
+		return
+	}
+	users, err := s.repo.ListUsers()
+	if err != nil {
+		writeResult(w, r, nil, err)
+		return
+	}
+	memberIDs := make(map[string]struct{}, len(members))
+	for _, member := range members {
+		memberIDs[member.UserID] = struct{}{}
+	}
+	type memberCandidate struct {
+		ID    string `json:"id"`
+		Email string `json:"email"`
+		Name  string `json:"name"`
+	}
+	candidates := make([]memberCandidate, 0, len(users))
+	for _, candidate := range users {
+		if _, exists := memberIDs[candidate.ID]; exists {
+			continue
+		}
+		candidates = append(candidates, memberCandidate{ID: candidate.ID, Email: candidate.Email, Name: candidate.Name})
+	}
+	writeJSON(w, http.StatusOK, candidates)
 }
 
 func (s *Server) handleProject(w http.ResponseWriter, r *http.Request, user domain.User, projectID string) {

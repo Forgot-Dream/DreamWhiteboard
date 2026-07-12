@@ -8,10 +8,11 @@ const bootstrapEmail = process.env.E2E_ADMIN_EMAIL ?? 'admin@example.com';
 const bootstrapPassword = process.env.E2E_ADMIN_PASSWORD ?? 'replace-with-a-unique-12+-character-password';
 
 test('admin setup, dual-session collaboration, reconnect, viewer permissions, and image persistence', async ({ browser }) => {
-  test.setTimeout(120_000);
+  test.setTimeout(150_000);
   const suffix = Date.now().toString(36);
   const editorEmail = `editor-${suffix}@example.com`;
   const viewerEmail = `viewer-${suffix}@example.com`;
+  const editorName = 'E2E Editor With An Intentionally Very Long Display Name For Layout Validation';
   const editorInitial = 'Editor-one-time-2026!';
   const viewerInitial = 'Viewer-one-time-2026!';
   const projectName = `E2E Project ${suffix}`;
@@ -25,8 +26,20 @@ test('admin setup, dual-session collaboration, reconnect, viewer permissions, an
   expect(await admin.evaluate(() => typeof globalThis.crypto.randomUUID)).toBe('undefined');
 
   await admin.goto('/admin');
-  await createUser(admin, editorEmail, 'E2E Editor', editorInitial);
+  await createUser(admin, editorEmail, editorName, editorInitial);
   await createUser(admin, viewerEmail, 'E2E Viewer', viewerInitial);
+
+  await admin.setViewportSize({ width: 320, height: 800 });
+  const viewerAdminRow = admin.locator('.admin-user-row', { hasText: viewerEmail });
+  await viewerAdminRow.getByRole('button', { name: 'Reset password' }).click();
+  await expect(viewerAdminRow.locator('.admin-password-reset')).toBeVisible();
+  await expectNoPageOverflow(admin);
+  await viewerAdminRow.getByRole('button', { name: 'Cancel' }).click();
+  await viewerAdminRow.getByRole('button', { name: `Edit display name for ${viewerEmail}` }).click();
+  await expect(viewerAdminRow.locator('.admin-name-form')).toBeVisible();
+  await expectNoPageOverflow(admin);
+  await viewerAdminRow.getByRole('button', { name: 'Cancel' }).click();
+  await admin.setViewportSize({ width: 1280, height: 720 });
 
   await admin.goto('/projects');
   await admin.getByPlaceholder('Project name').fill(projectName);
@@ -39,8 +52,28 @@ test('admin setup, dual-session collaboration, reconnect, viewer permissions, an
   await admin.getByRole('button', { name: 'Board' }).click();
   await expect(admin.locator('.board-open', { hasText: boardName })).toBeVisible();
 
-  await addMember(admin, editorEmail, 'editor');
+  await addMember(admin, editorEmail, 'editor', 'Intentionally Very Long', true);
   await addMember(admin, viewerEmail, 'viewer');
+
+  const editorMemberRow = admin.locator('.member-row', { hasText: editorEmail });
+  const desktopMemberLayout = await editorMemberRow.evaluate((row) => {
+    const identity = row.querySelector('.member-identity')?.getBoundingClientRect();
+    const role = row.querySelector('.member-role')?.getBoundingClientRect();
+    return identity && role ? { identityRight: identity.right, roleLeft: role.left } : null;
+  });
+  expect(desktopMemberLayout).not.toBeNull();
+  expect(desktopMemberLayout!.identityRight).toBeLessThanOrEqual(desktopMemberLayout!.roleLeft + 1);
+
+  await admin.setViewportSize({ width: 375, height: 800 });
+  await expectNoPageOverflow(admin);
+  const memberLayout = await editorMemberRow.evaluate((row) => {
+    const identity = row.querySelector('.member-identity')?.getBoundingClientRect();
+    const role = row.querySelector('.member-role')?.getBoundingClientRect();
+    return identity && role ? { identityBottom: identity.bottom, roleTop: role.top } : null;
+  });
+  expect(memberLayout).not.toBeNull();
+  expect(memberLayout!.identityBottom).toBeLessThanOrEqual(memberLayout!.roleTop + 1);
+  await admin.setViewportSize({ width: 1280, height: 720 });
 
   await admin.locator('.board-open', { hasText: boardName }).click();
   await expect(admin).toHaveURL(/\/boards\//);
@@ -77,8 +110,8 @@ test('admin setup, dual-session collaboration, reconnect, viewer permissions, an
   }, { timeout: 15_000 }).not.toBe('');
 
   const converged = await editorText.inputValue();
-  await compose('stop', 'api');
   try {
+    await compose('stop', 'api');
     await expect(editor.locator('.title-block')).toContainText('offline', { timeout: 20_000 });
     await editorText.fill(`${converged} offline replay`);
   } finally {
@@ -142,19 +175,31 @@ async function login(page: Page, email: string, password: string, replacement: s
 }
 
 async function createUser(page: Page, email: string, name: string, password: string) {
-  await page.getByPlaceholder('email').fill(email);
-  await page.getByPlaceholder('name').fill(name);
-  await page.getByPlaceholder('one-time password').fill(password);
-  await page.getByRole('button', { name: 'Add' }).click();
-  await expect(page.locator('.user-row', { hasText: email })).toBeVisible();
+  const form = page.locator('.admin-user-form');
+  await form.getByLabel('Email', { exact: true }).fill(email);
+  await form.getByLabel('Display name', { exact: true }).fill(name);
+  await form.getByLabel('One-time password', { exact: true }).fill(password);
+  await form.getByRole('button', { name: 'Create user' }).click();
+  await expect(page.locator('.admin-user-row', { hasText: email })).toBeVisible();
 }
 
-async function addMember(page: Page, email: string, role: 'editor' | 'viewer') {
+async function addMember(page: Page, email: string, role: 'editor' | 'viewer', search = email, useKeyboard = false) {
   const form = page.locator('.member-form');
-  await form.locator('select').nth(0).selectOption({ label: email });
-  await form.locator('select').nth(1).selectOption(role);
+  const userSearch = form.getByRole('combobox', { name: 'Search users by name or email' });
+  await userSearch.fill(search);
+  if (useKeyboard) {
+    await userSearch.press('ArrowDown');
+    await userSearch.press('Enter');
+  } else {
+    await form.getByRole('option', { name: new RegExp(email) }).click();
+  }
+  await form.getByRole('combobox', { name: 'New member role' }).selectOption(role);
   await form.getByRole('button', { name: 'Add' }).click();
-  await expect(page.locator('.member-row', { hasText: email })).toContainText(role);
+  await expect(page.locator('.member-row', { hasText: email }).locator('.member-role')).toHaveValue(role);
+}
+
+async function expectNoPageOverflow(page: Page) {
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 }
 
 async function pasteImage(page: Page, name: string, type: string, bytes: Buffer) {

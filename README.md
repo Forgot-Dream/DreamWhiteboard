@@ -174,7 +174,7 @@ REST owns authentication and metadata; it never modifies whiteboard content.
 
 - Authentication: `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/me`, `POST /api/me/password`.
 - Projects: `GET/POST /api/projects`, `GET/PATCH/DELETE /api/projects/:id`.
-- Members: `GET/POST /api/projects/:id/members`, `PATCH/DELETE /api/projects/:id/members/:userID`.
+- Members: `GET/POST /api/projects/:id/members`, `PATCH/DELETE /api/projects/:id/members/:userID`; project owners/admins can load addable `{id,name,email}` entries from `GET /api/projects/:id/member-candidates`.
 - Boards: `GET/POST /api/projects/:id/boards`, `GET/PATCH/DELETE /api/boards/:id`.
 - Board asset index: `PUT /api/boards/:id/asset-references`.
 - Assets: `POST /api/projects/:id/assets`, `GET/DELETE /api/assets/:id`.

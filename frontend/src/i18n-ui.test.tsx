@@ -9,6 +9,7 @@ import type { TextBlock } from './board/schema';
 import { useBoardStore } from './board/store';
 import { APIError, api, type Board, type Project, type User } from './lib/api';
 import { I18nProvider, useI18n } from './lib/i18n';
+import { Admin } from './pages/Admin';
 import { Projects } from './pages/Projects';
 
 vi.mock('./lib/api', async (importOriginal) => {
@@ -36,6 +37,7 @@ describe('Simplified Chinese UI coverage', () => {
       if (path === `/api/projects/${project.id}`) return project as never;
       if (path === `/api/projects/${project.id}/boards`) return [] as never;
       if (path === `/api/projects/${project.id}/members`) return [{ project_id: project.id, user_id: user.id, role: 'owner', user, created_at: user.created_at }] as never;
+      if (path === `/api/projects/${project.id}/member-candidates`) return [] as never;
       if (path === '/api/admin/users') return [user] as never;
       throw new Error(`Unexpected API request: ${path}`);
     });
@@ -61,10 +63,24 @@ describe('Simplified Chinese UI coverage', () => {
     expect(await screen.findByPlaceholderText('白板名称')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '白板' })).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: '成员' })).toBeInTheDocument();
-    expect(await screen.findByRole('option', { name: '选择用户' })).toBeInTheDocument();
+    expect(await screen.findByRole('combobox', { name: '按姓名或邮箱搜索用户' })).toBeInTheDocument();
     expect(screen.getAllByRole('option', { name: '所有者' })).not.toHaveLength(0);
     expect(await screen.findByText('暂无白板。')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '编辑项目' })).toBeInTheDocument();
+  });
+
+  it('localizes the enhanced administration directory', async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    render(<QueryClientProvider client={queryClient}><I18nProvider><Admin /></I18nProvider></QueryClientProvider>);
+
+    expect(await screen.findByRole('heading', { name: '系统用户' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '新增用户' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '用户目录' })).toBeInTheDocument();
+    expect(screen.getByText('用户总数')).toBeInTheDocument();
+    expect(screen.getByLabelText('搜索用户')).toBeInTheDocument();
+    expect(screen.getByLabelText('按角色筛选用户')).toBeInTheDocument();
+    expect(screen.getByLabelText('按密码状态筛选用户')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '创建用户' })).toBeInTheDocument();
   });
 
   it('localizes whiteboard toolbar labels and connection status', () => {
